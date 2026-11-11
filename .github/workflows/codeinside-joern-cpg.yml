@@ -1,0 +1,51 @@
+# codeinside PR 자동 분석 (Munsik-Park/codeinside docs/plan.md 단계 6)
+# PR이 열리거나 갱신될 때, main에 푸시될 때 그 커밋 SHA로 Joern 그래프(codebadger)를 만든다.
+# 커밋 상태 `codeinside/joern-cpg`의 설명에 codebase_hash를 남긴다. 이 상태가 SHA와 그래프의 대응 기록이다.
+# 작업은 codeinside의 스크립트가 한다. 이 파일은 그 스크립트를 고정된 커밋으로 불러오기만 한다.
+name: codeinside Joern CPG
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: codeinside-joern-cpg-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  # codeinside 스크립트 커밋. 스크립트를 바꾸면 이 값도 바꾼다.
+  CODEINSIDE_REF: 0df1ebb0f7a602daadc78f55bd3eec1eaf1bfb68
+  GRAPH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  cpg:
+    # self-hosted 러너이므로 포크에서 온 PR은 돌리지 않는다. main 푸시는 돈다.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, joern]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout opensre at the graph SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.GRAPH_SHA }}
+          path: opensre
+          persist-credentials: false
+
+      - name: Checkout codeinside scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Munsik-Park/codeinside
+          ref: ${{ env.CODEINSIDE_REF }}
+          path: codeinside
+          persist-credentials: false
+
+      - name: Build CPG, record codebase_hash, smoke-query via MCP
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout opensre --sha "$GRAPH_SHA"
