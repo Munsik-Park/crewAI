@@ -30,11 +30,11 @@ jobs:
     runs-on: [self-hosted, joern]
     timeout-minutes: 30
     steps:
-      - name: Checkout opensre at the graph SHA
+      - name: Checkout target repo at the graph SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.GRAPH_SHA }}
-          path: opensre
+          path: target
           persist-credentials: false
 
       - name: Checkout codeinside scripts
@@ -48,4 +48,4 @@ jobs:
       - name: Build CPG, record codebase_hash, smoke-query via MCP
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout opensre --sha "$GRAPH_SHA"
+        run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout target --sha "$GRAPH_SHA"
