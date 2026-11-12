@@ -13,6 +13,7 @@ on:
 permissions:
   contents: read
   statuses: write
+  pull-requests: read   # 보관 정리: 열린 PR의 head SHA를 읽는다
 
 concurrency:
   group: codeinside-joern-cpg-${{ github.event.pull_request.head.sha || github.sha }}
@@ -20,7 +21,7 @@ concurrency:
 
 env:
   # codeinside 스크립트 커밋. 스크립트를 바꾸면 이 값도 바꾼다.
-  CODEINSIDE_REF: e5b5388f413b61cd517b5fca3415a5c60beb3548
+  CODEINSIDE_REF: cbd0922288fd4d705b3bff66a6d38250b4aa6d1a
   GRAPH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
@@ -49,3 +50,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout target --sha "$GRAPH_SHA" --queries codeinside/config/queries/crewai.json
+
+      - name: Prune graphs outside main's last 20 commits and open PR heads
+        if: success() || failure()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 codeinside/scripts/ci/prune_cpgs.py --keep-main 20
