@@ -219,6 +219,7 @@ def get_current_call_id() -> str:
     return call_id
 
 
+# codeinside step 6 test: one-line change to check ancestor-graph fallback while this commit's graph builds.
 class BaseLLM(BaseModel, ABC):
     """Abstract base class for LLM implementations.
 
