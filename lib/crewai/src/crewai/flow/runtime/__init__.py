@@ -1589,8 +1589,14 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         try:
             if emit and collapsed_outcome:
                 await self._execute_listeners(
+                    FlowMethodName(context.method_name), collapsed_outcome
+                )
+                await self._execute_listeners(
                     FlowMethodName(collapsed_outcome),
                     result,
+                    trigger_is_router_result=not self._definition.methods[
+                        context.method_name
+                    ].is_start,
                 )
             else:
                 await self._execute_listeners(
@@ -3170,6 +3176,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         trigger_method: FlowMethodName,
         result: Any,
         triggering_event_id: str | None = None,
+        *,
+        trigger_is_router_result: bool = False,
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
@@ -3182,6 +3190,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             result: The result from the triggering method, passed to listeners that accept parameters.
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
+            trigger_is_router_result: Handle ``trigger_method`` as a router's outcome:
+                re-arm fired ``or_`` listeners for it and run the conditional starts it satisfies.
 
         Note:
             - Routers are executed sequentially to maintain flow control
@@ -3254,7 +3264,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         for idx, current_trigger in enumerate(all_triggers):
             if current_trigger:
-                if idx > 0 and rearmable:
+                is_router_result = idx > 0 or trigger_is_router_result
+                if is_router_result and rearmable:
                     self._rearm_or_listeners_for_trigger(current_trigger, rearmable)
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
@@ -3293,7 +3304,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         ]
                         await asyncio.gather(*tasks)
 
-                if current_trigger in router_results:
+                if is_router_result or current_trigger in router_results:
                     for method_name in self._start_method_names():
                         if self._start_condition_triggered_by(
                             method_name, current_trigger
