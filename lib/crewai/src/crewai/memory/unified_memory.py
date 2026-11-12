@@ -151,7 +151,8 @@ class Memory(BaseModel):
         description=(
             "Recall fetches this many times the requested limit as candidates for "
             "ranking: on every storage search of a deep recall, and per scope in a "
-            "MemorySlice recall. A shallow recall fetches exactly the limit."
+            "MemorySlice recall at either depth. Memory.recall(depth='shallow') "
+            "fetches exactly the limit."
         ),
     )
     read_only: bool = Field(
