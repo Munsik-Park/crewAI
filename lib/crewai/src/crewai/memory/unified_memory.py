@@ -26,6 +26,7 @@ from crewai.llms.base_llm import BaseLLM
 from crewai.memory.analyze import extract_memories_from_content
 from crewai.memory.storage.backend import StorageBackend
 from crewai.memory.types import (
+    _RECALL_OVERSAMPLE_FACTOR,
     MemoryConfig,
     MemoryMatch,
     MemoryRecord,
@@ -141,6 +142,14 @@ class Memory(BaseModel):
         default=1,
         description="Number of LLM-driven exploration rounds during deep recall.",
     )
+    recall_oversample_factor: int = Field(
+        default=_RECALL_OVERSAMPLE_FACTOR,
+        description=(
+            "Multiplier on the recall limit: each storage search of a deep "
+            "recall, and each per-scope request of a MemorySlice, asks for "
+            "limit times this many candidates. An integer of 1 or more."
+        ),
+    )
     query_analysis_threshold: int = Field(
         default=200,
         description="Queries shorter than this skip LLM analysis during deep recall.",
@@ -222,6 +231,7 @@ class Memory(BaseModel):
             confidence_threshold_low=self.confidence_threshold_low,
             complex_query_threshold=self.complex_query_threshold,
             exploration_budget=self.exploration_budget,
+            recall_oversample_factor=self.recall_oversample_factor,
             query_analysis_threshold=self.query_analysis_threshold,
         )
 
