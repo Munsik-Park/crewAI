@@ -329,6 +329,13 @@ multimodal_agent = Agent(
 - `max_rpm`: Limite de requisições por minuto
 - `max_retry_limit`: Tentativas de correção em erros
 
+<Note>
+  Quando `max_execution_time` expira, a execução da tarefa que ainda está em andamento é tratada de forma diferente em cada caminho:
+
+  - **Síncrono (`execute_task`)**: `TimeoutError` é lançado no limite, mas a execução em andamento não é interrompida. Ela continua em uma thread em segundo plano (daemon) até o fim, e seu resultado ou erro é descartado: nunca se torna a saída da tarefa. Até terminar, ela continua fazendo requisições ao modelo, contadas no `max_rpm` quando definido, e chamadas de ferramentas, e ao final salva na memória quando a memória está configurada. Ela não impede o encerramento do processo Python. Uma execução posterior no mesmo agente, ou em um colega para quem essa execução delegou, roda separadamente dela e não espera por ela.
+  - **Assíncrono (`aexecute_task`)**: a execução é cancelada no limite e `TimeoutError` é lançado; ela para no próximo `await`. Uma ferramenta síncrona que ela executava em uma thread não é interrompida: continua até retornar, e seu resultado é descartado.
+</Note>
+
 #### Execução de Código
 
 <Warning>

@@ -291,6 +291,13 @@ multimodal_agent = Agent(
 - `max_rpm`: Rate limiting for API calls
 - `max_retry_limit`: Retries on error
 
+<Note>
+  When `max_execution_time` expires, the task execution that is still running is handled differently on each path:
+
+  - **Synchronous (`execute_task`)**: `TimeoutError` is raised at the limit, but the running execution is not stopped. It goes on in a background (daemon) thread until its run ends, and its result or error is discarded: it never becomes the task's output. Until it ends it keeps making model requests, counted against `max_rpm` when set, and tool calls, and at its end it saves to memory when memory is configured. It does not keep the Python process from exiting. A later execution on the same agent, or on a coworker that run delegated to, runs separately from it and does not wait for it.
+  - **Asynchronous (`aexecute_task`)**: the run is cancelled at the limit and `TimeoutError` is raised; it stops at its next `await`. A synchronous tool it was running in a thread is not stopped: it goes on until it returns, and its result is discarded.
+</Note>
+
 #### Code Execution
 
 <Warning>

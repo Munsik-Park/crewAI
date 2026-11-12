@@ -17,12 +17,14 @@ from crewai.events.types.knowledge_events import (
 )
 from crewai.hooks.dispatch import HookAborted
 from crewai.knowledge.utils.knowledge_utils import extract_knowledge_context
+from crewai.tasks.execution_messages import record_execution_messages
 from crewai.utilities.pydantic_schema_utils import generate_model_description
 from crewai.utilities.types import LLMMessage
 
 
 if TYPE_CHECKING:
     from crewai.agent.core import Agent
+    from crewai.agents.agent_executor import AgentExecutor
     from crewai.task import Task
     from crewai.tools.base_tool import BaseTool
 
@@ -157,30 +159,25 @@ def handle_knowledge_retrieval(
         ),
     )
     try:
-        agent.knowledge_search_query = agent._get_knowledge_search_query(
-            task_prompt, task
-        )
-        if agent.knowledge_search_query:
+        # Locals, not read back from the fields: another preparation on this
+        # agent may write the fields between this one's write and its read.
+        query = agent._get_knowledge_search_query(task_prompt, task)
+        agent.knowledge_search_query = query
+        if query:
             if agent.knowledge:
-                agent_knowledge_snippets = query_func(
-                    [agent.knowledge_search_query], **knowledge_config
-                )
+                agent_knowledge_snippets = query_func([query], **knowledge_config)
                 if agent_knowledge_snippets:
-                    agent.agent_knowledge_context = extract_knowledge_context(
-                        agent_knowledge_snippets
-                    )
-                    if agent.agent_knowledge_context:
-                        task_prompt += agent.agent_knowledge_context
+                    agent_context = extract_knowledge_context(agent_knowledge_snippets)
+                    agent.agent_knowledge_context = agent_context
+                    if agent_context:
+                        task_prompt += agent_context
 
-            knowledge_snippets = crew_query_func(
-                [agent.knowledge_search_query], **knowledge_config
-            )
+            knowledge_snippets = crew_query_func([query], **knowledge_config)
             if knowledge_snippets:
-                agent.crew_knowledge_context = extract_knowledge_context(
-                    knowledge_snippets
-                )
-                if agent.crew_knowledge_context:
-                    task_prompt += agent.crew_knowledge_context
+                crew_context = extract_knowledge_context(knowledge_snippets)
+                agent.crew_knowledge_context = crew_context
+                if crew_context:
+                    task_prompt += crew_context
 
             crewai_event_bus.emit(
                 agent,
@@ -253,22 +250,30 @@ def process_tool_results(agent: Agent, result: Any) -> Any:
     return result
 
 
-def save_last_messages(agent: Agent) -> None:
-    """Save the last messages from agent executor.
+def _store_last_messages(agent: Agent, messages: list[LLMMessage]) -> None:
+    agent._last_messages = messages
+    record_execution_messages(agent, messages)
+
+
+def save_last_messages(agent: Agent, executor: AgentExecutor | None) -> None:
+    """Save the messages of the execution that ran on ``executor``.
 
     Sanitizes messages to be compatible with TaskOutput's LLMMessage type,
     which accepts 'user', 'assistant', 'system', and 'tool' roles.
     Preserves tool_call_id/name for tool messages and tool_calls for assistant messages.
+    They go to ``agent.last_messages`` and to the execution messages record
+    open for this agent.
 
     Args:
         agent: The agent instance.
+        executor: The executor the execution ran on.
     """
-    if not agent.agent_executor or not hasattr(agent.agent_executor, "messages"):
-        agent._last_messages = []
+    if not executor or not hasattr(executor, "messages"):
+        _store_last_messages(agent, [])
         return
 
     sanitized_messages: list[LLMMessage] = []
-    for msg in agent.agent_executor.messages:
+    for msg in executor.messages:
         role = msg.get("role", "")
         if role not in ("user", "assistant", "system", "tool"):
             continue
@@ -289,7 +294,7 @@ def save_last_messages(agent: Agent) -> None:
                 sanitized_msg["tool_calls"] = tool_calls
         sanitized_messages.append(sanitized_msg)
 
-    agent._last_messages = sanitized_messages
+    _store_last_messages(agent, sanitized_messages)
 
 
 def prepare_tools(
@@ -355,31 +360,30 @@ async def ahandle_knowledge_retrieval(
         ),
     )
     try:
-        agent.knowledge_search_query = agent._get_knowledge_search_query(
-            task_prompt, task
-        )
-        if agent.knowledge_search_query:
+        # Locals, not read back from the fields: another preparation on this
+        # agent may write the fields across this one's awaits.
+        query = agent._get_knowledge_search_query(task_prompt, task)
+        agent.knowledge_search_query = query
+        if query:
             if agent.knowledge:
                 agent_knowledge_snippets = await agent.knowledge.aquery(
-                    [agent.knowledge_search_query], **knowledge_config
+                    [query], **knowledge_config
                 )
                 if agent_knowledge_snippets:
-                    agent.agent_knowledge_context = extract_knowledge_context(
-                        agent_knowledge_snippets
-                    )
-                    if agent.agent_knowledge_context:
-                        task_prompt += agent.agent_knowledge_context
+                    agent_context = extract_knowledge_context(agent_knowledge_snippets)
+                    agent.agent_knowledge_context = agent_context
+                    if agent_context:
+                        task_prompt += agent_context
 
             if _crew:
                 knowledge_snippets = await _crew.aquery_knowledge(
-                    [agent.knowledge_search_query], **knowledge_config
+                    [query], **knowledge_config
                 )
                 if knowledge_snippets:
-                    agent.crew_knowledge_context = extract_knowledge_context(
-                        knowledge_snippets
-                    )
-                    if agent.crew_knowledge_context:
-                        task_prompt += agent.crew_knowledge_context
+                    crew_context = extract_knowledge_context(knowledge_snippets)
+                    agent.crew_knowledge_context = crew_context
+                    if crew_context:
+                        task_prompt += crew_context
 
             crewai_event_bus.emit(
                 agent,
