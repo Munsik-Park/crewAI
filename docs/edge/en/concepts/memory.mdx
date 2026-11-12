@@ -882,4 +882,5 @@ All configuration is passed as keyword arguments to `Memory(...)`. Every paramet
 | `confidence_threshold_low` | `0.5` | Recall confidence below which deeper exploration is triggered. |
 | `complex_query_threshold` | `0.7` | For complex queries, explore deeper below this confidence. |
 | `exploration_budget` | `1` | Number of LLM-driven exploration rounds during deep recall. |
+| `recall_oversample_factor` | `2` | Multiplier on `limit` for the candidates recall fetches before ranking: each storage search of a deep recall asks for `limit` × this value, and `MemorySlice.recall` asks each of its scopes for `limit` × this value at either depth. `Memory.recall(depth="shallow")` asks for exactly `limit`. An integer of 1 or more. |
 | `query_analysis_threshold` | `200` | Queries shorter than this (in characters) skip LLM analysis during deep recall. |

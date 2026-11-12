@@ -875,4 +875,5 @@ memory.reset(scope="/project/old")  # Only that subtree
 | `confidence_threshold_low` | `0.5` | ثقة الاسترجاع التي يُشغّل تحتها استكشاف أعمق. |
 | `complex_query_threshold` | `0.7` | للاستعلامات المعقدة، استكشف أعمق تحت هذه الثقة. |
 | `exploration_budget` | `1` | عدد جولات الاستكشاف المدفوعة بـ LLM أثناء الاسترجاع العميق. |
+| `recall_oversample_factor` | `2` | مُضاعِف لـ `limit` يحدد عدد المرشحين الذين يجلبهم الاسترجاع قبل الترتيب: كل بحث في التخزين أثناء الاسترجاع العميق يطلب `limit` × هذه القيمة، ويطلب `MemorySlice.recall` من كل نطاق من نطاقاته `limit` × هذه القيمة في كلا العمقين. يطلب `Memory.recall(depth="shallow")` قيمة `limit` بالضبط. عدد صحيح يساوي 1 أو أكثر. |
 | `query_analysis_threshold` | `200` | الاستعلامات الأقصر من هذا (بالأحرف) تتخطى تحليل LLM أثناء الاسترجاع العميق. |

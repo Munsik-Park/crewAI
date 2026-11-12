@@ -875,4 +875,5 @@ Toda a configuração é passada como argumentos nomeados para `Memory(...)`. Ca
 | `confidence_threshold_low` | `0.5` | Confiança de recall abaixo da qual exploração mais profunda é ativada. |
 | `complex_query_threshold` | `0.7` | Para consultas complexas, explorar mais profundamente abaixo desta confiança. |
 | `exploration_budget` | `1` | Número de rodadas de exploração por LLM durante recall profundo. |
+| `recall_oversample_factor` | `2` | Multiplicador de `limit` para os candidatos que o recall busca antes do ranqueamento: cada busca no armazenamento de um recall profundo pede `limit` × este valor, e `MemorySlice.recall` pede a cada um de seus escopos `limit` × este valor em qualquer profundidade. `Memory.recall(depth="shallow")` pede exatamente `limit`. Um inteiro maior ou igual a 1. |
 | `query_analysis_threshold` | `200` | Consultas menores que isso (em caracteres) pulam análise LLM durante recall profundo. |
