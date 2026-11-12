@@ -1,5 +1,3 @@
-"""Recall over-fetches from storage by the oversample factor configured on Memory."""
-
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -25,8 +23,6 @@ QUERY = "short query"
 
 
 class RecordingStorage:
-    """Storage double that records the limit of every search it is asked for."""
-
     def __init__(self) -> None:
         self.search_limits: list[int] = []
 
