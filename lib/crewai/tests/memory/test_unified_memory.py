@@ -1563,8 +1563,6 @@ def test_result_count_stays_capped_at_limit_with_a_larger_factor(
 def detached_runtime_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     from crewai.events.event_bus import crewai_event_bus
 
-    # Isolates each test from checkpoint runtime state: re-arms checkpoint handler
-    # registration and resets the bus runtime state before and after the test.
     monkeypatch.setattr("crewai.state.checkpoint_listener._handlers_registered", False)
     crewai_event_bus.reset_runtime_state()
     yield
