@@ -256,6 +256,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
     _finalize_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _finalize_called: bool = PrivateAttr(default=False)
     _is_executing: bool = PrivateAttr(default=False)
+    # Executions holding this executor from their reuse decision to their end;
+    # read and written under _execution_lock.
+    _holders: int = PrivateAttr(default=0)
     _has_been_invoked: bool = PrivateAttr(default=False)
     _instance_id: str = PrivateAttr(default_factory=lambda: str(uuid4())[:8])
     _step_executor: Any = PrivateAttr(default=None)

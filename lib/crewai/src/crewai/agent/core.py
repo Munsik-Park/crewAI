@@ -10,7 +10,8 @@ import inspect
 import json
 import os
 from pathlib import Path
-from threading import Lock
+import threading
+from threading import Lock, Thread
 import time
 from typing import (
     TYPE_CHECKING,
@@ -68,6 +69,7 @@ from crewai.agents.agent_builder.base_agent import (
 )
 from crewai.agents.agent_executor import AgentExecutor
 from crewai.agents.cache.cache_handler import CacheHandler
+from crewai.agents.tools_handler import ToolsHandler
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
@@ -101,6 +103,7 @@ from crewai.security.fingerprint import Fingerprint
 from crewai.skills.loader import load_skills
 from crewai.skills.models import INSTRUCTIONS, Skill as SkillModel
 from crewai.state.checkpoint_config import CheckpointConfig, apply_checkpoint
+from crewai.tasks.execution_messages import clear_execution_messages
 from crewai.telemetry import Telemetry
 from crewai.tools.agent_tools.agent_tools import AgentTools
 from crewai.tools.tool_failure import (
@@ -154,6 +157,7 @@ if TYPE_CHECKING:
     from crewai.task import Task
     from crewai.tools.base_tool import BaseTool
     from crewai.tools.structured_tool import CrewStructuredTool
+    from crewai.tools.tool_calling import InstructorToolCalling, ToolCalling
     from crewai.utilities.types import LLMMessage
 
 
@@ -175,6 +179,87 @@ def _is_resuming_agent_executor(
 ) -> TypeIs[AgentExecutor]:
     """Type guard: True when the executor is resuming from a checkpoint."""
     return isinstance(executor, AgentExecutor) and executor._resuming
+
+
+class _ExecutorToolsHandler(ToolsHandler):
+    """One executor's tools handler: it keeps that executor's run's last tool
+    use, and passes each tool use on to the agent's handler."""
+
+    reports_to: ToolsHandler
+
+    def on_tool_use(
+        self,
+        calling: ToolCalling | InstructorToolCalling,
+        output: Any,
+        should_cache: bool = True,
+    ) -> None:
+        self.last_used_tool = calling
+        self.reports_to.on_tool_use(
+            calling=calling, output=output, should_cache=should_cache
+        )
+
+
+class _Taking:
+    """One execution's hold on the executor its preparation took."""
+
+    __slots__ = ("executor", "held", "token")
+
+    def __init__(self) -> None:
+        self.executor: AgentExecutor | None = None
+        self.held = False
+        self.token: contextvars.Token[dict[int, _Taking] | None] | None = None
+
+
+# Keyed by agent id, so an execution of another agent nested in one (a
+# delegation) does not displace that one's taking.
+_takings: contextvars.ContextVar[dict[int, _Taking] | None] = contextvars.ContextVar(
+    "crewai_agent_takings", default=None
+)
+
+
+def _take_executor(executor: AgentExecutor) -> bool:
+    """Take ``executor`` for one holder; False when another execution uses it."""
+    with executor._execution_lock:
+        if executor._is_executing or executor._holders:
+            return False
+        executor._holders = 1
+        return True
+
+
+def _add_holder(executor: AgentExecutor | None) -> None:
+    if executor is not None:
+        with executor._execution_lock:
+            executor._holders += 1
+
+
+def _release_holder(executor: AgentExecutor | None) -> None:
+    if executor is not None:
+        with executor._execution_lock:
+            executor._holders -= 1
+
+
+def _enter_execution(agent: Agent) -> _Taking:
+    """Start one execution of ``agent``; what it takes is held until it exits."""
+    taking = _Taking()
+    taking.token = _takings.set({**(_takings.get() or {}), id(agent): taking})
+    return taking
+
+
+def _release_taking(taking: _Taking | None) -> None:
+    if taking is not None and taking.held:
+        taking.held = False
+        _release_holder(taking.executor)
+
+
+def _exit_execution(taking: _Taking) -> None:
+    _release_taking(taking)
+    if taking.token is not None:
+        _takings.reset(taking.token)
+
+
+def _current_taking(agent: Agent) -> _Taking | None:
+    takings = _takings.get()
+    return takings.get(id(agent)) if takings else None
 
 
 def _validate_executor_class(value: Any) -> Any:
@@ -900,7 +985,7 @@ class Agent(BaseAgent):
             ),
         )
 
-        save_last_messages(self)
+        save_last_messages(self, self._taken_executor())
         self._cleanup_mcp_clients()
 
         return result
@@ -1023,9 +1108,11 @@ class Agent(BaseAgent):
         """
         spreadsheets = read_spreadsheet_inputs(task_input_text(task))
         scope = enter_spreadsheet_scope(spreadsheets)
+        taking = _enter_execution(self)
         try:
             return self._execute_task(task, context, tools, spreadsheets)
         finally:
+            _exit_execution(taking)
             exit_spreadsheet_scope(scope)
 
     def _execute_task(
@@ -1082,7 +1169,9 @@ class Agent(BaseAgent):
             )
             raise e
         except Exception as e:
-            # The retry runs a whole execute_task of its own, result already finalized.
+            # The retry runs a whole execute_task of its own, result already
+            # finalized, and reuses the executor this attempt lets go of here.
+            _release_taking(_current_taking(self))
             return self._handle_execution_error(e, task, context, tools)
 
         return self._finalize_task_execution(task, result)
@@ -1103,29 +1192,53 @@ class Agent(BaseAgent):
             RuntimeError: If execution fails for other reasons.
         """
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
-                ctx.run,
-                self._execute_without_timeout,
-                task_prompt=task_prompt,
-                task=task,
-            )
+        # The caller finalizes this execution; an execution of this agent nested
+        # in the worker must not fill the task's messages record.
+        ctx.run(clear_execution_messages)
+        executor = self._taken_executor()
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
+        def run_worker() -> None:
+            # The hold goes before the outcome: a caller woken by a failure
+            # retries at once, and the retry must find the executor free.
             try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError as e:
-                future.cancel()
-                raise TimeoutError(
-                    f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
-                ) from e
-            except _passthrough_exceptions:
-                # Wrapping a deliberate stop in RuntimeError would hide it from
-                # _check_execution_error and trigger the retry loop instead.
-                future.cancel()
-                raise
-            except Exception as e:
-                future.cancel()
-                raise RuntimeError(f"Task execution failed: {e!s}") from e
+                result = ctx.run(
+                    self._execute_without_timeout, task_prompt=task_prompt, task=task
+                )
+            except BaseException as e:
+                _release_holder(executor)
+                future.set_exception(e)
+            else:
+                _release_holder(executor)
+                future.set_result(result)
+
+        # Daemon, and never joined: the caller abandons a worker still running at
+        # the deadline, and the interpreter does not join this thread at exit.
+        worker = Thread(target=run_worker, daemon=True)
+        # Added here, before the thread exists, so the caller's release on
+        # TimeoutError cannot free the executor the worker is about to invoke.
+        _add_holder(executor)
+        try:
+            worker.start()
+        except BaseException:
+            # start() also raises after the thread exists, from a signal handler
+            # during its wait; run_worker then releases. A started thread is
+            # listed until it ends, and has its ident by then.
+            if worker not in threading.enumerate() and worker.ident is None:
+                _release_holder(executor)
+            raise
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as e:
+            raise TimeoutError(
+                f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
+            ) from e
+        except _passthrough_exceptions:
+            # Wrapping a deliberate stop in RuntimeError would hide it from
+            # _check_execution_error and trigger the retry loop instead.
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Task execution failed: {e!s}") from e
 
     def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
         """Execute a task without a timeout.
@@ -1137,14 +1250,15 @@ class Agent(BaseAgent):
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        executor = self._taken_executor()
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        invoke_result = self.agent_executor.invoke(
+        invoke_result = executor.invoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1183,9 +1297,11 @@ class Agent(BaseAgent):
             read_spreadsheet_inputs, task_input_text(task)
         )
         scope = enter_spreadsheet_scope(spreadsheets)
+        taking = _enter_execution(self)
         try:
             return await self._aexecute_task(task, context, tools, spreadsheets)
         finally:
+            _exit_execution(taking)
             exit_spreadsheet_scope(scope)
 
     async def _aexecute_task(
@@ -1235,7 +1351,9 @@ class Agent(BaseAgent):
             )
             raise e
         except Exception as e:
-            # The retry runs a whole aexecute_task of its own, result already finalized.
+            # The retry runs a whole aexecute_task of its own, result already
+            # finalized, and reuses the executor this attempt lets go of here.
+            _release_taking(_current_taking(self))
             return await self._handle_execution_error_async(e, task, context, tools)
 
         return self._finalize_task_execution(task, result)
@@ -1278,14 +1396,15 @@ class Agent(BaseAgent):
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        executor = self._taken_executor()
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        result = await self.agent_executor.ainvoke(
+        result = await executor.ainvoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1337,28 +1456,40 @@ class Agent(BaseAgent):
     def create_agent_executor(
         self, tools: list[BaseTool] | None = None, task: Task | None = None
     ) -> None:
-        """Create the AgentExecutor for the agent."""
+        """Create the AgentExecutor for the agent.
+
+        The agent's executor is reused and rebound only when no other execution
+        is using it; otherwise a fresh one replaces it on the agent. With a
+        ``task``, inside ``execute_task``, the execution keeps the executor it
+        got until it ends; otherwise the executor is free again on return.
+        """
         configured_tools = tools if tools is not None else self.tools or []
         raw_tools = self._add_skill_loader_tool(list(configured_tools), task=task)
         parsed_tools = parse_tools(raw_tools)
 
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        if self.agent_executor is not None:
-            self._update_executor_parameters(
-                task=task,
-                tools=parsed_tools,
-                raw_tools=raw_tools,
-                prompt=prompt,
-                stop_words=stop_words,
-                rpm_limit_fn=rpm_limit_fn,
-            )
+        executor = self.agent_executor
+        if executor is not None and _take_executor(executor):
+            try:
+                self._update_executor_parameters(
+                    executor,
+                    task=task,
+                    tools=parsed_tools,
+                    raw_tools=raw_tools,
+                    prompt=prompt,
+                    stop_words=stop_words,
+                    rpm_limit_fn=rpm_limit_fn,
+                )
+            except BaseException:
+                _release_holder(executor)
+                raise
         else:
             if not isinstance(self.llm, BaseLLM):
                 raise RuntimeError(
                     "LLM must be resolved before creating agent executor."
                 )
-            self.agent_executor = self.executor_class(
+            executor = self.executor_class(
                 llm=self.llm,
                 task=task,
                 agent=self,
@@ -1368,7 +1499,7 @@ class Agent(BaseAgent):
                 original_tools=raw_tools,
                 stop_words=stop_words,
                 max_iter=self.max_iter,
-                tools_handler=self.tools_handler,
+                tools_handler=self._executor_tools_handler(),
                 tools_names=get_tool_names(parsed_tools),
                 tools_description=render_text_description_and_args(parsed_tools),
                 step_callback=self.step_callback,
@@ -1382,11 +1513,19 @@ class Agent(BaseAgent):
                 if task
                 else None,
             )
-            if isinstance(self.agent_executor, AgentExecutor):
-                self.agent_executor.use_better_compaction = self.use_better_compaction
+            if isinstance(executor, AgentExecutor):
+                executor.use_better_compaction = self.use_better_compaction
+            _take_executor(executor)
+            self.agent_executor = executor
+
+        if task is not None:
+            self._hold_for_execution(executor)
+        else:
+            _release_holder(executor)
 
     def _update_executor_parameters(
         self,
+        executor: AgentExecutor,
         task: Task | None,
         tools: list[CrewStructuredTool],
         raw_tools: list[BaseTool],
@@ -1397,6 +1536,7 @@ class Agent(BaseAgent):
         """Update executor parameters without recreating instance.
 
         Args:
+            executor: The executor to rebind, taken by the caller.
             task: Task to execute.
             tools: Parsed tools.
             raw_tools: Original tools.
@@ -1404,32 +1544,67 @@ class Agent(BaseAgent):
             stop_words: Stop words list.
             rpm_limit_fn: RPM limit callback function.
         """
-        if self.agent_executor is None:
-            raise RuntimeError("Agent executor is not initialized.")
         if not isinstance(self.llm, BaseLLM):
             raise RuntimeError(
                 "LLM must be resolved before updating agent executor parameters."
             )
 
         if task is not None:
-            self.agent_executor.task = task
-        self.agent_executor.llm = self.llm
-        self.agent_executor.tools = tools
-        self.agent_executor.original_tools = raw_tools
-        self.agent_executor.prompt = prompt
-        self.agent_executor.stop_words = stop_words
-        self.agent_executor.tools_names = get_tool_names(tools)
-        self.agent_executor.tools_description = render_text_description_and_args(tools)
-        self.agent_executor.response_model = (
+            executor.task = task
+        executor.llm = self.llm
+        executor.tools = tools
+        executor.original_tools = raw_tools
+        executor.prompt = prompt
+        executor.stop_words = stop_words
+        executor.tools_names = get_tool_names(tools)
+        executor.tools_description = render_text_description_and_args(tools)
+        executor.response_model = (
             (task.response_model or task.output_pydantic or task.output_json)
             if task
             else None
         )
 
-        self.agent_executor.tools_handler = self.tools_handler
-        self.agent_executor.request_within_rpm_limit = rpm_limit_fn
-        if isinstance(self.agent_executor, AgentExecutor):
-            self.agent_executor.use_better_compaction = self.use_better_compaction
+        self._bind_own_tools_handler(executor)
+        executor.request_within_rpm_limit = rpm_limit_fn
+        if isinstance(executor, AgentExecutor):
+            executor.use_better_compaction = self.use_better_compaction
+
+    def _executor_tools_handler(self) -> ToolsHandler:
+        """A tools handler for one executor, with the agent's cache, reporting
+        to the agent's handler."""
+        return _ExecutorToolsHandler(
+            cache=self.tools_handler.cache, reports_to=self.tools_handler
+        )
+
+    def _bind_own_tools_handler(self, executor: AgentExecutor) -> None:
+        """Give ``executor`` a tools handler no other executor of this agent uses.
+
+        A handler the agent made for it is kept and given the agent's current
+        cache and handler: the step executor it built holds that object.
+        """
+        handler = executor.tools_handler
+        if isinstance(handler, _ExecutorToolsHandler):
+            handler.cache = self.tools_handler.cache
+            handler.reports_to = self.tools_handler
+        else:
+            executor.tools_handler = self._executor_tools_handler()
+
+    def _hold_for_execution(self, executor: AgentExecutor) -> None:
+        """Keep ``executor``, just taken, until this agent's current execution
+        ends; release it at once when no execution of this agent is preparing."""
+        taking = _current_taking(self)
+        if taking is not None and taking.executor is None:
+            taking.executor = executor
+            taking.held = True
+        else:
+            _release_holder(executor)
+
+    def _taken_executor(self) -> AgentExecutor | None:
+        """The executor the current execution took, else the agent's."""
+        taking = _current_taking(self)
+        if taking is not None and taking.executor is not None:
+            return taking.executor
+        return self.agent_executor
 
     def get_delegation_tools(self, agents: Sequence[BaseAgent]) -> list[BaseTool]:
         agent_tools = AgentTools(agents=agents)
@@ -1491,14 +1666,17 @@ class Agent(BaseAgent):
         self._cleanup_mcp_clients()
         from crewai.mcp.tool_resolver import MCPToolResolver
 
-        self._mcp_resolver = MCPToolResolver(agent=self, logger=self._logger)
-        return self._mcp_resolver.resolve(mcps)
+        # Read through locals: another execution on this agent may clear the
+        # field between two reads of it.
+        resolver = MCPToolResolver(agent=self, logger=self._logger)
+        self._mcp_resolver = resolver
+        return resolver.resolve(mcps)
 
     def _cleanup_mcp_clients(self) -> None:
         """Cleanup MCP client connections after task execution."""
-        if self._mcp_resolver is not None:
-            self._mcp_resolver.cleanup()
-            self._mcp_resolver = None
+        resolver, self._mcp_resolver = self._mcp_resolver, None
+        if resolver is not None:
+            resolver.cleanup()
 
     @staticmethod
     def get_multimodal_tools() -> Sequence[BaseTool]:
@@ -1752,8 +1930,9 @@ class Agent(BaseAgent):
 
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        if _is_resuming_agent_executor(self.agent_executor):
-            executor = self.agent_executor
+        executor = self.agent_executor
+        if _is_resuming_agent_executor(executor) and _take_executor(executor):
+            self._hold_for_execution(executor)
             if not isinstance(self.llm, BaseLLM):
                 raise RuntimeError(
                     "LLM must be resolved before resuming agent executor."
@@ -1766,7 +1945,7 @@ class Agent(BaseAgent):
             executor.prompt = prompt
             executor.response_model = response_format
             executor.stop_words = stop_words
-            executor.tools_handler = self.tools_handler
+            self._bind_own_tools_handler(executor)
             executor.step_callback = self.step_callback
             executor.function_calling_llm = cast(
                 BaseLLM | None, self.function_calling_llm
@@ -1785,7 +1964,7 @@ class Agent(BaseAgent):
                 tools_names=get_tool_names(parsed_tools),
                 stop_words=stop_words,
                 tools_description=render_text_description_and_args(parsed_tools),
-                tools_handler=self.tools_handler,
+                tools_handler=self._executor_tools_handler(),
                 original_tools=raw_tools,
                 step_callback=self.step_callback,
                 function_calling_llm=self.function_calling_llm,
@@ -2004,6 +2183,7 @@ class Agent(BaseAgent):
         spreadsheets = read_spreadsheet_inputs(kickoff_input_text(messages))
         execution_token = begin_execution()
         scope = enter_spreadsheet_scope(spreadsheets)
+        taking = _enter_execution(self)
         try:
             executor, inputs, agent_info, parsed_tools = self._prepare_kickoff(
                 messages, response_format, input_files, spreadsheets
@@ -2039,6 +2219,7 @@ class Agent(BaseAgent):
             except Exception as e:
                 self._emit_kickoff_error(agent_info, e)
         finally:
+            _exit_execution(taking)
             exit_spreadsheet_scope(scope)
             end_execution(execution_token)
 
@@ -2388,6 +2569,7 @@ class Agent(BaseAgent):
         )
         execution_token = begin_execution()
         scope = enter_spreadsheet_scope(spreadsheets)
+        taking = _enter_execution(self)
         try:
             executor, inputs, agent_info, parsed_tools = self._prepare_kickoff(
                 messages, response_format, input_files, spreadsheets
@@ -2423,6 +2605,7 @@ class Agent(BaseAgent):
             except Exception as e:
                 self._emit_kickoff_error(agent_info, e)
         finally:
+            _exit_execution(taking)
             exit_spreadsheet_scope(scope)
             end_execution(execution_token)
 

@@ -50,6 +50,7 @@ from crewai.events.types.task_events import (
 from crewai.llms.base_llm import BaseLLM
 from crewai.llms.providers.openai.completion import OpenAICompletion
 from crewai.security import Fingerprint, SecurityConfig
+from crewai.tasks.execution_messages import execution_messages
 from crewai.tasks.output_format import OutputFormat
 from crewai.tasks.task_output import TaskOutput
 from crewai.tools.base_tool import BaseTool
@@ -730,7 +731,10 @@ class Task(BaseModel):
             dispatch(InterceptionPoint.PRE_STEP, pre_step_ctx)
             context = pre_step_ctx.payload
 
-            with tool_failure_collector() as execution_failures:
+            with (
+                tool_failure_collector() as execution_failures,
+                execution_messages(agent) as execution_record,
+            ):
                 result = await agent.aexecute_task(
                     task=self,
                     context=context,
@@ -766,7 +770,7 @@ class Task(BaseModel):
                 json_dict=json_output,
                 agent=agent.role,
                 output_format=self._get_output_format(),
-                messages=agent.last_messages,  # type: ignore[attr-defined]
+                messages=execution_record.read(),
                 tool_failures=list(execution_failures),
             )
 
@@ -889,7 +893,10 @@ class Task(BaseModel):
             dispatch(InterceptionPoint.PRE_STEP, pre_step_ctx)
             context = pre_step_ctx.payload
 
-            with tool_failure_collector() as execution_failures:
+            with (
+                tool_failure_collector() as execution_failures,
+                execution_messages(agent) as execution_record,
+            ):
                 result = agent.execute_task(
                     task=self,
                     context=context,
@@ -925,7 +932,7 @@ class Task(BaseModel):
                 json_dict=json_output,
                 agent=agent.role,
                 output_format=self._get_output_format(),
-                messages=agent.last_messages,  # type: ignore[attr-defined]
+                messages=execution_record.read(),
                 tool_failures=list(execution_failures),
             )
 
@@ -1502,7 +1509,10 @@ Follow these guidelines:
                     content=f"Guardrail {guardrail_index if guardrail_index is not None else ''} blocked (attempt {attempt + 1}/{max_attempts}), retrying due to: {guardrail_result.error}\n",
                     color="yellow",
                 )
-            with tool_failure_collector() as retry_failures:
+            with (
+                tool_failure_collector() as retry_failures,
+                execution_messages(agent) as retry_record,
+            ):
                 result = agent.execute_task(
                     task=self,
                     context=context,
@@ -1533,7 +1543,7 @@ Follow these guidelines:
                 json_dict=json_output,
                 agent=agent.role,
                 output_format=self._get_output_format(),
-                messages=agent.last_messages,  # type: ignore[attr-defined]
+                messages=retry_record.read(),
                 tool_failures=merge_tool_failures(accumulated_failures, retry_failures),
             )
             accumulated_failures = list(task_output.tool_failures)
@@ -1623,7 +1633,10 @@ Follow these guidelines:
                     content=f"Guardrail {guardrail_index if guardrail_index is not None else ''} blocked (attempt {attempt + 1}/{max_attempts}), retrying due to: {guardrail_result.error}\n",
                     color="yellow",
                 )
-            with tool_failure_collector() as retry_failures:
+            with (
+                tool_failure_collector() as retry_failures,
+                execution_messages(agent) as retry_record,
+            ):
                 result = await agent.aexecute_task(
                     task=self,
                     context=context,
@@ -1654,7 +1667,7 @@ Follow these guidelines:
                 json_dict=json_output,
                 agent=agent.role,
                 output_format=self._get_output_format(),
-                messages=agent.last_messages,  # type: ignore[attr-defined]
+                messages=retry_record.read(),
                 tool_failures=merge_tool_failures(accumulated_failures, retry_failures),
             )
             accumulated_failures = list(task_output.tool_failures)
