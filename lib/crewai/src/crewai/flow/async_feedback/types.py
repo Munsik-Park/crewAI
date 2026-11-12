@@ -60,6 +60,9 @@ class PendingFeedbackContext:
             pass would have passed, handed to the joins it completes on resume.
             Restored from JSON: a ``HumanFeedbackResult`` is rebuilt, any other
             value arrives in its JSON form.
+        cut_trigger_labels: The cut or carried triggers a router returned in a
+            pass the pause left before its listeners ran; on resume each re-arms
+            the fired ``or_`` listeners it is dispatched to.
 
     Example:
         ```python
@@ -93,6 +96,7 @@ class PendingFeedbackContext:
     cut_triggers: list[str] = field(default_factory=list)
     carried_cut_triggers: dict[str, list[str]] = field(default_factory=dict)
     cut_trigger_payloads: dict[str, Any] = field(default_factory=dict)
+    cut_trigger_labels: list[str] = field(default_factory=list)
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -207,6 +211,7 @@ class PendingFeedbackContext:
                 trigger: self._payload_to_row(payload)
                 for trigger, payload in self.cut_trigger_payloads.items()
             },
+            "cut_trigger_labels": list(self.cut_trigger_labels),
         }
 
     @classmethod
@@ -265,6 +270,7 @@ class PendingFeedbackContext:
                 trigger: cls._payload_from_row(row)
                 for trigger, row in (data.get("cut_trigger_payloads") or {}).items()
             },
+            cut_trigger_labels=list(data.get("cut_trigger_labels") or []),
         )
 
 
