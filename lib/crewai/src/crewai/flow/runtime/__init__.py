@@ -1318,6 +1318,20 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         )
         instance._initialize_state(state_data)
         instance._pending_feedback_context = pending_context
+        instance._pending_events = {
+            PendingListenerKey(key): set(seen)
+            for key, seen in pending_context.pending_events.items()
+        }
+        # A name the flow no longer defines would raise KeyError when an or_
+        # re-arm looks up its listen condition.
+        instance._fired_or_listeners = {
+            FlowMethodName(name)
+            for name in pending_context.fired_or_listeners
+            if name in instance._definition.methods
+        }
+        instance._completed_methods = {
+            FlowMethodName(name) for name in pending_context.completed_methods
+        }
         instance._is_execution_resuming = True
         # Seed the match id so the resume-phase listener filters its own
         # LLM events (which run with `current_flow_id == instance.flow_id`)
@@ -1586,12 +1600,30 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
+        if context.cut_triggers:
+            for listener_name, _, condition in self._listener_methods():
+                if listener_name in self._fired_or_listeners:
+                    continue
+                if context.method_name in _iter_condition_events(condition):
+                    self._pending_events.setdefault(
+                        PendingListenerKey(str(listener_name)), set()
+                    ).update(context.cut_triggers)
+
         try:
             if emit and collapsed_outcome:
                 await self._execute_listeners(
-                    FlowMethodName(collapsed_outcome),
-                    result,
+                    FlowMethodName(context.method_name), collapsed_outcome
                 )
+                outcome = FlowMethodName(collapsed_outcome)
+                if self._definition.methods[context.method_name].is_start:
+                    await self._execute_listeners(outcome, result)
+                else:
+                    # A routed listener's outcome is a router result of its
+                    # trigger's pass, so conditional starts and or_ re-arms
+                    # apply to it.
+                    await self._execute_listeners(
+                        FlowMethodName(""), result, routed_outcome=outcome
+                    )
             else:
                 await self._execute_listeners(
                     FlowMethodName(context.method_name),
@@ -1612,6 +1644,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     if isinstance(self._state, dict)
                     else self._state.model_dump()
                 )
+                self._snapshot_pause_records(e.context)
                 future = crewai_event_bus.emit(
                     self,
                     FlowPausedEvent(
@@ -2463,6 +2496,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         if isinstance(self._state, dict)
                         else self._state.model_dump()
                     )
+                    self._snapshot_pause_records(e.context)
                     # Emit flow paused event
                     future = crewai_event_bus.emit(
                         self,
@@ -3170,6 +3204,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         trigger_method: FlowMethodName,
         result: Any,
         triggering_event_id: str | None = None,
+        *,
+        routed_outcome: FlowMethodName | None = None,
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
@@ -3182,13 +3218,40 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             result: The result from the triggering method, passed to listeners that accept parameters.
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
+            routed_outcome: An outcome to dispatch as if a router of
+                ``trigger_method`` had returned it, with ``result`` as its payload.
 
         Note:
             - Routers are executed sequentially to maintain flow control
             - Each router's result becomes a new trigger_method
             - Normal listeners are executed in parallel for efficiency
             - Listeners can receive the trigger method's result as a parameter
+            - A pause raised here records on its context the triggers whose
+              listener pass it cut short
         """
+        unrecorded_triggers: list[FlowMethodName] = [trigger_method]
+        try:
+            await self._run_listener_passes(
+                trigger_method,
+                result,
+                triggering_event_id,
+                routed_outcome,
+                unrecorded_triggers,
+            )
+        except HumanFeedbackPending as e:
+            e.context.cut_triggers.extend(
+                str(trigger) for trigger in unrecorded_triggers if trigger
+            )
+            raise
+
+    async def _run_listener_passes(
+        self,
+        trigger_method: FlowMethodName,
+        result: Any,
+        triggering_event_id: str | None,
+        routed_outcome: FlowMethodName | None,
+        unrecorded_triggers: list[FlowMethodName],
+    ) -> None:
         # First, handle routers repeatedly until no router triggers anymore
         router_results = []
         router_result_payloads: dict[str, Any] = {}
@@ -3201,6 +3264,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         # Methods already run per trigger, so a conditional start that also
         # listens to the same event is not run a second time below.
         ran_for_trigger: dict[str, set[FlowMethodName]] = {}
+        if routed_outcome is not None:
+            router_results.append(routed_outcome)
+            unrecorded_triggers.append(routed_outcome)
+            router_result_payloads[str(routed_outcome)] = result
+            router_result_to_feedback[str(routed_outcome)] = result
+            current_trigger = routed_outcome
 
         while True:
             routers_triggered = self._find_triggered_methods(
@@ -3235,6 +3304,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 router_result_str = str(router_result)
                 router_result_event = FlowMethodName(router_result_str)
                 router_results.append(router_result_event)
+                unrecorded_triggers.append(router_result_event)
                 router_result_payloads[router_result_str] = (
                     self.last_human_feedback
                     if self.last_human_feedback is not None
@@ -3259,6 +3329,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
                 )
+                unrecorded_triggers[:] = all_triggers[idx + 1 :]
                 ran_for_trigger.setdefault(str(current_trigger), set()).update(
                     listeners_triggered
                 )
@@ -3308,6 +3379,15 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                                 self._is_execution_resuming = was_resuming
                             else:
                                 await self._execute_start_method(method_name)
+
+    def _snapshot_pause_records(self, context: PendingFeedbackContext) -> None:
+        """Copy the join records, fired ``or_`` set and completed set into ``context``."""
+        context.pending_events = {
+            str(key): sorted(seen) for key, seen in self._pending_events.items()
+        }
+        with self._or_listeners_lock:
+            context.fired_or_listeners = sorted(self._fired_or_listeners)
+        context.completed_methods = sorted(self._completed_methods)
 
     def _condition_met(
         self,

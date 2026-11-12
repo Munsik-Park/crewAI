@@ -43,6 +43,14 @@ class PendingFeedbackContext:
             new uuid. New pauses always store a value.
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
+        pending_events: Each listener's join record when the flow paused - the
+            triggers it has seen since it last ran - restored on resume.
+        fired_or_listeners: Multi-event ``or_`` listeners that had already fired
+            when the flow paused, restored on resume.
+        completed_methods: Methods completed when the flow paused, restored on
+            resume.
+        cut_triggers: Triggers whose listener pass the pause cut short; on
+            resume they are credited to the joins of the reviewed method.
 
     Example:
         ```python
@@ -70,6 +78,10 @@ class PendingFeedbackContext:
     requested_at: datetime = field(default_factory=datetime.now)
     execution_uuid: str | None = None
     trace_context: tuple[int, int] | None = None
+    pending_events: dict[str, list[str]] = field(default_factory=dict)
+    fired_or_listeners: list[str] = field(default_factory=list)
+    completed_methods: list[str] = field(default_factory=list)
+    cut_triggers: list[str] = field(default_factory=list)
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -116,6 +128,12 @@ class PendingFeedbackContext:
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
             "trace_context": list(self.trace_context) if self.trace_context else None,
+            "pending_events": {
+                key: list(seen) for key, seen in self.pending_events.items()
+            },
+            "fired_or_listeners": list(self.fired_or_listeners),
+            "completed_methods": list(self.completed_methods),
+            "cut_triggers": list(self.cut_triggers),
         }
 
     @classmethod
@@ -157,6 +175,13 @@ class PendingFeedbackContext:
             trace_context=(trace_context[0], trace_context[1])
             if trace_context
             else None,
+            pending_events={
+                key: list(seen)
+                for key, seen in (data.get("pending_events") or {}).items()
+            },
+            fired_or_listeners=list(data.get("fired_or_listeners") or []),
+            completed_methods=list(data.get("completed_methods") or []),
+            cut_triggers=list(data.get("cut_triggers") or []),
         )
 
 
