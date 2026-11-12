@@ -12,6 +12,7 @@ import pytest
 
 from crewai import Agent, Crew, Task
 import crewai.agent.core as agent_core
+from crewai.agents.tools_handler import ToolsHandler
 from crewai.hooks.dispatch import HookAborted
 from crewai.llms.base_llm import BaseLLM
 from crewai.state.checkpoint_config import CheckpointConfig
@@ -1234,6 +1235,92 @@ def test_later_execution_repeating_the_workers_tool_call_gets_the_tool_result(
     assert result == "two got the tool's result"
     if not cache:
         assert len(lookups) - lookups_before == 1, "the tool did not run for it"
+
+
+class CountingToolsHandler(ToolsHandler):
+    uses: int = 0
+    last_tool: str | None = None
+
+    def on_tool_use(self, calling: Any, output: Any, should_cache: bool = True) -> None:
+        self.uses += 1
+        self.last_tool = calling.tool_name
+        super().on_tool_use(calling, output, should_cache)
+
+
+@pytest.mark.parametrize("given", ["at-construction", "assigned-after-a-first-run"])
+def test_tool_uses_reach_the_tools_handler_on_the_agent(given: str) -> None:
+    runs: list[str] = []
+    llm = StubLLM(
+        lambda call: final("done") if "tool_a-result" in call.text else act("tool_a")
+    )
+    handler = CountingToolsHandler()
+    earlier = CountingToolsHandler() if given != "at-construction" else handler
+    agent = make_agent(llm, tools=[recording_tool("tool_a", runs)], tools_handler=earlier)
+    if given != "at-construction":
+        agent.execute_task(make_task("TASK-FIRST", agent))
+        agent.tools_handler = handler
+
+    agent.execute_task(make_task("TASK-NEXT", agent))
+
+    assert (handler.uses, handler.last_tool) == (1, "tool_a"), (
+        "the handler on the agent did not receive the tool use on itself"
+    )
+    if given != "at-construction":
+        assert earlier.uses == 1, "the replaced handler received a later tool use"
+    assert runs == ["tool_a"] * (1 if given == "at-construction" else 2)
+
+
+def test_later_execution_repeating_the_workers_tool_call_with_a_handler_given_on_the_agent(
+    scene: Scene,
+) -> None:
+    tool_gate = scene.gate()
+    worker_gate = scene.gate()
+    worker_after_tool = threading.Event()
+    action = act("lookup", {"q": "x"})
+
+    @tool("lookup")
+    def lookup(q: str) -> str:
+        """Look something up."""
+        if not tool_gate.is_open:
+            tool_gate.wait()
+        return f"lookup-result-for-{q}"
+
+    def reply(call: Call) -> str:
+        if call.task and "TASK-ONE" in call.task:
+            if len(llm.calls_for("TASK-ONE")) == 1:
+                return action
+            worker_after_tool.set()
+            worker_gate.wait()
+            return final("one")
+        if len(llm.calls_for("TASK-TWO")) == 1:
+            tool_gate.open()
+            worker_after_tool.wait(VALVE)
+            return action
+        if REPEATED in call.text:
+            return final("two was told it repeated itself")
+        if "lookup-result-for-x" in call.text:
+            return final("two got the tool's result")
+        return final("two got neither")
+
+    llm = StubLLM(reply)
+    handler = CountingToolsHandler()
+    agent = make_agent(
+        llm, tools=[lookup], max_execution_time=LIMIT, tools_handler=handler
+    )
+    raises_timeout_at_the_limit(
+        lambda: agent.execute_task(make_task("TASK-ONE look up x", agent))
+    )
+    assert tool_gate.reached.is_set() and not tool_gate.is_open, (
+        "precondition: the worker is inside its tool call"
+    )
+
+    result = agent.execute_task(make_task("TASK-TWO look up x", agent))
+
+    assert worker_after_tool.is_set(), "precondition: the worker's tool call ended"
+    assert result == "two got the tool's result"
+    assert handler.uses == 2, (
+        f"the handler on the agent received {handler.uses} of the two runs' tool uses"
+    )
 
 
 class StubKnowledge:
