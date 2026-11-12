@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     from crewai.task import Task
     from crewai.tools.base_tool import BaseTool
     from crewai.tools.structured_tool import CrewStructuredTool
+    from crewai.tools.tool_calling import InstructorToolCalling, ToolCalling
     from crewai.utilities.types import LLMMessage
 
 
@@ -177,6 +178,24 @@ def _is_resuming_agent_executor(
 ) -> TypeIs[AgentExecutor]:
     """Type guard: True when the executor is resuming from a checkpoint."""
     return isinstance(executor, AgentExecutor) and executor._resuming
+
+
+class _ExecutorToolsHandler(ToolsHandler):
+    """One executor's tools handler: it keeps that executor's run's last tool
+    use, and passes each tool use on to the agent's handler."""
+
+    reports_to: ToolsHandler
+
+    def on_tool_use(
+        self,
+        calling: ToolCalling | InstructorToolCalling,
+        output: Any,
+        should_cache: bool = True,
+    ) -> None:
+        self.last_used_tool = calling
+        self.reports_to.on_tool_use(
+            calling=calling, output=output, should_cache=should_cache
+        )
 
 
 class _Taking:
@@ -789,6 +808,9 @@ class Agent(BaseAgent):
         get_env_context()
 
         self.reset_tool_failures()
+
+        if self.tools_handler:
+            self.tools_handler.last_used_tool = None
 
         task_prompt = task.prompt()
         task_prompt = build_task_prompt_with_schema(task, task_prompt)
@@ -1542,20 +1564,24 @@ class Agent(BaseAgent):
             executor.use_better_compaction = self.use_better_compaction
 
     def _executor_tools_handler(self) -> ToolsHandler:
-        """A tools handler for one executor, sharing the agent's cache."""
-        return ToolsHandler(cache=self.tools_handler.cache)
+        """A tools handler for one executor, with the agent's cache, reporting
+        to the agent's handler."""
+        return _ExecutorToolsHandler(
+            cache=self.tools_handler.cache, reports_to=self.tools_handler
+        )
 
     def _bind_own_tools_handler(self, executor: AgentExecutor) -> None:
         """Give ``executor`` a tools handler no other executor of this agent uses.
 
-        A handler it already owns is kept and only gets the agent's cache: the
-        step executor it built holds that object.
+        A handler the agent made for it is kept and given the agent's current
+        cache and handler: the step executor it built holds that object.
         """
         handler = executor.tools_handler
-        if handler is None or handler is self.tools_handler:
-            executor.tools_handler = self._executor_tools_handler()
-        else:
+        if isinstance(handler, _ExecutorToolsHandler):
             handler.cache = self.tools_handler.cache
+            handler.reports_to = self.tools_handler
+        else:
+            executor.tools_handler = self._executor_tools_handler()
 
     def _hold_for_execution(self, executor: AgentExecutor) -> None:
         """Keep ``executor``, just taken, until this agent's current execution
@@ -1854,6 +1880,9 @@ class Agent(BaseAgent):
         if spreadsheets is None:
             spreadsheets = read_spreadsheet_inputs(kickoff_input_text(messages))
         self.reset_tool_failures()
+
+        if self.tools_handler:
+            self.tools_handler.last_used_tool = None
 
         if self.apps:
             platform_tools = self.get_platform_tools(self.apps)
