@@ -2614,6 +2614,104 @@ def _router_join_in_a_self_loop(pause: bool) -> tuple[type[Flow], list[str]]:
     return RouterJoinLoopFlow, ran
 
 
+def _or_listener_on_the_review_and_a_label(
+    listens_to: str, emit: list[str] | None
+) -> Any:
+    def build(pause: bool) -> tuple[type[Flow], list[str]]:
+        ran: list[str] = []
+        provider = _ReviewProvider(pause)
+
+        class OrLabelFlow(Flow):
+            @start()
+            def begin(self) -> None:
+                ran.append("begin")
+
+            @router("begin")
+            def gate(self) -> str:
+                ran.append("gate")
+                return "go"
+
+            @listen(listens_to)
+            @_review(provider, emit)
+            def draft(self) -> str:
+                ran.append("draft")
+                return "content"
+
+            @listen(or_("draft", "go"))
+            def either(self) -> None:
+                ran.append("either")
+
+        return OrLabelFlow, ran
+
+    return build
+
+
+def _or_listener_on_a_carried_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class CarriedLabelFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["fine", "redo"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen(or_("review2", "go"))
+        def either(self) -> None:
+            ran.append("either")
+
+    return CarriedLabelFlow, ran
+
+
+def _or_listener_on_a_label_of_an_enclosing_pass(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class EnclosingPassLabelFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("begin")
+        def mid(self) -> None:
+            ran.append("mid")
+
+        @listen("mid")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(or_("draft", "go"))
+        def either(self) -> None:
+            ran.append("either")
+
+    return EnclosingPassLabelFlow, ran
+
+
 class TestResumeRunsWhatTheReviewRuns:
     """A resumed review runs the listeners, joins and routes it runs unpaused."""
 
@@ -2943,4 +3041,38 @@ class TestResumeRunsWhatTheReviewRuns:
         with tempfile.TemporaryDirectory() as tmpdir:
             ran, result = _run_paused(build, ["approved"], tmpdir)
         assert len(_received_entries(ran)) == 1, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    @pytest.mark.parametrize(
+        ("build", "outcomes", "runs"),
+        [
+            (
+                _or_listener_on_the_review_and_a_label("begin", ["approved", "no"]),
+                ["approved"],
+                2,
+            ),
+            (
+                _or_listener_on_the_review_and_a_label("go", ["approved", "no"]),
+                ["approved"],
+                2,
+            ),
+            (_or_listener_on_a_carried_label, ["approved", "fine"], 2),
+            (_or_listener_on_the_review_and_a_label("begin", None), [""], 1),
+            (_or_listener_on_a_label_of_an_enclosing_pass, ["approved"], 1),
+        ],
+        ids=[
+            "sibling-label",
+            "own-trigger-label",
+            "carried-label",
+            "label-of-a-review-without-emit",
+            "label-of-an-enclosing-listener-pass",
+        ],
+    )
+    def test_or_listener_on_the_review_and_a_cut_label_runs_as_often_as_answered(
+        self, build: Any, outcomes: list[str], runs: int
+    ) -> None:
+        assert _run_answered(build, outcomes).count("either") == runs
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(build, outcomes, tmpdir)
+        assert ran.count("either") == runs, f"resumed run list: {ran}"
         assert not isinstance(result, HumanFeedbackPending)
