@@ -1,8 +1,10 @@
 from pathlib import Path
 import subprocess
 
+from click.testing import CliRunner
 import pytest
 
+from crewai_cli.cli import crewai
 import crewai_cli.install_crew as install_crew_module
 
 
@@ -102,3 +104,29 @@ def test_install_crew_swallows_sync_failure_by_default(fp):
     fp.register(["uv", "sync"], returncode=1, stderr="sync failed\n")
 
     install_crew_module.install_crew([])
+
+
+def test_install_command_exits_with_uv_sync_status(fp, monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'classic'\n")
+    fp.register(["uv", "sync", "--locked"], returncode=3, stderr="lockfile stale\n")
+
+    result = CliRunner().invoke(crewai, ["install", "--locked"])
+
+    assert result.exit_code == 3, (
+        f"expected uv sync's exit status 3, got {result.exit_code}: {result.output}"
+    )
+
+
+def test_install_command_exits_nonzero_when_project_cannot_be_read(
+    fp, monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project\nname = 'broken'\n")
+
+    result = CliRunner().invoke(crewai, ["install"])
+
+    assert result.exit_code != 0, (
+        f"expected a non-zero exit status for an unreadable pyproject.toml: "
+        f"{result.output}"
+    )
