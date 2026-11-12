@@ -1194,7 +1194,11 @@ class Agent(BaseAgent):
 
         # Daemon, and never joined: the caller abandons a worker still running at
         # the deadline, and the interpreter does not join this thread at exit.
-        Thread(target=run_worker, daemon=True).start()
+        try:
+            Thread(target=run_worker, daemon=True).start()
+        except BaseException:
+            _release_holder(executor)
+            raise
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError as e:
