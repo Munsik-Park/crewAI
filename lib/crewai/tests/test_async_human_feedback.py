@@ -2409,6 +2409,211 @@ def _review_on_a_reviews_outcome(pause: bool) -> tuple[type[Flow], list[str]]:
     return ReviewOnOutcomeFlow, ran
 
 
+def _received(name: str, payload: Any) -> str:
+    value = (
+        (payload.method_name, payload.outcome, payload.output, payload.feedback)
+        if isinstance(payload, HumanFeedbackResult)
+        else payload
+    )
+    return f"{name}:{type(payload).__name__}:{value!r}"
+
+
+def _received_entries(ran: list[str]) -> list[str]:
+    return sorted(entry for entry in ran if ":" in entry)
+
+
+def _self_referencing_dict() -> dict[str, Any]:
+    value: dict[str, Any] = {"k": 1}
+    value["self"] = value
+    return value
+
+
+def _join_on_own_trigger_returning(make_payload: Any) -> Any:
+    def build(pause: bool) -> tuple[type[Flow], list[str]]:
+        ran: list[str] = []
+        provider = _ReviewProvider(pause)
+
+        class OwnTriggerPayloadFlow(Flow):
+            @start()
+            def begin(self) -> Any:
+                ran.append("begin")
+                return make_payload()
+
+            @listen("begin")
+            @_review(provider, ["approved", "rejected"])
+            def draft(self) -> str:
+                ran.append("draft")
+                return "content"
+
+            @listen(and_("draft", "begin"))
+            def join(self, payload: Any) -> None:
+                ran.append(_received("join", payload))
+
+        return OwnTriggerPayloadFlow, ran
+
+    return build
+
+
+def _payload_joins_on_a_router_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RoutedPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("go")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self, payload: Any) -> None:
+            ran.append(_received("join_begin", payload))
+
+        @listen(and_("draft", "go"))
+        def join_go(self, payload: Any) -> None:
+            ran.append(_received("join_go", payload))
+
+    return RoutedPayloadFlow, ran
+
+
+def _payload_joins_of_a_review_without_emit(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class PlainReviewPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @listen("begin")
+        @_review(provider, None)
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "ok"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self, payload: Any) -> None:
+            ran.append(_received("join_begin", payload))
+
+        @listen(and_("draft", "ok"))
+        def join_ok(self, payload: Any) -> None:
+            ran.append(_received("join_ok", payload))
+
+    return PlainReviewPayloadFlow, ran
+
+
+def _payload_join_of_a_review_of_a_review(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOfAReviewPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["ok", "no"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen(and_("review2", "begin"))
+        def join_r2_begin(self, payload: Any) -> None:
+            ran.append(_received("join_r2_begin", payload))
+
+    return ReviewOfAReviewPayloadFlow, ran
+
+
+def _payload_join_on_a_reviewed_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+
+    class ReviewedLabelPayloadFlow(Flow):
+        @start()
+        def setup(self) -> None:
+            ran.append("setup")
+
+        @listen("setup")
+        def gen(self) -> str:
+            ran.append("gen")
+            return "gen-payload"
+
+        @listen("gen")
+        @_review(_ReviewProvider(False), ["go", "stop"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "one"
+
+        @listen("go")
+        @_review(_ReviewProvider(pause), ["fin", "no"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "two"
+
+        @listen(and_("r2", "go"))
+        def join_r2_go(self, payload: Any) -> None:
+            ran.append(_received("join_r2_go", payload))
+
+    return ReviewedLabelPayloadFlow, ran
+
+
+def _router_join_in_a_self_loop(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RouterJoinLoopFlow(Flow):
+        @start()
+        def generate(self) -> None:
+            ran.append("generate")
+
+        @listen(or_("generate", "revise"))
+        @_review(provider, ["revise", "approved"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @router(and_("review", "generate"))
+        def rj(self) -> str:
+            ran.append("rj")
+            return "routed"
+
+        @listen("routed")
+        def after_rj(self) -> None:
+            ran.append("after_rj")
+
+        @listen("approved")
+        def publish(self) -> None:
+            ran.append("publish")
+
+    return RouterJoinLoopFlow, ran
+
+
 class TestResumeRunsWhatTheReviewRuns:
     """A resumed review runs the listeners, joins and routes it runs unpaused."""
 
@@ -2652,4 +2857,90 @@ class TestResumeRunsWhatTheReviewRuns:
         assert [ran.count(name) for name in counted] == [1, 1, 1, 1, 1], (
             f"resumed run list: {ran}"
         )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_join_on_the_reviewed_listeners_trigger_receives_its_result(
+        self, use_async: bool
+    ) -> None:
+        build = _join_on_own_trigger_returning(lambda: "begin-payload")
+        expected = ["join:str:'begin-payload'"]
+        assert _received_entries(_run_answered(build, ["approved"])) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(build, ["approved"], tmpdir, use_async=use_async)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    def test_joins_on_a_router_label_receive_their_trigger_payloads(self) -> None:
+        expected = ["join_begin:str:'begin-payload'", "join_go:str:'go'"]
+        answered = _run_answered(_payload_joins_on_a_router_label, ["approved"])
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_payload_joins_on_a_router_label, ["approved"], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    def test_label_join_of_a_review_without_emit_receives_the_label(self) -> None:
+        expected = [
+            "join_begin:HumanFeedbackResult:('draft', None, 'content', 'reply')",
+            "join_ok:str:'ok'",
+        ]
+        answered = _run_answered(_payload_joins_of_a_review_without_emit, [])
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_payload_joins_of_a_review_without_emit, [""], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("restore_each", [True, False])
+    def test_join_of_a_review_paused_inside_a_resumed_review_receives_its_input(
+        self, restore_each: bool
+    ) -> None:
+        expected = ["join_r2_begin:str:'begin-payload'"]
+        outcomes = ["approved", "ok"]
+        answered = _run_answered(_payload_join_of_a_review_of_a_review, outcomes)
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(
+                _payload_join_of_a_review_of_a_review,
+                outcomes,
+                tmpdir,
+                restore_each=restore_each,
+            )
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_join_on_a_reviewed_label_receives_the_feedback_result(self) -> None:
+        expected = ["join_r2_go:HumanFeedbackResult:('r1', 'go', 'one', 'reply')"]
+        answered = _run_answered(_payload_join_on_a_reviewed_label, ["go", "fin"])
+        assert _received_entries(answered) == expected
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(Flow, "_collapse_to_outcome", return_value="go"),
+        ):
+            ran, result = _run_paused(_payload_join_on_a_reviewed_label, ["fin"], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_router_join_in_a_self_loop_runs_as_often_as_answered(self) -> None:
+        counted = ["review", "rj", "after_rj", "publish"]
+        outcomes = ["revise", "approved"]
+        answered = _run_answered(_router_join_in_a_self_loop, outcomes)
+        assert [answered.count(name) for name in counted] == [2, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_router_join_in_a_self_loop, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [2, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+
+    @pytest.mark.parametrize(
+        "make_payload",
+        [lambda: {("a", "b"): 1}, _self_referencing_dict],
+        ids=["tuple-key", "self-referencing"],
+    )
+    def test_trigger_result_json_cannot_hold_still_pauses_and_resumes(
+        self, make_payload: Any
+    ) -> None:
+        build = _join_on_own_trigger_returning(make_payload)
+        assert len(_received_entries(_run_answered(build, ["approved"]))) == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(build, ["approved"], tmpdir)
+        assert len(_received_entries(ran)) == 1, f"resumed run list: {ran}"
         assert not isinstance(result, HumanFeedbackPending)
