@@ -20,7 +20,7 @@ concurrency:
 
 env:
   # codeinside 스크립트 커밋. 스크립트를 바꾸면 이 값도 바꾼다.
-  CODEINSIDE_REF: 0df1ebb0f7a602daadc78f55bd3eec1eaf1bfb68
+  CODEINSIDE_REF: e5b5388f413b61cd517b5fca3415a5c60beb3548
   GRAPH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
@@ -48,4 +48,4 @@ jobs:
       - name: Build CPG, record codebase_hash, smoke-query via MCP
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout target --sha "$GRAPH_SHA"
+        run: python3 codeinside/scripts/ci/joern_cpg_job.py --checkout target --sha "$GRAPH_SHA" --queries codeinside/config/queries/crewai.json
