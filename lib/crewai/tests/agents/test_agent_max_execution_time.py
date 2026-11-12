@@ -937,6 +937,148 @@ def test_timed_execution_whose_worker_thread_cannot_start_leaves_the_executor_re
     )
 
 
+class RaisedBySignalHandler(BaseException):
+    pass
+
+
+class StartRaisingOnceTheThreadExists:
+    def __init__(self, point: str) -> None:
+        self.point = point
+        self.let_run = threading.Event()
+        self.in_call = threading.Event()
+        self.running = threading.Event()
+        self.threads: list[threading.Thread] = []
+
+    def reply(self, call: Call) -> str:
+        if "TASK-WORKER" in call.text and self.point == "while-the-worker-runs":
+            self.in_call.set()
+            self.let_run.wait(VALVE)
+        return final("answer")
+
+    def thread_class(self) -> type[threading.Thread]:
+        control = self
+
+        class WorkerThread(threading.Thread):
+            def _bootstrap(self) -> None:
+                if control.point == "before-the-thread-runs":
+                    # Lets start() return before this thread has run at all: the
+                    # state a signal handler's exception during start()'s wait leaves.
+                    self._started.set()
+                    control.let_run.wait(VALVE)
+                super()._bootstrap()
+
+            def run(self) -> None:
+                control.running.set()
+                if control.point == "before-the-worker-runs":
+                    control.let_run.wait(VALVE)
+                super().run()
+
+            def start(self) -> None:
+                control.threads.append(self)
+                super().start()
+                if control.point == "while-the-worker-runs":
+                    control.in_call.wait(VALVE)
+                elif control.point == "after-the-worker-ended":
+                    self.join(VALVE)
+                raise RaisedBySignalHandler
+
+        return WorkerThread
+
+    def finish(self) -> bool:
+        self.let_run.set()
+        if not self.running.wait(VALVE):
+            return False
+        for thread in self.threads:
+            thread.join(VALVE)
+        return not any(thread.is_alive() for thread in self.threads)
+
+
+@pytest.mark.parametrize(
+    "point",
+    [
+        "before-the-thread-runs",
+        "before-the-worker-runs",
+        "while-the-worker-runs",
+        "after-the-worker-ended",
+    ],
+)
+def test_execution_whose_thread_start_raises_once_the_thread_exists_leaves_the_executor_reusable(
+    monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    start = StartRaisingOnceTheThreadExists(point)
+    llm = StubLLM(start.reply)
+    agent = make_agent(llm, max_execution_time=30)
+    agent.execute_task(make_task("TASK-PRE warm", agent))
+    held = agent.agent_executor
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(agent_core, "Thread", start.thread_class())
+            with pytest.raises(RaisedBySignalHandler):
+                agent.execute_task(make_task("TASK-WORKER", agent))
+    finally:
+        ended = start.finish()
+
+    assert ended, "the interrupted execution's worker did not end"
+    assert any("TASK-WORKER" in c.text for c in llm.calls), (
+        "the interrupted execution's worker did not run"
+    )
+    assert agent.execute_task(make_task("TASK-NEXT", agent)) == "answer"
+    reused = agent.agent_executor is held
+    assert reused, (
+        "the executor stayed taken after the interrupted execution's worker "
+        "ended; a fresh one replaced it"
+    )
+
+
+@pytest.mark.parametrize("point", ["before-the-thread-runs", "before-the-worker-runs"])
+def test_execution_while_an_interrupted_executions_worker_has_not_run_leaves_it_its_executor(
+    monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    runs: list[str] = []
+    start = StartRaisingOnceTheThreadExists(point)
+    llm = StubLLM(start.reply)
+    agent = make_agent(llm, max_execution_time=30)
+    agent.execute_task(make_task("TASK-PRE warm", agent))
+    held = agent.agent_executor
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(agent_core, "Thread", start.thread_class())
+            with pytest.raises(RaisedBySignalHandler):
+                agent.execute_task(
+                    make_task("TASK-WORKER", agent),
+                    tools=[recording_tool("tool_of_the_worker", runs)],
+                )
+        assert not any("TASK-WORKER" in c.text for c in llm.calls), (
+            "precondition: the worker has not run"
+        )
+
+        other = agent.execute_task(
+            make_task("TASK-OTHER", agent),
+            tools=[recording_tool("tool_of_the_other", runs)],
+        )
+        other_took_it = agent.agent_executor is held
+    finally:
+        ended = start.finish()
+
+    assert ended, "the interrupted execution's worker did not end"
+    assert other == "answer"
+    worker_calls = [c for c in llm.calls if "TASK-WORKER" in c.text]
+    assert worker_calls, "the interrupted execution's worker did not run"
+    assert (other_took_it, {c.task for c in worker_calls}) == (
+        False,
+        {"TASK-WORKER"},
+    ), (
+        "(another execution took the worker's executor, the tasks the worker's "
+        "model calls went out under)"
+    )
+    assert all(
+        "tool_of_the_worker" in c.text and "tool_of_the_other" not in c.text
+        for c in worker_calls
+    ), "the worker's model call carried another execution's tools"
+
+
 def _guardrail_failing_once() -> Callable[[Any], tuple[bool, Any]]:
     verdicts: list[bool] = []
 
