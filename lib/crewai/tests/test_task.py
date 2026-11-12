@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import threading
 import time
 from functools import partial
 from hashlib import md5
@@ -1729,10 +1730,14 @@ def test_task_with_max_execution_time_exceeded():
 
     """Test that execution raises TimeoutError when max_execution_time is exceeded."""
 
+    released = threading.Event()
+    ended = threading.Event()
+
     @tool("what amazing tool", result_as_answer=True)
     def my_tool() -> str:
         "My tool"
-        time.sleep(10)
+        released.wait(timeout=10)
+        ended.set()
         return "okay"
 
     researcher = Agent(
@@ -1755,6 +1760,8 @@ def test_task_with_max_execution_time_exceeded():
 
     with pytest.raises(TimeoutError):
         task.execute_sync(agent=researcher)
+    released.set()
+    assert ended.wait(timeout=10), "the timed-out run's tool was still running"
 
 
 @pytest.mark.vcr()
