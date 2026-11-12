@@ -11,8 +11,11 @@ This module tests the async/non-blocking human feedback flow, including:
 
 from __future__ import annotations
 
+import asyncio
+from collections import Counter
 import json
 import os
+from pathlib import Path
 import tempfile
 from datetime import datetime
 from typing import Any
@@ -21,7 +24,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from crewai.flow import Flow, HumanFeedbackResult, start, listen, human_feedback
+from crewai.flow import (
+    Flow,
+    HumanFeedbackResult,
+    and_,
+    human_feedback,
+    listen,
+    or_,
+    router,
+    start,
+)
 from crewai.flow.async_feedback import (
     ConsoleProvider,
     HumanFeedbackPending,
@@ -1820,3 +1832,370 @@ class TestLearnOnResume:
             ["Lead with the customer outcome"], source="hitl"
         )
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
+
+
+class _PausingProvider:
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        raise HumanFeedbackPending(context=context)
+
+
+_ROUTED_REVIEW: dict[str, Any] = {
+    "message": "Approve?",
+    "llm": "gpt-4o-mini",
+    "provider": _PausingProvider(),
+}
+
+
+def _received(arg: Any) -> Any:
+    if isinstance(arg, HumanFeedbackResult):
+        return ("HumanFeedbackResult", arg.outcome)
+    return arg
+
+
+def _calls(ran: list[tuple[str, Any]], method: str) -> list[Any]:
+    return [arg for name, arg in ran if name == method]
+
+
+class TestResumeDispatchesRoutedReview:
+    @pytest.fixture
+    def persistence(self, tmp_path: Path) -> SQLiteFlowPersistence:
+        return SQLiteFlowPersistence(str(tmp_path / "flows.db"))
+
+    @staticmethod
+    def _resume(
+        flow_class: type[Flow],
+        pending: HumanFeedbackPending,
+        persistence: SQLiteFlowPersistence,
+        outcome: str | None = None,
+        resume_mode: str = "resume",
+    ) -> Any:
+        flow = flow_class.from_pending(pending.context.flow_id, persistence)
+        with patch.object(flow, "_collapse_to_outcome", return_value=outcome):
+            if resume_mode == "resume_async":
+                return asyncio.run(flow.resume_async("feedback"))
+            return flow.resume("feedback")
+
+    @pytest.mark.parametrize("also_listens", [False, True])
+    @pytest.mark.parametrize("resume_mode", ["resume", "resume_async"])
+    def test_resumed_start_review_runs_its_own_listeners_and_its_outcome_listeners(
+        self,
+        persistence: SQLiteFlowPersistence,
+        resume_mode: str,
+        also_listens: bool,
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        def reviewed_start(method: Any) -> Any:
+            method = human_feedback(emit=["revise", "approved"], **_ROUTED_REVIEW)(
+                method
+            )
+            if also_listens:
+                method = listen("revise")(method)
+            return start()(method)
+
+        class ReviewFlow(Flow):
+            @reviewed_start
+            def draft(self):
+                ran.append(("draft", None))
+                return "content"
+
+            @listen(draft)
+            def audit(self, label):
+                ran.append(("audit", _received(label)))
+
+            @router(draft)
+            def triage(self, label):
+                ran.append(("triage", _received(label)))
+                return "fast" if label == "approved" else "slow"
+
+            @listen("fast")
+            def fast_path(self):
+                ran.append(("fast_path", None))
+
+            @listen("slow")
+            def slow_path(self):
+                ran.append(("slow_path", None))
+
+            @listen("approved")
+            def publish(self, result):
+                ran.append(("publish", _received(result)))
+
+            @listen(and_(draft, publish))
+            def late_join(self):
+                ran.append(("late_join", None))
+
+            @start("approved")
+            def celebrate(self):
+                ran.append(("celebrate", None))
+
+        pending = ReviewFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        self._resume(ReviewFlow, pending, persistence, "approved", resume_mode)
+
+        assert Counter(ran) == Counter(
+            [
+                ("audit", "approved"),
+                ("triage", "approved"),
+                ("fast_path", None),
+                ("publish", ("HumanFeedbackResult", "approved")),
+                ("late_join", None),
+            ]
+        ), "resume must run what the run answered without a pause runs after draft"
+
+    @pytest.mark.parametrize("resume_mode", ["resume", "resume_async"])
+    def test_resumed_listener_review_also_starts_the_conditional_start_of_its_outcome(
+        self, persistence: SQLiteFlowPersistence, resume_mode: str
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        class ReviewFlow(Flow):
+            @start()
+            def gen(self):
+                ran.append(("gen", None))
+
+            @listen(gen)
+            @human_feedback(emit=["approved", "rejected"], **_ROUTED_REVIEW)
+            def review(self):
+                ran.append(("review", None))
+                return "content"
+
+            @listen(review)
+            def audit(self, label):
+                ran.append(("audit", _received(label)))
+
+            @router(review)
+            def triage(self, label):
+                ran.append(("triage", _received(label)))
+                return "fast" if label == "approved" else "slow"
+
+            @listen("fast")
+            def fast_path(self):
+                ran.append(("fast_path", None))
+
+            @listen("slow")
+            def slow_path(self):
+                ran.append(("slow_path", None))
+
+            @listen("approved")
+            def publish(self, result):
+                ran.append(("publish", _received(result)))
+
+            @listen(and_(review, publish))
+            def late_join(self):
+                ran.append(("late_join", None))
+
+            @listen(or_(review, "approved"))
+            def either(self, result):
+                ran.append(("either", _received(result)))
+
+            @start("approved")
+            def celebrate(self):
+                ran.append(("celebrate", None))
+
+        pending = ReviewFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        self._resume(ReviewFlow, pending, persistence, "approved", resume_mode)
+
+        assert Counter(ran) == Counter(
+            [
+                ("audit", "approved"),
+                ("triage", "approved"),
+                ("fast_path", None),
+                ("publish", ("HumanFeedbackResult", "approved")),
+                ("late_join", None),
+                ("either", "approved"),
+                ("either", ("HumanFeedbackResult", "approved")),
+                ("celebrate", None),
+            ]
+        ), "resume must run what the run answered without a pause runs after review"
+        assert _calls(ran, "either") == [
+            "approved",
+            ("HumanFeedbackResult", "approved"),
+        ], "the completion must be dispatched before the outcome"
+
+    def test_resumed_self_loop_runs_its_own_listener_before_reviewing_again(
+        self, persistence: SQLiteFlowPersistence
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        class SelfLoopFlow(Flow):
+            @start()
+            def gen(self):
+                ran.append(("gen", None))
+
+            @listen(or_("gen", "revise"))
+            @human_feedback(emit=["revise", "approved"], **_ROUTED_REVIEW)
+            def review(self):
+                ran.append(("review", None))
+                return "content"
+
+            @listen(review)
+            def audit(self, label):
+                ran.append(("audit", _received(label)))
+
+            @listen("approved")
+            def publish(self):
+                ran.append(("publish", None))
+
+        pending = SelfLoopFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        repaused = self._resume(SelfLoopFlow, pending, persistence, "revise")
+
+        assert isinstance(repaused, HumanFeedbackPending)
+        assert repaused.context.method_name == "review"
+        assert _calls(ran, "audit") == ["revise"]
+        assert len(_calls(ran, "review")) == 1, "revise must loop back exactly once"
+        ran.clear()
+
+        self._resume(SelfLoopFlow, repaused, persistence, "approved")
+
+        assert _calls(ran, "audit") == ["approved"]
+        assert len(_calls(ran, "publish")) == 1
+        assert _calls(ran, "review") == []
+
+    def test_resumed_revise_outcome_reenters_the_conditional_start_revision_loop(
+        self, persistence: SQLiteFlowPersistence
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        class RevisionLoopFlow(Flow):
+            @start("revise")
+            def draft(self):
+                ran.append(("draft", None))
+
+            @listen(draft)
+            @human_feedback(emit=["revise", "approved"], **_ROUTED_REVIEW)
+            def review(self):
+                ran.append(("review", None))
+                return "content"
+
+            @listen("revise")
+            def log_revision(self):
+                ran.append(("log_revision", None))
+
+            @listen("approved")
+            def publish(self):
+                ran.append(("publish", None))
+
+        pending = RevisionLoopFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        repaused = self._resume(RevisionLoopFlow, pending, persistence, "revise")
+
+        assert isinstance(repaused, HumanFeedbackPending)
+        assert repaused.context.method_name == "review"
+        assert len(_calls(ran, "draft")) == 1
+        assert len(_calls(ran, "review")) == 1
+        assert len(_calls(ran, "log_revision")) == 1, (
+            "the outcome's listeners must run before the revision loop reviews again"
+        )
+        ran.clear()
+
+        self._resume(RevisionLoopFlow, repaused, persistence, "approved")
+
+        assert len(_calls(ran, "publish")) == 1
+        assert _calls(ran, "draft") == []
+        assert _calls(ran, "review") == []
+
+    def test_resume_ends_at_a_review_its_own_listener_pauses_on(
+        self, persistence: SQLiteFlowPersistence
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        class SecondReviewFlow(Flow):
+            @start()
+            @human_feedback(emit=["approved", "rejected"], **_ROUTED_REVIEW)
+            def draft(self):
+                ran.append(("draft", None))
+                return "content"
+
+            @listen(draft)
+            @human_feedback(message="Second look?", provider=_PausingProvider())
+            def second_review(self, label):
+                ran.append(("second_review", _received(label)))
+                return "second"
+
+            @listen(second_review)
+            def after_second(self):
+                ran.append(("after_second", None))
+
+            @listen("approved")
+            def publish(self, result):
+                ran.append(("publish", _received(result)))
+
+        pending = SecondReviewFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        repaused = self._resume(SecondReviewFlow, pending, persistence, "approved")
+
+        assert isinstance(repaused, HumanFeedbackPending)
+        assert repaused.context.method_name == "second_review"
+        assert _calls(ran, "second_review") == ["approved"]
+        assert _calls(ran, "draft") == []
+        ran.clear()
+
+        self._resume(SecondReviewFlow, repaused, persistence)
+
+        assert len(_calls(ran, "after_second")) == 1
+
+    def test_resume_starts_the_outcome_conditional_start_before_a_route_pauses(
+        self, persistence: SQLiteFlowPersistence
+    ) -> None:
+        ran: list[tuple[str, Any]] = []
+
+        class ChainedRouteFlow(Flow):
+            @start()
+            def gen(self):
+                ran.append(("gen", None))
+
+            @listen(gen)
+            @human_feedback(emit=["approved", "rejected"], **_ROUTED_REVIEW)
+            def review(self):
+                ran.append(("review", None))
+                return "content"
+
+            @router("approved")
+            def triage(self):
+                return "fast"
+
+            @listen("fast")
+            @human_feedback(message="Fast-track?", provider=_PausingProvider())
+            def fast_review(self):
+                ran.append(("fast_review", None))
+                return "fast-tracked"
+
+            @listen(fast_review)
+            def after_fast(self):
+                ran.append(("after_fast", None))
+
+            @listen("approved")
+            def publish(self, result):
+                ran.append(("publish", _received(result)))
+
+            @start("approved")
+            def celebrate(self):
+                ran.append(("celebrate", None))
+
+        pending = ChainedRouteFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        ran.clear()
+
+        repaused = self._resume(ChainedRouteFlow, pending, persistence, "approved")
+
+        assert isinstance(repaused, HumanFeedbackPending)
+        assert repaused.context.method_name == "fast_review"
+        assert len(_calls(ran, "celebrate")) == 1
+        assert _calls(ran, "review") == []
+        ran.clear()
+
+        self._resume(ChainedRouteFlow, repaused, persistence)
+
+        assert len(_calls(ran, "after_fast")) == 1
