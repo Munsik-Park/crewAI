@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+import contextvars
 from dataclasses import dataclass
 import json
 import threading
@@ -912,6 +913,29 @@ def test_timed_worker_held_before_its_invoke_keeps_its_executor(
     assert runs == ["tool_b", "tool_a"], f"tools run: {runs}"
 
 
+def test_timed_execution_whose_worker_thread_cannot_start_leaves_the_executor_reusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = make_agent(StubLLM(lambda call: final("answer")), max_execution_time=30)
+    agent.execute_task(make_task("TASK-PRE warm", agent))
+    held = agent.agent_executor
+
+    class UnstartableThread(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_core, "Thread", UnstartableThread)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            agent.execute_task(make_task("TASK-NO-THREAD", agent))
+
+    assert agent.execute_task(make_task("TASK-NEXT", agent)) == "answer"
+    assert agent.agent_executor is held, (
+        "the execution whose worker thread did not start left the executor "
+        "held; a fresh one replaced it"
+    )
+
+
 def _guardrail_failing_once() -> Callable[[Any], tuple[bool, Any]]:
     verdicts: list[bool] = []
 
@@ -1106,6 +1130,56 @@ def test_task_output_is_not_filled_by_an_execution_in_an_abandoned_worker_below_
     text = messages_text(output.messages)
     assert "TASK-T" in text and "TASK-NESTED" not in text, (
         "task T's output carries the nested execution's conversation"
+    )
+
+
+def test_task_output_is_not_filled_by_another_agents_execution_started_inside_it(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    side_gate = scene.gate()
+    side_runs: list[Background] = []
+
+    def side_reply(call: Call) -> str:
+        side_gate.wait()
+        return final("side-answer")
+
+    side_agent = make_agent(StubLLM(side_reply), role="side")
+    side_task = make_task("TASK-SIDE aside", side_agent)
+
+    @tool("start_side_job")
+    def start_side_job() -> str:
+        """Start a side job and return at once."""
+        ctx = contextvars.copy_context()
+        side_runs.append(
+            scene.background(lambda: ctx.run(side_agent.execute_task, side_task))
+        )
+        return "side job started"
+
+    def main_reply(call: Call) -> str:
+        if "side job started" in call.text:
+            return final("main-answer")
+        return act("start_side_job")
+
+    main_agent = make_agent(StubLLM(main_reply), role="main", tools=[start_side_job])
+    main_task = make_task("TASK-MAIN run", main_agent)
+    original = Task._post_agent_execution
+
+    def after_main_saved(self: Task, agent: Any) -> None:
+        if self is main_task:
+            side_gate.open()
+            assert side_runs[0].result() == "side-answer", (
+                "precondition: the side execution ended before the task's output build"
+            )
+        original(self, agent)
+
+    monkeypatch.setattr(Task, "_post_agent_execution", after_main_saved)
+
+    output = main_task.execute_sync(agent=main_agent)
+
+    assert output.raw == "main-answer"
+    text = messages_text(output.messages)
+    assert "TASK-MAIN" in text and "TASK-SIDE" not in text, (
+        "the task's output carries the side agent's conversation"
     )
 
 
