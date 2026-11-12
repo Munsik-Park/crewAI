@@ -34,10 +34,8 @@ _active: ContextVar[ExecutionMessages | None] = ContextVar(
 def execution_messages(agent: Any) -> Iterator[ExecutionMessages]:
     """Record the messages of the execution of ``agent`` run inside the block.
 
-    ``agent.last_messages`` is one field per agent, which an execution
-    overlapping this one on the same agent overwrites; the record is this
-    block's own. The ContextVar is copied into threads and asyncio tasks, so an
-    execution run from a copied context fills it too.
+    The ContextVar is copied into threads and asyncio tasks, so an execution
+    run from a copied context fills it too.
     """
     record = ExecutionMessages(agent)
     token = _active.set(record)
