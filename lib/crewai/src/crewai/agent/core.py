@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import threading
 from threading import Lock, Thread
 import time
 from typing import (
@@ -1195,9 +1196,6 @@ class Agent(BaseAgent):
         # in the worker must not fill the task's messages record.
         ctx.run(clear_execution_messages)
         executor = self._taken_executor()
-        # Added here, before the thread exists, so the caller's release on
-        # TimeoutError cannot free the executor the worker is about to invoke.
-        _add_holder(executor)
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
         def run_worker() -> None:
@@ -1216,10 +1214,18 @@ class Agent(BaseAgent):
 
         # Daemon, and never joined: the caller abandons a worker still running at
         # the deadline, and the interpreter does not join this thread at exit.
+        worker = Thread(target=run_worker, daemon=True)
+        # Added here, before the thread exists, so the caller's release on
+        # TimeoutError cannot free the executor the worker is about to invoke.
+        _add_holder(executor)
         try:
-            Thread(target=run_worker, daemon=True).start()
+            worker.start()
         except BaseException:
-            _release_holder(executor)
+            # start() also raises after the thread exists, from a signal handler
+            # during its wait; run_worker then releases. A started thread is
+            # listed until it ends, and has its ident by then.
+            if worker not in threading.enumerate() and worker.ident is None:
+                _release_holder(executor)
             raise
         try:
             return future.result(timeout=timeout)
