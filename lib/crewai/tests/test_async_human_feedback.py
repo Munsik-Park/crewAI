@@ -1833,9 +1833,6 @@ class TestLearnOnResume:
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
 
 
-# Resuming a routed review runs what the same review answered without a pause runs
-
-
 class _ReviewProvider:
     """Raises ``HumanFeedbackPending`` when ``pause`` is set, else replies at once."""
 
