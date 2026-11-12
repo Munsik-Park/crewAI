@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 
@@ -50,11 +51,15 @@ class PendingFeedbackContext:
         completed_methods: Methods completed when the flow paused, restored on
             resume.
         cut_triggers: Triggers whose listener pass the pause cut short; on
-            resume they are credited to the joins of the reviewed method.
+            resume they are dispatched to the joins of the reviewed method.
         carried_cut_triggers: Triggers still cut short by an earlier pause, each
-            mapped to the reviewed methods whose joins were already credited
-            with it; on resume they are credited to the joins of the reviewed
-            method that name none of those methods.
+            mapped to the reviewed methods whose joins were already given it;
+            on resume they are dispatched to the joins of the reviewed method
+            that name none of those methods.
+        cut_trigger_payloads: The payload each cut or carried trigger's listener
+            pass would have passed, handed to the joins it completes on resume.
+            Restored from JSON: a ``HumanFeedbackResult`` is rebuilt, any other
+            value arrives in its JSON form.
 
     Example:
         ```python
@@ -87,6 +92,7 @@ class PendingFeedbackContext:
     completed_methods: list[str] = field(default_factory=list)
     cut_triggers: list[str] = field(default_factory=list)
     carried_cut_triggers: dict[str, list[str]] = field(default_factory=dict)
+    cut_trigger_payloads: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -113,6 +119,60 @@ class PendingFeedbackContext:
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return PendingFeedbackContext._make_json_safe(dataclasses.asdict(value))
         return str(value)
+
+    @staticmethod
+    def _keyed_json_safe(value: Any) -> Any:
+        """``_make_json_safe`` with each dict key JSON cannot hold made its ``str``."""
+        if isinstance(value, dict):
+            return {
+                key
+                if key is None or isinstance(key, (str, int, float, bool))
+                else str(key): PendingFeedbackContext._keyed_json_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [PendingFeedbackContext._keyed_json_safe(item) for item in value]
+        return PendingFeedbackContext._make_json_safe(value)
+
+    @staticmethod
+    def _payload_to_row(payload: Any) -> dict[str, Any]:
+        """Row form of a cut trigger's payload; never raises, so a pause always persists."""
+        from crewai.flow.human_feedback import HumanFeedbackResult
+
+        safe = PendingFeedbackContext._keyed_json_safe
+        try:
+            if isinstance(payload, HumanFeedbackResult):
+                row: dict[str, Any] = {
+                    "human_feedback_result": {
+                        "output": safe(payload.output),
+                        "feedback": payload.feedback,
+                        "outcome": payload.outcome,
+                        "timestamp": payload.timestamp.isoformat(),
+                        "method_name": payload.method_name,
+                        "metadata": safe(payload.metadata),
+                    }
+                }
+            else:
+                row = {"value": safe(payload)}
+            json.dumps(row)
+        except Exception:
+            try:
+                text = str(payload)
+            except Exception:
+                text = object.__repr__(payload)
+            row = {"value": text}
+        return row
+
+    @staticmethod
+    def _payload_from_row(row: dict[str, Any]) -> Any:
+        from crewai.flow.human_feedback import HumanFeedbackResult
+
+        fields = row.get("human_feedback_result")
+        if fields is None:
+            return row.get("value")
+        return HumanFeedbackResult(
+            **{**fields, "timestamp": datetime.fromisoformat(fields["timestamp"])}
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize context to a dictionary for persistence.
@@ -142,6 +202,10 @@ class PendingFeedbackContext:
             "carried_cut_triggers": {
                 trigger: list(credited)
                 for trigger, credited in self.carried_cut_triggers.items()
+            },
+            "cut_trigger_payloads": {
+                trigger: self._payload_to_row(payload)
+                for trigger, payload in self.cut_trigger_payloads.items()
             },
         }
 
@@ -196,6 +260,10 @@ class PendingFeedbackContext:
                 for trigger, credited in (
                     data.get("carried_cut_triggers") or {}
                 ).items()
+            },
+            cut_trigger_payloads={
+                trigger: cls._payload_from_row(row)
+                for trigger, row in (data.get("cut_trigger_payloads") or {}).items()
             },
         )
 

@@ -1600,29 +1600,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
-        if context.cut_triggers or context.carried_cut_triggers:
-            for listener_name, _, condition in self._listener_methods():
-                if listener_name in self._fired_or_listeners:
-                    continue
-                events = set(_iter_condition_events(condition))
-                if context.method_name not in events:
-                    continue
-                credit = set(context.cut_triggers)
-                credit.update(
-                    trigger
-                    for trigger, credited in context.carried_cut_triggers.items()
-                    if events.isdisjoint(credited)
-                )
-                if credit:
-                    self._pending_events.setdefault(
-                        PendingListenerKey(str(listener_name)), set()
-                    ).update(credit)
-
         try:
             if emit and collapsed_outcome:
                 await self._execute_listeners(
                     FlowMethodName(context.method_name), collapsed_outcome
                 )
+                await self._dispatch_cut_triggers(context)
                 outcome = FlowMethodName(collapsed_outcome)
                 if self._definition.methods[context.method_name].is_start:
                     await self._execute_listeners(outcome, result)
@@ -1638,6 +1621,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     FlowMethodName(context.method_name),
                     result,
                 )
+                await self._dispatch_cut_triggers(context)
         except Exception as e:
             # Check if flow was paused again for human feedback (loop case)
             if isinstance(e, HumanFeedbackPending):
@@ -1663,6 +1647,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 for trigger in e.context.cut_triggers:
                     carried.pop(trigger, None)
                 e.context.carried_cut_triggers = carried
+                for trigger in carried:
+                    e.context.cut_trigger_payloads[trigger] = (
+                        context.cut_trigger_payloads.get(trigger)
+                    )
                 future = crewai_event_bus.emit(
                     self,
                     FlowPausedEvent(
@@ -3245,9 +3233,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             - Normal listeners are executed in parallel for efficiency
             - Listeners can receive the trigger method's result as a parameter
             - A pause raised here records on its context the triggers whose
-              listener pass it cut short
+              listener pass it cut short, with the payload each pass would pass
         """
         unrecorded_triggers: list[FlowMethodName] = [trigger_method]
+        router_result_payloads: dict[str, Any] = {}
         try:
             await self._run_listener_passes(
                 trigger_method,
@@ -3255,11 +3244,15 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 triggering_event_id,
                 routed_outcome,
                 unrecorded_triggers,
+                router_result_payloads,
             )
         except HumanFeedbackPending as e:
-            e.context.cut_triggers.extend(
-                str(trigger) for trigger in unrecorded_triggers if trigger
-            )
+            for trigger in unrecorded_triggers:
+                if trigger:
+                    e.context.cut_triggers.append(str(trigger))
+                    e.context.cut_trigger_payloads.setdefault(
+                        str(trigger), router_result_payloads.get(str(trigger), result)
+                    )
             raise
 
     async def _run_listener_passes(
@@ -3269,10 +3262,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         triggering_event_id: str | None,
         routed_outcome: FlowMethodName | None,
         unrecorded_triggers: list[FlowMethodName],
+        router_result_payloads: dict[str, Any],
     ) -> None:
         # First, handle routers repeatedly until no router triggers anymore
         router_results = []
-        router_result_payloads: dict[str, Any] = {}
         router_result_to_feedback: dict[
             str, Any
         ] = {}  # Map outcome -> HumanFeedbackResult
@@ -3352,35 +3345,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     listeners_triggered
                 )
                 if listeners_triggered:
-                    listener_result = router_result_payloads.get(
-                        str(current_trigger), result
+                    await self._run_triggered_listeners(
+                        listeners_triggered,
+                        router_result_payloads.get(str(current_trigger), result),
+                        current_triggering_event_id,
                     )
-                    racing_group = self._get_racing_group_for_listeners(
-                        listeners_triggered
-                    )
-                    if racing_group:
-                        racing_members, _ = racing_group
-                        other_listeners = [
-                            name
-                            for name in listeners_triggered
-                            if name not in racing_members
-                        ]
-                        await self._execute_racing_listeners(
-                            racing_members,
-                            other_listeners,
-                            listener_result,
-                            current_triggering_event_id,
-                        )
-                    else:
-                        tasks = [
-                            self._execute_single_listener(
-                                listener_name,
-                                listener_result,
-                                current_triggering_event_id,
-                            )
-                            for listener_name in listeners_triggered
-                        ]
-                        await asyncio.gather(*tasks)
 
                 if current_trigger in router_results:
                     for method_name in self._start_method_names():
@@ -3397,6 +3366,57 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                                 self._is_execution_resuming = was_resuming
                             else:
                                 await self._execute_start_method(method_name)
+
+    async def _run_triggered_listeners(
+        self,
+        listeners_triggered: list[FlowMethodName],
+        listener_result: Any,
+        triggering_event_id: str | None,
+    ) -> None:
+        racing_group = self._get_racing_group_for_listeners(listeners_triggered)
+        if racing_group:
+            racing_members, _ = racing_group
+            other_listeners = [
+                name for name in listeners_triggered if name not in racing_members
+            ]
+            await self._execute_racing_listeners(
+                racing_members,
+                other_listeners,
+                listener_result,
+                triggering_event_id,
+            )
+        else:
+            tasks = [
+                self._execute_single_listener(
+                    listener_name,
+                    listener_result,
+                    triggering_event_id,
+                )
+                for listener_name in listeners_triggered
+            ]
+            await asyncio.gather(*tasks)
+
+    async def _dispatch_cut_triggers(self, context: PendingFeedbackContext) -> None:
+        """Pass each cut trigger, with its payload, to the reviewed method's listeners."""
+        triggers: list[tuple[str, list[str]]] = [
+            (trigger, []) for trigger in context.cut_triggers
+        ]
+        triggers.extend(context.carried_cut_triggers.items())
+        for trigger, credited in triggers:
+            served: set[FlowMethodName] = set()
+            for listener_name, _, condition in self._listener_methods():
+                events = set(_iter_condition_events(condition))
+                if context.method_name in events and events.isdisjoint(credited):
+                    served.add(listener_name)
+            listeners_triggered = self._find_triggered_methods(
+                FlowMethodName(trigger), router_only=False, among=served
+            )
+            if listeners_triggered:
+                await self._run_triggered_listeners(
+                    listeners_triggered,
+                    context.cut_trigger_payloads.get(trigger),
+                    None,
+                )
 
     def _snapshot_pause_records(self, context: PendingFeedbackContext) -> None:
         """Copy the join records, fired ``or_`` set and completed set into ``context``."""
@@ -3421,13 +3441,19 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         return True
 
     def _find_triggered_methods(
-        self, trigger_method: FlowMethodName, router_only: bool
+        self,
+        trigger_method: FlowMethodName,
+        router_only: bool,
+        *,
+        among: set[FlowMethodName] | None = None,
     ) -> list[FlowMethodName]:
         triggered: list[FlowMethodName] = []
 
         for listener_name, method_definition, condition in self._listener_methods():
             is_router = method_definition.router
             if router_only != is_router:
+                continue
+            if among is not None and listener_name not in among:
                 continue
 
             should_check_fired = _is_multi_event_or(condition) and not is_router
