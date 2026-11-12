@@ -2291,6 +2291,124 @@ def _join_input_recurring(pause: bool) -> tuple[type[Flow], list[str]]:
     return RecurringInputFlow, ran
 
 
+def _review_of_a_review(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOfAReviewFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["ok", "no"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen("approved")
+        def on_approved(self) -> None:
+            ran.append("on_approved")
+
+        @listen("ok")
+        def on_ok(self) -> None:
+            ran.append("on_ok")
+
+        @listen(and_("review2", "begin"))
+        def join_r2_begin(self) -> None:
+            ran.append("join_r2_begin")
+
+    return ReviewOfAReviewFlow, ran
+
+
+def _three_chained_reviews(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ThreeChainedReviewsFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["a1", "x1"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "one"
+
+        @listen("r1")
+        @_review(provider, ["a2", "x2"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "two"
+
+        @listen("r2")
+        @_review(provider, ["a3", "x3"])
+        def r3(self) -> str:
+            ran.append("r3")
+            return "three"
+
+        @listen(and_("r3", "begin"))
+        def join_r3_begin(self) -> None:
+            ran.append("join_r3_begin")
+
+        @listen(and_("r3", "r1"))
+        def join_r3_r1(self) -> None:
+            ran.append("join_r3_r1")
+
+    return ThreeChainedReviewsFlow, ran
+
+
+def _review_on_a_reviews_outcome(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOnOutcomeFlow(Flow):
+        @start()
+        def setup(self) -> None:
+            ran.append("setup")
+
+        @listen("setup")
+        def gen(self) -> None:
+            ran.append("gen")
+
+        @listen("gen")
+        @_review(provider, ["go", "stop"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "c"
+
+        @listen("go")
+        @_review(provider, ["fin", "no"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "d"
+
+        @listen(and_("r2", "gen"))
+        def join_r2_gen(self) -> None:
+            ran.append("join_r2_gen")
+
+        @listen("r1")
+        def on_r1(self) -> None:
+            ran.append("on_r1")
+
+        @listen("go")
+        def on_go(self) -> None:
+            ran.append("on_go")
+
+        @listen("fin")
+        def on_fin(self) -> None:
+            ran.append("on_fin")
+
+    return ReviewOnOutcomeFlow, ran
+
+
 class TestResumeRunsWhatTheReviewRuns:
     """A resumed review runs the listeners, joins and routes it runs unpaused."""
 
@@ -2494,3 +2612,44 @@ class TestResumeRunsWhatTheReviewRuns:
         with tempfile.TemporaryDirectory() as tmpdir:
             ran, _ = _run_paused(_join_input_recurring, outcomes, tmpdir)
         assert ran == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("restore_each", [True, False])
+    def test_join_of_a_review_paused_inside_a_resumed_review(
+        self, restore_each: bool
+    ) -> None:
+        counted = ["draft", "review2", "on_ok", "join_r2_begin"]
+        outcomes = ["approved", "ok"]
+        answered = _run_answered(_review_of_a_review, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(
+                _review_of_a_review, outcomes, tmpdir, restore_each=restore_each
+            )
+        assert [ran.count(name) for name in counted] == [1, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_joins_of_the_third_review_in_a_chain_of_paused_reviews(self) -> None:
+        counted = ["join_r3_begin", "join_r3_r1"]
+        outcomes = ["a1", "a2", "a3"]
+        answered = _run_answered(_three_chained_reviews, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(_three_chained_reviews, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_join_of_a_review_paused_on_a_resumed_reviews_outcome(self) -> None:
+        counted = ["r1", "r2", "on_r1", "on_fin", "join_r2_gen"]
+        outcomes = ["go", "fin"]
+        answered = _run_answered(_review_on_a_reviews_outcome, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(_review_on_a_reviews_outcome, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [1, 1, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
