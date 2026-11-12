@@ -1192,8 +1192,8 @@ class Agent(BaseAgent):
                 _release_holder(executor)
                 future.set_result(result)
 
-        # Daemon, and never joined: a worker still running at the deadline is
-        # abandoned and must not keep the interpreter from exiting.
+        # Daemon, and never joined: the caller abandons a worker still running at
+        # the deadline, and the interpreter does not join this thread at exit.
         Thread(target=run_worker, daemon=True).start()
         try:
             return future.result(timeout=timeout)
