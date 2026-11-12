@@ -51,6 +51,10 @@ class PendingFeedbackContext:
             resume.
         cut_triggers: Triggers whose listener pass the pause cut short; on
             resume they are credited to the joins of the reviewed method.
+        carried_cut_triggers: Triggers still cut short by an earlier pause, each
+            mapped to the reviewed methods whose joins were already credited
+            with it; on resume they are credited to the joins of the reviewed
+            method that name none of those methods.
 
     Example:
         ```python
@@ -82,6 +86,7 @@ class PendingFeedbackContext:
     fired_or_listeners: list[str] = field(default_factory=list)
     completed_methods: list[str] = field(default_factory=list)
     cut_triggers: list[str] = field(default_factory=list)
+    carried_cut_triggers: dict[str, list[str]] = field(default_factory=dict)
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -134,6 +139,10 @@ class PendingFeedbackContext:
             "fired_or_listeners": list(self.fired_or_listeners),
             "completed_methods": list(self.completed_methods),
             "cut_triggers": list(self.cut_triggers),
+            "carried_cut_triggers": {
+                trigger: list(credited)
+                for trigger, credited in self.carried_cut_triggers.items()
+            },
         }
 
     @classmethod
@@ -182,6 +191,12 @@ class PendingFeedbackContext:
             fired_or_listeners=list(data.get("fired_or_listeners") or []),
             completed_methods=list(data.get("completed_methods") or []),
             cut_triggers=list(data.get("cut_triggers") or []),
+            carried_cut_triggers={
+                trigger: list(credited)
+                for trigger, credited in (
+                    data.get("carried_cut_triggers") or {}
+                ).items()
+            },
         )
 
 

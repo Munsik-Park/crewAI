@@ -1600,14 +1600,23 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
-        if context.cut_triggers:
+        if context.cut_triggers or context.carried_cut_triggers:
             for listener_name, _, condition in self._listener_methods():
                 if listener_name in self._fired_or_listeners:
                     continue
-                if context.method_name in _iter_condition_events(condition):
+                events = set(_iter_condition_events(condition))
+                if context.method_name not in events:
+                    continue
+                credit = set(context.cut_triggers)
+                credit.update(
+                    trigger
+                    for trigger, credited in context.carried_cut_triggers.items()
+                    if events.isdisjoint(credited)
+                )
+                if credit:
                     self._pending_events.setdefault(
                         PendingListenerKey(str(listener_name)), set()
-                    ).update(context.cut_triggers)
+                    ).update(credit)
 
         try:
             if emit and collapsed_outcome:
@@ -1645,6 +1654,15 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     else self._state.model_dump()
                 )
                 self._snapshot_pause_records(e.context)
+                carried = {
+                    trigger: sorted({*credited, context.method_name})
+                    for trigger, credited in context.carried_cut_triggers.items()
+                }
+                for trigger in context.cut_triggers:
+                    carried[trigger] = [context.method_name]
+                for trigger in e.context.cut_triggers:
+                    carried.pop(trigger, None)
+                e.context.carried_cut_triggers = carried
                 future = crewai_event_bus.emit(
                     self,
                     FlowPausedEvent(
