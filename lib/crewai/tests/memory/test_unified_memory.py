@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 import threading
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -1424,3 +1425,199 @@ def test_private_record_still_visible_to_its_source_and_when_included(lancedb_pa
     assert [m.record.content for m in with_private] == ["private to worker-1"], (
         "include_private=True must still see everything"
     )
+
+
+def _recording_store() -> MagicMock:
+    store = MagicMock()
+    store.search.return_value = []
+    store.list_scopes.return_value = []
+    return store
+
+
+def _recording_memory(**config: Any) -> tuple[Any, MagicMock]:
+    from crewai.memory.unified_memory import Memory
+
+    store = _recording_store()
+    mem = Memory(
+        storage=store,
+        llm=MagicMock(),
+        embedder=lambda texts: [[0.1] * 4 for _ in texts],
+        **config,
+    )
+    return mem, store
+
+
+def _search_limits(store: MagicMock) -> list[int]:
+    return [c.kwargs["limit"] for c in store.search.call_args_list]
+
+
+def _factor_kwargs(factor: int | None) -> dict[str, int]:
+    return {} if factor is None else {"recall_oversample_factor": factor}
+
+
+@pytest.mark.parametrize(("factor", "expected"), [(None, 10), (1, 5), (3, 15)])
+def test_deep_recall_asks_every_search_for_limit_times_factor(
+    factor: int | None, expected: int
+) -> None:
+    mem, store = _recording_memory(exploration_budget=2, **_factor_kwargs(factor))
+
+    mem.recall("short query", limit=5, depth="deep")
+
+    assert _search_limits(store) == [expected] * 3, (
+        "the initial search and both re-searches must ask for limit * factor"
+    )
+
+
+@pytest.mark.parametrize(("factor", "expected"), [(1, 5), (3, 15)])
+def test_recall_flow_asks_storage_with_the_factor_of_its_config(
+    factor: int, expected: int
+) -> None:
+    from crewai.memory.recall_flow import RecallFlow
+
+    store = _recording_store()
+    flow = RecallFlow(
+        storage=store,
+        llm=MagicMock(),
+        embedder=lambda texts: [[0.1] * 4 for _ in texts],
+        config=MemoryConfig(recall_oversample_factor=factor),
+    )
+
+    flow.kickoff(
+        inputs={"query": "short query", "scope": None, "categories": [], "limit": 5}
+    )
+
+    assert _search_limits(store) == [expected] * 2, (
+        "the initial search and the re-search must ask for limit * the config's factor"
+    )
+
+
+@pytest.mark.parametrize(
+    ("depth", "factor", "expected_limit", "searches_per_scope"),
+    [
+        ("shallow", None, 10, 1),
+        ("shallow", 1, 5, 1),
+        ("shallow", 3, 15, 1),
+        ("deep", None, 20, 2),
+        ("deep", 1, 5, 2),
+        ("deep", 3, 45, 2),
+    ],
+)
+def test_slice_asks_each_scope_for_limit_times_the_factor_of_its_memory(
+    depth: str, factor: int | None, expected_limit: int, searches_per_scope: int
+) -> None:
+    from crewai.memory.memory_scope import MemorySlice
+
+    mem, store = _recording_memory(**_factor_kwargs(factor))
+    sl = MemorySlice(memory=mem, scopes=["/a", "/b"])
+
+    sl.recall("short query", limit=5, depth=depth)
+
+    requests = [(c.kwargs["scope_prefix"], c.kwargs["limit"]) for c in store.search.call_args_list]
+    assert requests == [("/a", expected_limit)] * searches_per_scope + [
+        ("/b", expected_limit)
+    ] * searches_per_scope
+
+
+@pytest.mark.parametrize("factor", [None, 1, 3])
+def test_shallow_recall_asks_exactly_limit_whatever_the_factor(
+    factor: int | None,
+) -> None:
+    mem, store = _recording_memory(**_factor_kwargs(factor))
+
+    mem.recall("short query", limit=5, depth="shallow")
+
+    assert _search_limits(store) == [5]
+
+
+@pytest.mark.parametrize("value", [0, 2.5])
+def test_out_of_range_oversample_factor_is_rejected_at_construction(
+    value: float,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc_info:
+        _recording_memory(recall_oversample_factor=value)
+
+    assert exc_info.value.title == "Memory"
+    assert [e["loc"] for e in exc_info.value.errors()] == [("recall_oversample_factor",)]
+
+
+@pytest.mark.parametrize(("depth", "through_slice"), [("deep", False), ("deep", True), ("shallow", True)])
+def test_result_count_stays_capped_at_limit_with_a_larger_factor(
+    depth: str, through_slice: bool
+) -> None:
+    from crewai.memory.memory_scope import MemorySlice
+
+    mem, store = _recording_memory(recall_oversample_factor=3)
+    store.search.side_effect = lambda *args, **kwargs: [
+        (MemoryRecord(content=f"record {i}"), 0.9) for i in range(15)
+    ]
+    recaller = MemorySlice(memory=mem, scopes=["/a", "/b"]) if through_slice else mem
+
+    results = recaller.recall("short query", limit=5, depth=depth)
+
+    assert len(results) == 5
+
+
+@pytest.fixture
+def detached_runtime_state(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from crewai.events.event_bus import crewai_event_bus
+
+    # from_checkpoint() attaches the restored state to the process-wide bus and nothing
+    # detaches it; the listener's register-once flag outlives the conftest's bus cleanup.
+    monkeypatch.setattr("crewai.state.checkpoint_listener._handlers_registered", False)
+    crewai_event_bus.reset_runtime_state()
+    yield
+    crewai_event_bus.reset_runtime_state()
+
+
+@pytest.mark.usefixtures("detached_runtime_state")
+@pytest.mark.parametrize("holder", ["crew", "agent", "flow"])
+def test_checkpoint_restore_keeps_the_oversample_factor_of_a_held_memory(
+    holder: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from crewai import Agent, Crew
+    from crewai.flow.flow import Flow, start
+    from crewai.memory.storage.factory import set_memory_storage_factory
+    from crewai.memory.unified_memory import Memory
+    from crewai.state.checkpoint_config import CheckpointConfig
+    from crewai.state.runtime import RuntimeState
+
+    class OneStepFlow(Flow):
+        @start()
+        def go(self) -> str:
+            return "done"
+
+    def an_agent(**kwargs: Any) -> Agent:
+        return Agent(role="r", goal="g", backstory="b", llm="gpt-4o-mini", **kwargs)
+
+    holders = {
+        "crew": (lambda m: Crew(agents=[an_agent()], tasks=[], memory=m), Crew),
+        "agent": (lambda m: an_agent(memory=m), Agent),
+        "flow": (lambda m: OneStepFlow(memory=m), Flow),
+    }
+    build, restore_cls = holders[holder]
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    monkeypatch.setattr(
+        "crewai.memory.unified_memory._default_embedder",
+        lambda: lambda texts: [[0.1] * 4 for _ in texts],
+    )
+    store = _recording_store()
+    set_memory_storage_factory(lambda spec: store if spec == "recording" else None)
+    try:
+        original = Memory(storage="recording", llm="gpt-4o-mini", recall_oversample_factor=3)
+        checkpoint = tmp_path / "checkpoint.json"
+        checkpoint.write_text(
+            RuntimeState(root=[build(original)]).model_dump_json(), encoding="utf-8"
+        )
+
+        restored = restore_cls.from_checkpoint(CheckpointConfig(restore_from=str(checkpoint)))
+        store.search.reset_mock()
+        restored.memory.recall("short query", limit=5, depth="deep")
+    finally:
+        set_memory_storage_factory(None)
+
+    assert isinstance(restored.memory, Memory)
+    assert restored.memory is not original, "the restore must rebuild the Memory"
+    assert _search_limits(store) == [15, 15]
