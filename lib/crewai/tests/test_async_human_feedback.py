@@ -11,9 +11,11 @@ This module tests the async/non-blocking human feedback flow, including:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -21,7 +23,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from crewai.flow import Flow, HumanFeedbackResult, start, listen, human_feedback
+from crewai.flow import (
+    Flow,
+    HumanFeedbackResult,
+    and_,
+    human_feedback,
+    listen,
+    or_,
+    router,
+    start,
+)
 from crewai.flow.async_feedback import (
     ConsoleProvider,
     HumanFeedbackPending,
@@ -1820,3 +1831,1248 @@ class TestLearnOnResume:
             ["Lead with the customer outcome"], source="hitl"
         )
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
+
+
+class _ReviewProvider:
+    """Raises ``HumanFeedbackPending`` when ``pause`` is set, else replies at once."""
+
+    def __init__(self, pause: bool, ready: threading.Event | None = None) -> None:
+        self.pause = pause
+        self.ready = ready
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if not self.pause:
+            return "reply"
+        if self.ready is not None:
+            self.ready.wait(timeout=10)
+        raise HumanFeedbackPending(context=context)
+
+
+def _review(provider: _ReviewProvider, emit: list[str] | None) -> Any:
+    return human_feedback(
+        message="Review:", emit=emit, llm="gpt-4o-mini", provider=provider
+    )
+
+
+def _run_answered(build: Any, outcomes: list[str]) -> list[str]:
+    """Run list of ``build(False)``'s flow, each review routed to the next outcome."""
+    flow_cls, ran = build(False)
+    replies = iter(outcomes)
+    with patch.object(
+        flow_cls, "_collapse_to_outcome", side_effect=lambda *a, **k: next(replies)
+    ):
+        flow_cls().kickoff()
+    return ran
+
+
+def _run_paused(
+    build: Any,
+    outcomes: list[str],
+    tmpdir: str,
+    *,
+    use_async: bool = False,
+    restore_each: bool = True,
+) -> tuple[list[str], Any]:
+    """Run list and last result of ``build(True)``'s flow, resumed once per outcome."""
+    flow_cls, ran = build(True)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+    result: Any = flow_cls(persistence=persistence).kickoff()
+    flow = None
+    for outcome in outcomes:
+        assert isinstance(result, HumanFeedbackPending), (
+            f"expected a pause before resuming with {outcome!r}, got {result!r}"
+        )
+        if flow is None or restore_each:
+            flow = flow_cls.from_pending(result.context.flow_id, persistence)
+        with patch.object(flow_cls, "_collapse_to_outcome", return_value=outcome):
+            result = (
+                asyncio.run(flow.resume_async("reply"))
+                if use_async
+                else flow.resume("reply")
+            )
+    return ran, result
+
+
+def _start_under_review(also_listens: bool) -> Any:
+    def build(pause: bool) -> tuple[type[Flow], list[str]]:
+        ran: list[str] = []
+        provider = _ReviewProvider(pause)
+
+        def draft(self: Flow) -> str:
+            ran.append("draft")
+            return "content"
+
+        reviewed = _review(provider, ["approved", "rejected"])(draft)
+        if also_listens:
+            reviewed = listen("never")(reviewed)
+
+        class StartReviewFlow(Flow):
+            draft = start()(reviewed)
+
+            @listen("draft")
+            def on_draft(self, payload: Any) -> None:
+                ran.append(f"on_draft:{type(payload).__name__}:{payload}")
+
+            @listen(or_("draft", "never"))
+            def or_draft(self) -> None:
+                ran.append("or_draft")
+
+            @router("draft")
+            def gate(self) -> str:
+                ran.append("gate")
+                return "gated"
+
+            @listen("gated")
+            def after_gate(self) -> None:
+                ran.append("after_gate")
+
+            @listen("approved")
+            def on_approved(self, payload: Any) -> None:
+                ran.append(f"on_approved:{type(payload).__name__}")
+
+            @start("approved")
+            def cond_start(self) -> None:
+                ran.append("cond_start")
+
+            @listen(or_("draft", "approved"))
+            def or_both(self) -> None:
+                ran.append("or_both")
+
+        return StartReviewFlow, ran
+
+    return build
+
+
+def _listener_under_review(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ListenerReviewFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        def on_draft(self, payload: Any) -> None:
+            ran.append(f"on_draft:{type(payload).__name__}:{payload}")
+
+        @listen(or_("draft", "never"))
+        def or_draft(self) -> None:
+            ran.append("or_draft")
+
+        @router("draft")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "gated"
+
+        @listen("gated")
+        def after_gate(self) -> None:
+            ran.append("after_gate")
+
+        @listen("approved")
+        def on_approved(self, payload: Any) -> None:
+            ran.append(f"on_approved:{type(payload).__name__}")
+
+        @start("approved")
+        def cond_start(self) -> None:
+            ran.append("cond_start")
+
+        @listen("cond_start")
+        def after_cond_start(self) -> None:
+            ran.append("after_cond_start")
+
+        @listen(or_("draft", "approved"))
+        def or_both(self) -> None:
+            ran.append("or_both")
+
+    return ListenerReviewFlow, ran
+
+
+def _join_on_other_start(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    other_done = threading.Event()
+    # The pause waits for other_start's listener, so the join's other input is
+    # recorded before the pause on every run, never by timing.
+    provider = _ReviewProvider(pause, ready=other_done)
+
+    class TwoStartsFlow(Flow):
+        @start()
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @start()
+        def other_start(self) -> None:
+            ran.append("other_start")
+
+        @listen("other_start")
+        def after_other(self) -> None:
+            ran.append("after_other")
+            other_done.set()
+
+        @listen(and_("draft", "other_start"))
+        def join(self) -> None:
+            ran.append("join")
+
+        @listen("approved")
+        def on_approved(self) -> None:
+            ran.append("on_approved")
+
+    return TwoStartsFlow, ran
+
+
+def _join_on_own_trigger(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class OwnTriggerJoinFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(and_("draft", "begin"))
+        def join(self) -> None:
+            ran.append("join")
+
+        @listen("approved")
+        def on_approved(self) -> None:
+            ran.append("on_approved")
+
+    return OwnTriggerJoinFlow, ran
+
+
+def _review_without_emit(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class PlainReviewFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, None)
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "ok"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self) -> None:
+            ran.append("join_begin")
+
+        @listen(and_("draft", "ok"))
+        def join_ok(self) -> None:
+            ran.append("join_ok")
+
+    return PlainReviewFlow, ran
+
+
+def _fired_or_before_review(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class FiredOrFlow(Flow):
+        @start()
+        def x(self) -> None:
+            ran.append("x")
+
+        @listen(or_("review", "x"))
+        def logger(self) -> None:
+            ran.append("logger")
+
+        @listen("logger")
+        @_review(provider, ["approved", "rejected"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @listen("approved")
+        def done(self) -> None:
+            ran.append("done")
+
+    return FiredOrFlow, ran
+
+
+def _two_reviews(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class TwoReviewsFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["go", "stop"])
+        def review1(self) -> str:
+            ran.append("review1")
+            return "plan"
+
+        @listen(or_("go", "again"))
+        def work(self) -> None:
+            ran.append("work")
+
+        @listen("work")
+        @_review(provider, ["again", "done"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "result"
+
+        @listen("review2")
+        def audit2(self) -> None:
+            ran.append("audit2")
+
+        @listen("done")
+        def finish(self) -> None:
+            ran.append("finish")
+
+    return TwoReviewsFlow, ran
+
+
+def _revision_loop(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RevisionLoopFlow(Flow):
+        @start()
+        def generate(self) -> None:
+            ran.append("generate")
+
+        @listen(or_("generate", "needs_revision"))
+        def x(self) -> None:
+            ran.append("x")
+
+        @listen(or_("x", "never"))
+        def y(self) -> None:
+            ran.append("y")
+
+        @listen("y")
+        @_review(provider, ["needs_revision", "approved"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @listen("approved")
+        def publish(self) -> None:
+            ran.append("publish")
+
+    return RevisionLoopFlow, ran
+
+
+def _self_loop_with_join(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class SelfLoopFlow(Flow):
+        @start()
+        def generate(self) -> None:
+            ran.append("generate")
+
+        @listen(or_("generate", "revise"))
+        @_review(provider, ["revise", "approved"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @listen("approved")
+        def publish(self) -> None:
+            ran.append("publish")
+
+        @listen(and_("review", "generate"))
+        def join(self) -> None:
+            ran.append("join")
+
+    return SelfLoopFlow, ran
+
+
+def _router_before_review(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RoutedReviewFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("go")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self) -> None:
+            ran.append("join_begin")
+
+        @listen(and_("draft", "go"))
+        def join_go(self) -> None:
+            ran.append("join_go")
+
+    return RoutedReviewFlow, ran
+
+
+def _chained_router_on_outcome(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ChainedRouterFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @router("approved")
+        def chain(self) -> str:
+            ran.append("chain")
+            return "shipped"
+
+        @listen("shipped")
+        def ship(self) -> None:
+            ran.append("ship")
+
+    return ChainedRouterFlow, ran
+
+
+def _join_input_recurring(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RecurringInputFlow(Flow):
+        @start()
+        def setup(self) -> None:
+            ran.append("setup")
+
+        @listen(or_("setup", "revise"))
+        def generate(self) -> None:
+            ran.append("generate")
+
+        @listen("generate")
+        @_review(provider, ["revise", "approved"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @listen(and_("review", "generate"))
+        def summarize(self) -> None:
+            ran.append("summarize")
+
+        @listen("approved")
+        def publish(self) -> None:
+            ran.append("publish")
+
+    return RecurringInputFlow, ran
+
+
+def _review_of_a_review(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOfAReviewFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["ok", "no"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen("approved")
+        def on_approved(self) -> None:
+            ran.append("on_approved")
+
+        @listen("ok")
+        def on_ok(self) -> None:
+            ran.append("on_ok")
+
+        @listen(and_("review2", "begin"))
+        def join_r2_begin(self) -> None:
+            ran.append("join_r2_begin")
+
+    return ReviewOfAReviewFlow, ran
+
+
+def _three_chained_reviews(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ThreeChainedReviewsFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @listen("begin")
+        @_review(provider, ["a1", "x1"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "one"
+
+        @listen("r1")
+        @_review(provider, ["a2", "x2"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "two"
+
+        @listen("r2")
+        @_review(provider, ["a3", "x3"])
+        def r3(self) -> str:
+            ran.append("r3")
+            return "three"
+
+        @listen(and_("r3", "begin"))
+        def join_r3_begin(self) -> None:
+            ran.append("join_r3_begin")
+
+        @listen(and_("r3", "r1"))
+        def join_r3_r1(self) -> None:
+            ran.append("join_r3_r1")
+
+    return ThreeChainedReviewsFlow, ran
+
+
+def _review_on_a_reviews_outcome(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOnOutcomeFlow(Flow):
+        @start()
+        def setup(self) -> None:
+            ran.append("setup")
+
+        @listen("setup")
+        def gen(self) -> None:
+            ran.append("gen")
+
+        @listen("gen")
+        @_review(provider, ["go", "stop"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "c"
+
+        @listen("go")
+        @_review(provider, ["fin", "no"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "d"
+
+        @listen(and_("r2", "gen"))
+        def join_r2_gen(self) -> None:
+            ran.append("join_r2_gen")
+
+        @listen("r1")
+        def on_r1(self) -> None:
+            ran.append("on_r1")
+
+        @listen("go")
+        def on_go(self) -> None:
+            ran.append("on_go")
+
+        @listen("fin")
+        def on_fin(self) -> None:
+            ran.append("on_fin")
+
+    return ReviewOnOutcomeFlow, ran
+
+
+def _received(name: str, payload: Any) -> str:
+    value = (
+        (payload.method_name, payload.outcome, payload.output, payload.feedback)
+        if isinstance(payload, HumanFeedbackResult)
+        else payload
+    )
+    return f"{name}:{type(payload).__name__}:{value!r}"
+
+
+def _received_entries(ran: list[str]) -> list[str]:
+    return sorted(entry for entry in ran if ":" in entry)
+
+
+def _self_referencing_dict() -> dict[str, Any]:
+    value: dict[str, Any] = {"k": 1}
+    value["self"] = value
+    return value
+
+
+def _join_on_own_trigger_returning(make_payload: Any) -> Any:
+    def build(pause: bool) -> tuple[type[Flow], list[str]]:
+        ran: list[str] = []
+        provider = _ReviewProvider(pause)
+
+        class OwnTriggerPayloadFlow(Flow):
+            @start()
+            def begin(self) -> Any:
+                ran.append("begin")
+                return make_payload()
+
+            @listen("begin")
+            @_review(provider, ["approved", "rejected"])
+            def draft(self) -> str:
+                ran.append("draft")
+                return "content"
+
+            @listen(and_("draft", "begin"))
+            def join(self, payload: Any) -> None:
+                ran.append(_received("join", payload))
+
+        return OwnTriggerPayloadFlow, ran
+
+    return build
+
+
+def _payload_joins_on_a_router_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RoutedPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("go")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self, payload: Any) -> None:
+            ran.append(_received("join_begin", payload))
+
+        @listen(and_("draft", "go"))
+        def join_go(self, payload: Any) -> None:
+            ran.append(_received("join_go", payload))
+
+    return RoutedPayloadFlow, ran
+
+
+def _payload_joins_of_a_review_without_emit(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class PlainReviewPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @listen("begin")
+        @_review(provider, None)
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "ok"
+
+        @listen(and_("draft", "begin"))
+        def join_begin(self, payload: Any) -> None:
+            ran.append(_received("join_begin", payload))
+
+        @listen(and_("draft", "ok"))
+        def join_ok(self, payload: Any) -> None:
+            ran.append(_received("join_ok", payload))
+
+    return PlainReviewPayloadFlow, ran
+
+
+def _payload_join_of_a_review_of_a_review(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class ReviewOfAReviewPayloadFlow(Flow):
+        @start()
+        def begin(self) -> str:
+            ran.append("begin")
+            return "begin-payload"
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["ok", "no"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen(and_("review2", "begin"))
+        def join_r2_begin(self, payload: Any) -> None:
+            ran.append(_received("join_r2_begin", payload))
+
+    return ReviewOfAReviewPayloadFlow, ran
+
+
+def _payload_join_on_a_reviewed_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+
+    class ReviewedLabelPayloadFlow(Flow):
+        @start()
+        def setup(self) -> None:
+            ran.append("setup")
+
+        @listen("setup")
+        def gen(self) -> str:
+            ran.append("gen")
+            return "gen-payload"
+
+        @listen("gen")
+        @_review(_ReviewProvider(False), ["go", "stop"])
+        def r1(self) -> str:
+            ran.append("r1")
+            return "one"
+
+        @listen("go")
+        @_review(_ReviewProvider(pause), ["fin", "no"])
+        def r2(self) -> str:
+            ran.append("r2")
+            return "two"
+
+        @listen(and_("r2", "go"))
+        def join_r2_go(self, payload: Any) -> None:
+            ran.append(_received("join_r2_go", payload))
+
+    return ReviewedLabelPayloadFlow, ran
+
+
+def _router_join_in_a_self_loop(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class RouterJoinLoopFlow(Flow):
+        @start()
+        def generate(self) -> None:
+            ran.append("generate")
+
+        @listen(or_("generate", "revise"))
+        @_review(provider, ["revise", "approved"])
+        def review(self) -> str:
+            ran.append("review")
+            return "content"
+
+        @router(and_("review", "generate"))
+        def rj(self) -> str:
+            ran.append("rj")
+            return "routed"
+
+        @listen("routed")
+        def after_rj(self) -> None:
+            ran.append("after_rj")
+
+        @listen("approved")
+        def publish(self) -> None:
+            ran.append("publish")
+
+    return RouterJoinLoopFlow, ran
+
+
+def _or_listener_on_the_review_and_a_label(
+    listens_to: str, emit: list[str] | None
+) -> Any:
+    def build(pause: bool) -> tuple[type[Flow], list[str]]:
+        ran: list[str] = []
+        provider = _ReviewProvider(pause)
+
+        class OrLabelFlow(Flow):
+            @start()
+            def begin(self) -> None:
+                ran.append("begin")
+
+            @router("begin")
+            def gate(self) -> str:
+                ran.append("gate")
+                return "go"
+
+            @listen(listens_to)
+            @_review(provider, emit)
+            def draft(self) -> str:
+                ran.append("draft")
+                return "content"
+
+            @listen(or_("draft", "go"))
+            def either(self) -> None:
+                ran.append("either")
+
+        return OrLabelFlow, ran
+
+    return build
+
+
+def _or_listener_on_a_carried_label(pause: bool) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class CarriedLabelFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("begin")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen("draft")
+        @_review(provider, ["fine", "redo"])
+        def review2(self) -> str:
+            ran.append("review2")
+            return "second"
+
+        @listen(or_("review2", "go"))
+        def either(self) -> None:
+            ran.append("either")
+
+    return CarriedLabelFlow, ran
+
+
+def _or_listener_on_a_label_of_an_enclosing_pass(
+    pause: bool,
+) -> tuple[type[Flow], list[str]]:
+    ran: list[str] = []
+    provider = _ReviewProvider(pause)
+
+    class EnclosingPassLabelFlow(Flow):
+        @start()
+        def begin(self) -> None:
+            ran.append("begin")
+
+        @router("begin")
+        def gate(self) -> str:
+            ran.append("gate")
+            return "go"
+
+        @listen("begin")
+        def mid(self) -> None:
+            ran.append("mid")
+
+        @listen("mid")
+        @_review(provider, ["approved", "rejected"])
+        def draft(self) -> str:
+            ran.append("draft")
+            return "content"
+
+        @listen(or_("draft", "go"))
+        def either(self) -> None:
+            ran.append("either")
+
+    return EnclosingPassLabelFlow, ran
+
+
+class TestResumeRunsWhatTheReviewRuns:
+    """A resumed review runs the listeners, joins and routes it runs unpaused."""
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    @pytest.mark.parametrize("also_listens", [False, True])
+    def test_start_under_review(self, also_listens: bool, use_async: bool) -> None:
+        build = _start_under_review(also_listens)
+        expected = sorted(
+            [
+                "draft",
+                "gate",
+                "after_gate",
+                "on_draft:str:approved",
+                "or_draft",
+                "or_both",
+                "on_approved:HumanFeedbackResult",
+            ]
+        )
+        assert sorted(_run_answered(build, ["approved"])) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(build, ["approved"], tmpdir, use_async=use_async)
+        assert sorted(ran) == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_listener_under_review(self, use_async: bool) -> None:
+        expected = sorted(
+            [
+                "begin",
+                "draft",
+                "gate",
+                "after_gate",
+                "on_draft:str:approved",
+                "or_draft",
+                "or_both",
+                "on_approved:HumanFeedbackResult",
+                "or_both",
+                "cond_start",
+                "after_cond_start",
+            ]
+        )
+        assert sorted(_run_answered(_listener_under_review, ["approved"])) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(
+                _listener_under_review, ["approved"], tmpdir, use_async=use_async
+            )
+        assert sorted(ran) == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_join_on_a_start_completed_before_the_pause(self, use_async: bool) -> None:
+        assert _run_answered(_join_on_other_start, ["approved"]).count("join") == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(
+                _join_on_other_start, ["approved"], tmpdir, use_async=use_async
+            )
+        assert ran.count("join") == 1, f"resumed run list: {ran}"
+        assert ran.count("draft") == 1, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_join_on_the_reviewed_listeners_trigger(self, use_async: bool) -> None:
+        assert _run_answered(_join_on_own_trigger, ["approved"]).count("join") == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(
+                _join_on_own_trigger, ["approved"], tmpdir, use_async=use_async
+            )
+        assert sorted(ran) == ["begin", "draft", "join", "on_approved"], (
+            f"resumed run list: {ran}"
+        )
+
+    def test_joins_of_a_review_without_emit(self) -> None:
+        answered = _run_answered(_review_without_emit, [])
+        assert (answered.count("join_begin"), answered.count("join_ok")) == (1, 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_review_without_emit, [""], tmpdir)
+        assert (ran.count("join_begin"), ran.count("join_ok")) == (1, 1), (
+            f"resumed run list: {ran}"
+        )
+
+    def test_or_listener_fired_before_the_pause_runs_once(self) -> None:
+        assert _run_answered(_fired_or_before_review, ["approved"]).count("logger") == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_fired_or_before_review, ["approved"], tmpdir)
+        assert ran == ["x", "logger", "review", "done"], f"resumed run list: {ran}"
+
+    def test_second_pause_resumed_on_the_same_instance(self) -> None:
+        expected = [
+            "begin",
+            "review1",
+            "work",
+            "review2",
+            "audit2",
+            "work",
+            "review2",
+            "audit2",
+            "finish",
+        ]
+        outcomes = ["go", "again", "done"]
+        assert _run_answered(_two_reviews, outcomes) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(
+                _two_reviews, outcomes, tmpdir, restore_each=False
+            )
+        assert ran == expected, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_revision_loop_through_or_listeners(self) -> None:
+        expected = ["generate", "x", "y", "review", "x", "y", "review", "publish"]
+        outcomes = ["needs_revision", "approved"]
+        assert _run_answered(_revision_loop, outcomes) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_revision_loop, outcomes, tmpdir)
+        assert ran == expected, f"resumed run list: {ran}"
+
+    def test_self_loop_reruns_the_review_and_runs_its_join_once(self) -> None:
+        outcomes = ["revise", "approved"]
+        answered = _run_answered(_self_loop_with_join, outcomes)
+        assert answered.count("join") == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_self_loop_with_join, outcomes, tmpdir)
+        assert [name for name in ran if name != "join"] == [
+            "generate",
+            "review",
+            "review",
+            "publish",
+        ], f"resumed run list: {ran}"
+        assert ran.count("join") == 1, f"resumed run list: {ran}"
+
+    def test_fired_listener_the_flow_no_longer_defines_is_dropped(self) -> None:
+        ran: list[str] = []
+
+        class RedeployedFlow(Flow):
+            @start()
+            def begin(self) -> None:
+                ran.append("begin")
+
+            @listen("begin")
+            @_review(_ReviewProvider(True), ["approved", "rejected"])
+            def draft(self) -> str:
+                return "content"
+
+            @listen("approved")
+            def on_approved(self) -> None:
+                ran.append("on_approved")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+            context = PendingFeedbackContext.from_dict(
+                {
+                    "flow_id": "redeployed-1",
+                    "flow_class": "test.RedeployedFlow",
+                    "method_name": "draft",
+                    "method_output": "content",
+                    "message": "Review:",
+                    "emit": ["approved", "rejected"],
+                    "llm": "gpt-4o-mini",
+                    "fired_or_listeners": ["removed_step"],
+                }
+            )
+            persistence.save_pending_feedback(
+                flow_uuid="redeployed-1",
+                context=context,
+                state_data={"id": "redeployed-1"},
+            )
+            flow = RedeployedFlow.from_pending("redeployed-1", persistence)
+            with patch.object(flow, "_collapse_to_outcome", return_value="approved"):
+                flow.resume("reply")
+
+        assert ran == ["on_approved"]
+
+    def test_joins_on_a_router_label_before_the_reviewed_listener(self) -> None:
+        answered = _run_answered(_router_before_review, ["approved"])
+        assert (answered.count("join_begin"), answered.count("join_go")) == (1, 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_router_before_review, ["approved"], tmpdir)
+        assert (ran.count("join_begin"), ran.count("join_go")) == (1, 1), (
+            f"resumed run list: {ran}"
+        )
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_chained_router_on_the_outcome(self, use_async: bool) -> None:
+        expected = ["begin", "draft", "chain", "ship"]
+        assert _run_answered(_chained_router_on_outcome, ["approved"]) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(
+                _chained_router_on_outcome, ["approved"], tmpdir, use_async=use_async
+            )
+        assert ran == expected, f"resumed run list: {ran}"
+
+    def test_join_runs_again_when_its_input_recurs(self) -> None:
+        expected = [
+            "setup",
+            "generate",
+            "review",
+            "summarize",
+            "generate",
+            "review",
+            "summarize",
+            "publish",
+        ]
+        outcomes = ["revise", "approved"]
+        assert _run_answered(_join_input_recurring, outcomes) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_join_input_recurring, outcomes, tmpdir)
+        assert ran == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("restore_each", [True, False])
+    def test_join_of_a_review_paused_inside_a_resumed_review(
+        self, restore_each: bool
+    ) -> None:
+        counted = ["draft", "review2", "on_ok", "join_r2_begin"]
+        outcomes = ["approved", "ok"]
+        answered = _run_answered(_review_of_a_review, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(
+                _review_of_a_review, outcomes, tmpdir, restore_each=restore_each
+            )
+        assert [ran.count(name) for name in counted] == [1, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_joins_of_the_third_review_in_a_chain_of_paused_reviews(self) -> None:
+        counted = ["join_r3_begin", "join_r3_r1"]
+        outcomes = ["a1", "a2", "a3"]
+        answered = _run_answered(_three_chained_reviews, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(_three_chained_reviews, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_join_of_a_review_paused_on_a_resumed_reviews_outcome(self) -> None:
+        counted = ["r1", "r2", "on_r1", "on_fin", "join_r2_gen"]
+        outcomes = ["go", "fin"]
+        answered = _run_answered(_review_on_a_reviews_outcome, outcomes)
+        assert [answered.count(name) for name in counted] == [1, 1, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(_review_on_a_reviews_outcome, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [1, 1, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+        assert not isinstance(result, HumanFeedbackPending)
+
+    @pytest.mark.parametrize("use_async", [False, True])
+    def test_join_on_the_reviewed_listeners_trigger_receives_its_result(
+        self, use_async: bool
+    ) -> None:
+        build = _join_on_own_trigger_returning(lambda: "begin-payload")
+        expected = ["join:str:'begin-payload'"]
+        assert _received_entries(_run_answered(build, ["approved"])) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(build, ["approved"], tmpdir, use_async=use_async)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    def test_joins_on_a_router_label_receive_their_trigger_payloads(self) -> None:
+        expected = ["join_begin:str:'begin-payload'", "join_go:str:'go'"]
+        answered = _run_answered(_payload_joins_on_a_router_label, ["approved"])
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_payload_joins_on_a_router_label, ["approved"], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    def test_label_join_of_a_review_without_emit_receives_the_label(self) -> None:
+        expected = [
+            "join_begin:HumanFeedbackResult:('draft', None, 'content', 'reply')",
+            "join_ok:str:'ok'",
+        ]
+        answered = _run_answered(_payload_joins_of_a_review_without_emit, [])
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_payload_joins_of_a_review_without_emit, [""], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+
+    @pytest.mark.parametrize("restore_each", [True, False])
+    def test_join_of_a_review_paused_inside_a_resumed_review_receives_its_input(
+        self, restore_each: bool
+    ) -> None:
+        expected = ["join_r2_begin:str:'begin-payload'"]
+        outcomes = ["approved", "ok"]
+        answered = _run_answered(_payload_join_of_a_review_of_a_review, outcomes)
+        assert _received_entries(answered) == expected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(
+                _payload_join_of_a_review_of_a_review,
+                outcomes,
+                tmpdir,
+                restore_each=restore_each,
+            )
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_join_on_a_reviewed_label_receives_the_feedback_result(self) -> None:
+        expected = ["join_r2_go:HumanFeedbackResult:('r1', 'go', 'one', 'reply')"]
+        answered = _run_answered(_payload_join_on_a_reviewed_label, ["go", "fin"])
+        assert _received_entries(answered) == expected
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(Flow, "_collapse_to_outcome", return_value="go"),
+        ):
+            ran, result = _run_paused(_payload_join_on_a_reviewed_label, ["fin"], tmpdir)
+        assert _received_entries(ran) == expected, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    def test_router_join_in_a_self_loop_runs_as_often_as_answered(self) -> None:
+        counted = ["review", "rj", "after_rj", "publish"]
+        outcomes = ["revise", "approved"]
+        answered = _run_answered(_router_join_in_a_self_loop, outcomes)
+        assert [answered.count(name) for name in counted] == [2, 1, 1, 1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, _ = _run_paused(_router_join_in_a_self_loop, outcomes, tmpdir)
+        assert [ran.count(name) for name in counted] == [2, 1, 1, 1], (
+            f"resumed run list: {ran}"
+        )
+
+    @pytest.mark.parametrize(
+        "make_payload",
+        [lambda: {("a", "b"): 1}, _self_referencing_dict],
+        ids=["tuple-key", "self-referencing"],
+    )
+    def test_trigger_result_json_cannot_hold_still_pauses_and_resumes(
+        self, make_payload: Any
+    ) -> None:
+        build = _join_on_own_trigger_returning(make_payload)
+        assert len(_received_entries(_run_answered(build, ["approved"]))) == 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(build, ["approved"], tmpdir)
+        assert len(_received_entries(ran)) == 1, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
+
+    @pytest.mark.parametrize(
+        ("build", "outcomes", "runs"),
+        [
+            (
+                _or_listener_on_the_review_and_a_label("begin", ["approved", "no"]),
+                ["approved"],
+                2,
+            ),
+            (
+                _or_listener_on_the_review_and_a_label("go", ["approved", "no"]),
+                ["approved"],
+                2,
+            ),
+            (_or_listener_on_a_carried_label, ["approved", "fine"], 2),
+            (_or_listener_on_the_review_and_a_label("begin", None), [""], 1),
+            (_or_listener_on_a_label_of_an_enclosing_pass, ["approved"], 1),
+        ],
+        ids=[
+            "sibling-label",
+            "own-trigger-label",
+            "carried-label",
+            "label-of-a-review-without-emit",
+            "label-of-an-enclosing-listener-pass",
+        ],
+    )
+    def test_or_listener_on_the_review_and_a_cut_label_runs_as_often_as_answered(
+        self, build: Any, outcomes: list[str], runs: int
+    ) -> None:
+        assert _run_answered(build, outcomes).count("either") == runs
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ran, result = _run_paused(build, outcomes, tmpdir)
+        assert ran.count("either") == runs, f"resumed run list: {ran}"
+        assert not isinstance(result, HumanFeedbackPending)
