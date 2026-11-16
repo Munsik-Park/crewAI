@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from typing_extensions import Self
 
 from crewai.memory.types import (
-    _RECALL_OVERSAMPLE_FACTOR,
     MemoryMatch,
     MemoryRecord,
     ScopeInfo,
@@ -306,11 +305,12 @@ class MemorySlice(BaseModel):
         cats = categories or self.categories
         all_matches: list[MemoryMatch] = []
         for sc in self.scopes:
-            matches = self._require_memory().recall(
+            memory = self._require_memory()
+            matches = memory.recall(
                 query,
                 scope=sc,
                 categories=cats,
-                limit=limit * _RECALL_OVERSAMPLE_FACTOR,
+                limit=limit * memory._config.recall_oversample_factor,
                 depth=depth,
                 source=source,
                 include_private=include_private,
