@@ -1,8 +1,10 @@
 from pathlib import Path
 import subprocess
 
+from click.testing import CliRunner
 import pytest
 
+from crewai_cli.cli import crewai
 import crewai_cli.install_crew as install_crew_module
 
 
@@ -102,3 +104,36 @@ def test_install_crew_swallows_sync_failure_by_default(fp):
     fp.register(["uv", "sync"], returncode=1, stderr="sync failed\n")
 
     install_crew_module.install_crew([])
+
+
+def test_install_command_exits_with_uv_sync_status(fp, monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    fp.register(["uv", "sync"], returncode=3, stderr="sync failed\n")
+
+    result = CliRunner().invoke(crewai, ["install"])
+
+    assert result.exit_code == 3
+    assert "returned non-zero exit status 3" in result.output
+
+
+def test_install_command_exits_128_plus_signal_when_uv_sync_is_killed(
+    fp, monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    fp.register(["uv", "sync"], returncode=-9)
+
+    result = CliRunner().invoke(crewai, ["install"])
+
+    assert result.exit_code == 137
+
+
+def test_install_command_exits_non_zero_on_unexpected_error(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project\n")
+
+    result = CliRunner().invoke(crewai, ["install"])
+
+    assert result.exit_code != 0
+    assert "An unexpected error occurred" in result.output
