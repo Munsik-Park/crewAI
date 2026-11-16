@@ -712,7 +712,14 @@ def install(context: click.Context) -> None:
     """Install the Crew."""
     from crewai_cli.install_crew import install_crew
 
-    install_crew(context.args)
+    try:
+        install_crew(context.args, raise_on_error=True)
+    except subprocess.CalledProcessError as e:
+        # A process killed by signal N reports -N; a shell reports 128 + N.
+        returncode = e.returncode
+        raise SystemExit(128 - returncode if returncode < 0 else returncode) from e
+    except Exception as e:
+        raise SystemExit(1) from e
 
 
 @crewai.command()
