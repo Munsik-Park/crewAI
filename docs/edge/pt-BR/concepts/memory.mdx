@@ -875,4 +875,5 @@ Toda a configuração é passada como argumentos nomeados para `Memory(...)`. Ca
 | `confidence_threshold_low` | `0.5` | Confiança de recall abaixo da qual exploração mais profunda é ativada. |
 | `complex_query_threshold` | `0.7` | Para consultas complexas, explorar mais profundamente abaixo desta confiança. |
 | `exploration_budget` | `1` | Número de rodadas de exploração por LLM durante recall profundo. |
+| `recall_oversample_factor` | `2` | Durante recall profundo, busca no vector store este múltiplo do número de resultados solicitado, para que a pontuação e a deduplicação tenham candidatos suficientes para preencher o conjunto de resultados. |
 | `query_analysis_threshold` | `200` | Consultas menores que isso (em caracteres) pulam análise LLM durante recall profundo. |

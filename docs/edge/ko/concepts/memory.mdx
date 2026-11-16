@@ -875,4 +875,5 @@ memory.reset(scope="/project/old")  # 해당 하위 트리만
 | `confidence_threshold_low` | `0.5` | recall 신뢰도가 이 값 미만이면 더 깊은 탐색 트리거. |
 | `complex_query_threshold` | `0.7` | 복잡한 쿼리의 경우 이 신뢰도 미만에서 더 깊이 탐색. |
 | `exploration_budget` | `1` | 딥 recall 중 LLM 기반 탐색 라운드 수. |
+| `recall_oversample_factor` | `2` | 딥 recall 중 요청한 결과 수의 이 배수만큼 벡터 스토어에서 가져와, 점수 계산과 중복 제거 후에도 결과를 채울 후보를 충분히 확보. |
 | `query_analysis_threshold` | `200` | 이 길이(문자 수)보다 짧은 쿼리는 딥 recall 중 LLM 분석을 건너뜀. |
