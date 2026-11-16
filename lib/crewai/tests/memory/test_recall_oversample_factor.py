@@ -76,7 +76,7 @@ def _memory(
     return mem, rec, llm
 
 
-# --- V1: deep flow uses F on every round and both branches (C1, C3, C4) ---
+# --- Deep recall fetches limit x factor on both branches and every round ---
 
 
 def test_deep_recall_parallel_branch_uses_factor_on_every_round() -> None:
@@ -111,7 +111,7 @@ def test_deep_recall_sequential_branch_uses_factor_on_every_round() -> None:
     assert len(result) <= L
 
 
-# --- V2: slice compounds F per scope (C1, S2) ---
+# --- A slice fetches limit x factor (shallow) or limit x factor^2 (deep) per scope ---
 
 
 @pytest.mark.parametrize(
@@ -128,7 +128,7 @@ def test_slice_recall_uses_factor_per_scope(depth: str, expected: int) -> None:
     assert len(result) <= L
 
 
-# --- V3: slice reads F from the currently bound Memory (C1) ---
+# --- A slice takes the factor from the Memory bound when it recalls ---
 
 
 def test_slice_reads_factor_from_bound_memory_at_recall_time() -> None:
@@ -145,7 +145,7 @@ def test_slice_reads_factor_from_bound_memory_at_recall_time() -> None:
     assert rec4.limits == [4 * L, 4 * L]
 
 
-# --- V4: default F=2 matches base; shallow is never over-fetched (C2) ---
+# --- Default factor 2; plain shallow recall fetches the limit at any factor ---
 
 
 def test_default_deep_recall_fetches_twice_limit() -> None:
