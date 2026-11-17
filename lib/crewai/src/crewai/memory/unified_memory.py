@@ -149,10 +149,11 @@ class Memory(BaseModel):
     recall_oversample_factor: int = Field(
         default=_RECALL_OVERSAMPLE_FACTOR,
         description=(
-            "Multiplier on the recall limit for how many candidates deep recall "
-            "and MemorySlice recall fetch from storage before scoring, "
+            "Recall over-fetch multiplier. Deep recall asks storage for the "
+            "limit times this value on each search, and MemorySlice recall asks "
+            "each of its scopes for the limit times this value, before scoring, "
             "deduplication and trimming to the limit. A shallow recall on "
-            "Memory itself fetches exactly the limit. Defaults to 2."
+            "Memory itself fetches exactly the limit."
         ),
     )
     read_only: bool = Field(

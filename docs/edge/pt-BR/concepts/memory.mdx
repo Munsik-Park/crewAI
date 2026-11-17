@@ -876,4 +876,4 @@ Toda a configuração é passada como argumentos nomeados para `Memory(...)`. Ca
 | `complex_query_threshold` | `0.7` | Para consultas complexas, explorar mais profundamente abaixo desta confiança. |
 | `exploration_budget` | `1` | Número de rodadas de exploração por LLM durante recall profundo. |
 | `query_analysis_threshold` | `200` | Consultas menores que isso (em caracteres) pulam análise LLM durante recall profundo. |
-| `recall_oversample_factor` | `2` | O recall profundo e o recall de `MemorySlice` buscam no armazenamento este múltiplo de `limit` em candidatos antes da pontuação, deduplicação e corte para `limit`. Um recall com `depth="shallow"` em `Memory` busca exatamente `limit`. |
+| `recall_oversample_factor` | `2` | O recall profundo pede ao armazenamento `limit` vezes este valor em cada busca, e o recall de `MemorySlice` pede a cada um de seus escopos `limit` vezes este valor, antes da pontuação, deduplicação e corte para `limit`. Um recall com `depth="shallow"` em `Memory` busca exatamente `limit`. |
