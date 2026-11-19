@@ -1,4 +1,4 @@
-"""Recall over-fetch honours ``recall_oversample_factor`` (issue #5).
+"""Recall over-fetch honours ``recall_oversample_factor``.
 
 Each test observes the ``limit=`` that ``storage.search`` is asked for and the
 number of search calls, through the public ``Memory(...)`` / ``recall`` /
@@ -58,9 +58,6 @@ def _slice(memory: Memory) -> MemorySlice:
     return MemorySlice(scopes=["/a", "/b"]).bind(memory)
 
 
-# C1: a configured factor governs every over-fetch of the recall flow.
-
-
 def test_deep_recall_uses_configured_factor() -> None:
     mem, storage = _memory(recall_oversample_factor=3)
     mem.recall(QUERY, limit=N, depth="deep")
@@ -84,9 +81,6 @@ def test_slice_shallow_recall_uses_configured_factor() -> None:
     mem, storage = _memory(recall_oversample_factor=3)
     _slice(mem).recall(QUERY, limit=N, depth="shallow")
     assert _limits(storage) == [3 * N, 3 * N]
-
-
-# C2: with no factor configured the counts are unchanged, and results are capped.
 
 
 def test_default_factor_search_counts_unchanged() -> None:
@@ -115,9 +109,6 @@ def test_recall_results_capped_at_limit_under_oversample() -> None:
     mem, storage = _memory(fill=True, recall_oversample_factor=3)
     assert len(_slice(mem).recall(QUERY, limit=N, depth="deep")) == N
     assert storage.search.call_count >= 1
-
-
-# C4: the factor is a validated ``Memory(...)`` keyword.
 
 
 def test_factor_below_one_rejected() -> None:
