@@ -1182,6 +1182,20 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 for name in progress.fired_or_listeners
                 if name in listen_keys
             }
+        events: set[str] = set()
+        for name, definition in methods.items():
+            if definition.listen is not None:
+                events.update(_iter_condition_events(definition.listen))
+            start_condition = self._start_condition(FlowMethodName(name))
+            if start_condition is not None:
+                events.update(_iter_condition_events(start_condition))
+        progress.carried_labels = [
+            carried
+            for carried in progress.carried_labels
+            if carried.method_name in methods
+            and methods[carried.method_name].router
+            and carried.label in events
+        ]
 
     def _infer_entry_path(self, method_name: str) -> str:
         definition = self._definition.methods.get(method_name)
