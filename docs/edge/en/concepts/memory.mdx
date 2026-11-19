@@ -883,3 +883,4 @@ All configuration is passed as keyword arguments to `Memory(...)`. Every paramet
 | `complex_query_threshold` | `0.7` | For complex queries, explore deeper below this confidence. |
 | `exploration_budget` | `1` | Number of LLM-driven exploration rounds during deep recall. |
 | `query_analysis_threshold` | `200` | Queries shorter than this (in characters) skip LLM analysis during deep recall. |
+| `recall_oversample_factor` | `2` | Fetch this many times more candidates than requested from each storage search, so scoring and filtering have enough to fill the result (minimum `1`; `1` disables over-fetching). Applies to every search of deep recall and to each scope of a `MemorySlice` recall, so a slice with deep recall over-fetches twice. |
