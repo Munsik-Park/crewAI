@@ -1174,6 +1174,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self._unoffered_to_routers.add(method_name)
         self._unoffered_to_listeners.add(method_name)
 
+    def _drop_unoffered(self, method_name: FlowMethodName) -> None:
+        """Forget a completion whose delivery was cancelled before reaching all
+        conditions; it will not be offered to them in this run either."""
+        self._unoffered_to_routers.discard(method_name)
+        self._unoffered_to_listeners.discard(method_name)
+
     def _pause_progress(self, pending: HumanFeedbackPending) -> ResumeProgress:
         progress = pending.context.resume_progress
         if progress is None:
@@ -3290,7 +3296,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             self._completed_methods.add(method_name)
             self._mark_completion_unoffered(method_name)
 
-            await asyncio.to_thread(self._persist_method_completion, method_name)
+            try:
+                await asyncio.to_thread(self._persist_method_completion, method_name)
+            except asyncio.CancelledError:
+                self._drop_unoffered(method_name)
+                raise
 
             finished_event_id: str | None = None
             if not self.suppress_flow_events:
@@ -3502,6 +3512,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                             self.last_human_feedback
                         )
                     current_trigger = router_result_event
+        except asyncio.CancelledError:
+            self._drop_unoffered(trigger_method)
+            raise
         except HumanFeedbackPending as e:
             # A pause in the router loop cuts the delivery of every trigger
             # collected so far, before its listeners and gated starts.
