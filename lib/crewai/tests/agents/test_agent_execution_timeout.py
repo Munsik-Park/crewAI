@@ -28,6 +28,7 @@ import threading
 import time
 from typing import Any
 
+from pydantic import Field
 import pytest
 
 from crewai import Agent, Task
@@ -43,6 +44,8 @@ from crewai.events.event_context import (
     _event_context_config,
 )
 from crewai.events.types.agent_events import AgentExecutionStartedEvent
+from crewai.knowledge.knowledge import Knowledge
+from crewai.knowledge.storage.base_knowledge_storage import BaseKnowledgeStorage
 from crewai.llms.base_llm import BaseLLM
 from crewai.tools import tool
 from crewai.tools.agent_tools.agent_tools import AgentTools
@@ -941,3 +944,105 @@ async def test_cancelled_run_leaves_coworker_it_calls_after_the_limit_as_it_was(
         pool.shutdown(wait=True)
     assert len(outcome) == 1, "the timed-out run's tool never called the coworker"
     coworker.assert_unchanged()
+
+
+class _RecordingKnowledgeStorage(BaseKnowledgeStorage):
+    """Knowledge storage stub recording each search."""
+
+    searches: list[Any] = Field(default_factory=list)
+
+    def search(self, query: Any, *args: Any, **kwargs: Any) -> list[Any]:
+        self.searches.append(query)
+        return []
+
+    async def asearch(self, query: Any, *args: Any, **kwargs: Any) -> list[Any]:
+        return self.search(query)
+
+    def save(self, documents: list[str]) -> None:
+        return None
+
+    async def asave(self, documents: list[str]) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+    async def areset(self) -> None:
+        return None
+
+
+class _BlockingRecallMemory(_RecordingMemory):
+    """Recording memory whose first recall blocks until the test releases it."""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self._release = release
+        self.recalls = 0
+
+    def recall(self, *args: Any, **kwargs: Any) -> list[Any]:
+        self.recalls += 1
+        if self.recalls == 1:
+            self._release.wait(ORPHAN_BLOCK)
+        return []
+
+
+@pytest.mark.parametrize("entry", ["execute_task", "aexecute_task"])
+def test_coworker_task_started_before_the_limit_queries_no_knowledge_after_it(
+    entry: str,
+) -> None:
+    """A coworker task whose memory recall ends after the limit makes no knowledge query and no LLM call."""
+    release = threading.Event()
+    coworker_calls: list[str] = []
+    storage = _RecordingKnowledgeStorage()
+    memory = _BlockingRecallMemory(release)
+
+    def coworker_script(text: str) -> str:
+        coworker_calls.append(text)
+        return _final("COWORKER_ORPHAN_ANSWER")
+
+    coworker = _agent(
+        _ScriptedLLM(coworker_script),
+        role="Coworker",
+        max_execution_time=None,
+        knowledge=Knowledge(collection_name="coworker", sources=[], storage=storage),
+    )
+    object.__setattr__(coworker, "memory", memory)
+    outcome: list[str] = []
+
+    @tool("ask_coworker")
+    def ask_coworker() -> str:
+        """Ask the coworker."""
+        sub_task = _task(coworker, "SUB_ONE")
+        try:
+            if entry == "execute_task":
+                coworker.execute_task(sub_task)
+            else:
+                asyncio.run(coworker.aexecute_task(sub_task))
+            outcome.append("ran")
+        except BaseException as error:
+            outcome.append(type(error).__name__)
+        return "ASKED_COWORKER"
+
+    agent = _agent(_ScriptedLLM(_asking_script), tools=[ask_coworker])
+
+    before = set(threading.enumerate())
+    try:
+        with pytest.raises(TimeoutError):
+            agent.execute_task(_task(agent, "TASK_ONE"))
+        assert not release.is_set(), "the coworker's recall ended before the limit"
+    finally:
+        release.set()
+        still_alive = _join_timed_runs(before)
+    assert still_alive == []
+    assert len(outcome) == 1, "the timed-out run's tool never called the coworker"
+    assert memory.recalls == 1, "the coworker's recall was not in flight"
+    ran = [
+        name
+        for name, happened in (
+            ("knowledge search", storage.searches),
+            ("LLM call", coworker_calls),
+            ("knowledge query written", coworker.knowledge_search_query),
+        )
+        if happened
+    ]
+    assert ran == [], f"after the limit the coworker made: {ran}"
