@@ -15,6 +15,129 @@ if TYPE_CHECKING:
     from crewai.flow.flow import Flow
 
 
+ENTRY_PATH_START = "start"
+ENTRY_PATH_LISTENER = "listener"
+_ENTRY_PATHS = frozenset({ENTRY_PATH_START, ENTRY_PATH_LISTENER})
+
+
+class _MalformedProgressError(ValueError):
+    """Raised while parsing a persisted progress field that is not well formed."""
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise _MalformedProgressError
+    return list(value)
+
+
+def _entry_path(value: Any) -> str | None:
+    """Return a known entry-path marker, or ``None`` for any other value."""
+    return value if isinstance(value, str) and value in _ENTRY_PATHS else None
+
+
+@dataclass
+class CarriedLabelDelivery:
+    """An enclosing router's label delivery cut by a pause.
+
+    Attributes:
+        method_name: The router that produced the label.
+        label: The router's result as a string.
+        entry_path: How the router was reached: ``"start"`` for a start
+            method, ``"listener"`` for a listener. ``None`` when unknown; the
+            path is then inferred from the flow definition.
+    """
+
+    method_name: str
+    label: str
+    entry_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "method_name": self.method_name,
+            "label": self.label,
+            "entry_path": self.entry_path,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CarriedLabelDelivery:
+        if not isinstance(data, dict):
+            raise _MalformedProgressError
+        method_name = data.get("method_name")
+        label = data.get("label")
+        if not isinstance(method_name, str) or not isinstance(label, str):
+            raise _MalformedProgressError
+        return cls(
+            method_name=method_name,
+            label=label,
+            entry_path=_entry_path(data.get("entry_path")),
+        )
+
+
+@dataclass
+class ResumeProgress:
+    """Execution progress of a flow at the moment a review paused it.
+
+    Restored on resume so the flow continues as it would have if the review
+    had been answered during the run.
+
+    Attributes:
+        completed_methods: Methods that had completed.
+        pending_events: Events already seen by each listener or conditional
+            start waiting on a multi-event condition, keyed by subscription.
+        fired_or_listeners: Multi-event ``or_`` listeners that had fired.
+        entry_path: How the paused method was reached (``"start"`` or
+            ``"listener"``). ``None`` when unknown; the path is then inferred
+            from the flow definition.
+        carried_labels: Label deliveries of enclosing routers that the pause
+            cut, innermost first.
+    """
+
+    completed_methods: list[str] = field(default_factory=list)
+    pending_events: dict[str, list[str]] = field(default_factory=dict)
+    fired_or_listeners: list[str] = field(default_factory=list)
+    entry_path: str | None = None
+    carried_labels: list[CarriedLabelDelivery] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "completed_methods": list(self.completed_methods),
+            "pending_events": {
+                key: list(events) for key, events in self.pending_events.items()
+            },
+            "fired_or_listeners": list(self.fired_or_listeners),
+            "entry_path": self.entry_path,
+            "carried_labels": [carried.to_dict() for carried in self.carried_labels],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ResumeProgress | None:
+        """Parse a persisted progress field; anything malformed yields ``None``."""
+        if isinstance(data, ResumeProgress):
+            return data
+        if not isinstance(data, dict):
+            return None
+        try:
+            pending = data.get("pending_events", {})
+            if not isinstance(pending, dict) or not all(
+                isinstance(key, str) for key in pending
+            ):
+                raise _MalformedProgressError
+            carried = data.get("carried_labels", [])
+            if not isinstance(carried, list):
+                raise _MalformedProgressError
+            return cls(
+                completed_methods=_string_list(data.get("completed_methods", [])),
+                pending_events={
+                    key: _string_list(events) for key, events in pending.items()
+                },
+                fired_or_listeners=_string_list(data.get("fired_or_listeners", [])),
+                entry_path=_entry_path(data.get("entry_path")),
+                carried_labels=[CarriedLabelDelivery.from_dict(c) for c in carried],
+            )
+        except _MalformedProgressError:
+            return None
+
+
 @dataclass
 class PendingFeedbackContext:
     """Context capturing everything needed to resume a paused flow.
@@ -43,6 +166,11 @@ class PendingFeedbackContext:
             new uuid. New pauses always store a value.
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
+        resume_progress: Execution progress at the pause (completed methods,
+            join and ``or_`` progress, how the paused method was reached, and
+            cut label deliveries of enclosing routers). ``None`` for rows
+            persisted before this field existed, or when the stored value is
+            malformed; resume then starts from empty progress.
 
     Example:
         ```python
@@ -70,6 +198,7 @@ class PendingFeedbackContext:
     requested_at: datetime = field(default_factory=datetime.now)
     execution_uuid: str | None = None
     trace_context: tuple[int, int] | None = None
+    resume_progress: ResumeProgress | None = None
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -116,6 +245,9 @@ class PendingFeedbackContext:
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
             "trace_context": list(self.trace_context) if self.trace_context else None,
+            "resume_progress": self.resume_progress.to_dict()
+            if self.resume_progress is not None
+            else None,
         }
 
     @classmethod
@@ -157,6 +289,7 @@ class PendingFeedbackContext:
             trace_context=(trace_context[0], trace_context[1])
             if trace_context
             else None,
+            resume_progress=ResumeProgress.from_dict(data.get("resume_progress")),
         )
 
 

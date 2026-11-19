@@ -521,6 +521,8 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+The resumed flow continues as it would have if the review had been answered during the run: the reviewed method's own listeners and its outcome-label listeners run, `and_` joins count members that completed before the pause, and `or_` listeners that already fired do not fire again.
+
 ### Key Types
 
 | Type | Description |
@@ -547,7 +549,12 @@ class PendingFeedbackContext:
     metadata: dict         # Custom metadata
     llm: str | None        # LLM for outcome collapsing
     requested_at: datetime
+    execution_uuid: str | None  # Kickoff run id, kept so traces stay on the same run
+    trace_context: tuple[int, int] | None  # Trace and span ids linking the resumed segment
+    resume_progress: ResumeProgress | None  # Execution progress at the pause
 ```
+
+A custom persistence backend that stores selected context fields instead of `to_dict()` or the context object must keep all of them; a resume without `resume_progress` cannot run joins or skip `or_` listeners that depended on work done before the pause.
 
 ### Complete Async Flow Example
 
