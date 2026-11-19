@@ -790,6 +790,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
     _definition: FlowDefinition = PrivateAttr()
     _or_listeners_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _completed_methods: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    # Completed methods whose delivery has not yet offered their name to router
+    # conditions, and to the conditions of other listeners. A method leaves
+    # each set at the matching step of its delivery.
+    _unoffered_to_routers: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    _unoffered_to_listeners: set[FlowMethodName] = PrivateAttr(default_factory=set)
     _method_call_counts: dict[FlowMethodName, int] = PrivateAttr(default_factory=dict)
     # True on flows CrewAI runs for its own bookkeeping - the agent executor and
     # the memory encoding/recall flows. Declared rather than inferred from the
@@ -1137,16 +1142,37 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     rearmable.discard(listener_name)
 
     def _snapshot_resume_progress(self) -> ResumeProgress:
-        """Copy the execution progress that a resume needs to continue."""
+        """Copy the execution progress that a resume needs to continue.
+
+        Methods that completed but were not yet offered to waiting conditions
+        are recorded in the joins that include them, as their delivery would
+        have done.
+        """
         with self._or_listeners_lock:
             fired = sorted(str(name) for name in self._fired_or_listeners)
-        return ResumeProgress(
+        progress = ResumeProgress(
             completed_methods=sorted(str(name) for name in self._completed_methods),
             pending_events={
                 str(key): sorted(events) for key, events in self._pending_events.items()
             },
             fired_or_listeners=fired,
         )
+        for routers, unoffered in (
+            (True, self._unoffered_to_routers),
+            (False, self._unoffered_to_listeners),
+        ):
+            targets = [
+                (str(name), condition)
+                for name, definition, condition in self._listener_methods()
+                if definition.router == routers
+            ]
+            for method_name in sorted(unoffered):
+                self._record_unsatisfied(progress, str(method_name), targets)
+        return progress
+
+    def _mark_completion_unoffered(self, method_name: FlowMethodName) -> None:
+        self._unoffered_to_routers.add(method_name)
+        self._unoffered_to_listeners.add(method_name)
 
     def _pause_progress(self, pending: HumanFeedbackPending) -> ResumeProgress:
         progress = pending.context.resume_progress
@@ -1156,8 +1182,14 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         return progress
 
     def _restore_resume_progress(self, progress: ResumeProgress) -> None:
-        """Restore progress saved at a pause, ignoring names the flow lacks."""
+        """Restore progress saved at a pause, ignoring names the flow lacks.
+
+        The saved join progress already counts every completion that had not
+        been offered at the pause, so none is left unoffered.
+        """
         methods = self._definition.methods
+        self._unoffered_to_routers = set()
+        self._unoffered_to_listeners = set()
         listen_keys = {
             str(name) for name, definition in methods.items() if definition.listen
         }
@@ -1257,6 +1289,15 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 condition = self._start_condition(name)
                 if condition is not None and name not in (skip_starts or set()):
                     targets.append((f"start:{name}", condition))
+        self._record_unsatisfied(progress, trigger_name, targets)
+
+    @staticmethod
+    def _record_unsatisfied(
+        progress: ResumeProgress,
+        trigger_name: str,
+        targets: list[tuple[str, FlowDefinitionCondition]],
+    ) -> None:
+        """Add ``trigger_name`` to each target condition it does not satisfy."""
         for key, condition in targets:
             if trigger_name not in set(_iter_condition_events(condition)):
                 continue
@@ -1627,6 +1668,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             raise ValueError(
                 "No pending feedback context. Use from_pending() to restore a paused flow."
             )
+        # Continue from the progress saved with this context, also on the
+        # instance that paused again during a previous resume.
+        if context.resume_progress is not None:
+            self._restore_resume_progress(context.resume_progress)
         emit = context.emit
 
         if not self.suppress_flow_events:
@@ -1692,6 +1737,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     raise
 
             self._completed_methods.add(FlowMethodName(context.method_name))
+            self._mark_completion_unoffered(FlowMethodName(context.method_name))
 
             await asyncio.to_thread(
                 self._persist_method_completion, FlowMethodName(context.method_name)
@@ -3242,6 +3288,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             )
 
             self._completed_methods.add(method_name)
+            self._mark_completion_unoffered(method_name)
 
             await asyncio.to_thread(self._persist_method_completion, method_name)
 
@@ -3579,6 +3626,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self, trigger_method: FlowMethodName, router_only: bool
     ) -> list[FlowMethodName]:
         triggered: list[FlowMethodName] = []
+        unoffered = (
+            self._unoffered_to_routers if router_only else self._unoffered_to_listeners
+        )
+        unoffered.discard(trigger_method)
 
         for listener_name, method_definition, condition in self._listener_methods():
             is_router = method_definition.router
