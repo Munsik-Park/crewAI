@@ -2511,6 +2511,128 @@ def test_same_instance_resume_with_second_repause_runs_join_once(
     assert_parity(in_run, flatten(segments))
 
 
+def make_reused_after_failure(run: list[int]) -> Factory:
+    """Run 1 delivers ``side`` to its router only, which raises; run 2 skips it.
+
+    ``choose`` routes to ``"x"`` in run 1 and to ``"y"`` in run 2. In run 1,
+    ``side`` completes and ``boom``, its router, raises before ``side`` is
+    offered to plain listeners. Run 2 is a fresh ``kickoff()`` on the same
+    instance, where ``side`` does not run and the review ``review_y`` pauses or
+    is answered.
+    """
+
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        class ReusedAfterFailure(Flow):
+            @start()
+            def begin(self):
+                log.append(("begin", None))
+
+            @router(begin)
+            def choose(self):
+                log.append(("choose", None))
+                return "x" if run[0] == 1 else "y"
+
+            @listen("x")
+            def side(self):
+                log.append(("side", None))
+                return "side-output"
+
+            @router(side)
+            def boom(self):
+                log.append(("boom", None))
+                if run[0] == 1:
+                    raise RuntimeError("router failure in run 1")
+                return "z"
+
+            @listen("y")
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def review_y(self):
+                log.append(("review_y", None))
+                return "review-output"
+
+            @listen(and_(side, review_y))
+            def combine(self, r=None):
+                log.append(("combine", payload(r)))
+
+            @listen("approved")
+            def publish(self, r=None):
+                log.append(("publish", payload(r)))
+
+        return ReusedAfterFailure
+
+    return make
+
+
+def run_after_failed_run(
+    pause: bool, resume_mode: str, db_path: str
+) -> tuple[list[Record], list[Record], list[str]]:
+    """Fail run 1 on an instance, then kick off run 2 on it and resume it.
+
+    Returns the log of run 1, the log of run 2 (with its resume, if paused)
+    and the name of each method run 2 paused on.
+    """
+    run = [1]
+    log: list[Record] = []
+    reviewer = Reviewer(
+        {"review_y": ["approved"]}, frozenset({"review_y"} if pause else ())
+    )
+    flow_class = make_reused_after_failure(run)(reviewer, log)
+    persistence = SQLiteFlowPersistence(db_path)
+    flow = flow_class(persistence=persistence)
+
+    with pytest.raises(RuntimeError, match="router failure in run 1"):
+        flow.kickoff()
+    first = list(log)
+
+    run[0] = 2
+    start_at = len(log)
+    result = flow.kickoff()
+    paused_on: list[str] = []
+    if isinstance(result, HumanFeedbackPending):
+        paused_on.append(result.context.method_name)
+        restored = flow_class.from_pending(result.context.flow_id, persistence)
+        feedback = reviewer.answer(result.context.method_name)
+        if resume_mode == "sync":
+            result = restored.resume(feedback)
+        else:
+            result = asyncio.run(restored.resume_async(feedback))
+        assert not isinstance(result, HumanFeedbackPending)
+    return first, log[start_at:], paused_on
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_fresh_kickoff_does_not_count_completion_left_unoffered_by_earlier_run(
+    resume_mode: str, tmp_path: Any
+) -> None:
+    """A fresh kickoff on a reused instance starts with nothing left unoffered.
+
+    ``side`` completed in a failed earlier run and was never offered to plain
+    listeners. It does not complete in run 2, so ``and_(side, review_y)`` does
+    not run in run 2 in-run, and must not run after run 2 pauses and resumes.
+    """
+    first_in_run, in_run, in_run_paused_on = run_after_failed_run(
+        False, resume_mode, str(tmp_path / "in-run.db")
+    )
+    first_paused, paused, paused_on = run_after_failed_run(
+        True, resume_mode, str(tmp_path / "paused.db")
+    )
+
+    for first in (first_in_run, first_paused):
+        assert names(first) == ["begin", "choose", "side", "boom"]
+    assert in_run_paused_on == []
+    assert paused_on == ["review_y"]
+    assert "side" not in names(in_run)
+    assert "review_y" in names(in_run)
+    assert "publish" in names(in_run)
+    assert "combine" not in names(in_run)
+    assert_parity(in_run, paused)
+
+
 # ---------------------------------------------------------------------------
 # V-16: a join completed by a cut trigger, as the docs state it
 # ---------------------------------------------------------------------------
