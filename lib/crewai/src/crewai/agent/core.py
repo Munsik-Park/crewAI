@@ -141,6 +141,7 @@ from crewai.utilities.timed_run import (
     TimedRunScope,
     current_run_scope,
     detach_abandoned_executor,
+    refuse_abandoned_run,
     reset_run_scope,
     run_scope_write_guard,
     set_run_scope,
@@ -739,10 +740,10 @@ class Agent(BaseAgent):
         """
         get_env_context()
 
-        self.reset_tool_failures()
-
-        if self.tools_handler:
-            self.tools_handler.last_used_tool = None
+        with run_scope_write_guard():
+            self.reset_tool_failures()
+            if self.tools_handler:
+                self.tools_handler.last_used_tool = None
 
         task_prompt = task.prompt()
         task_prompt = build_task_prompt_with_schema(task, task_prompt)
@@ -1045,6 +1046,8 @@ class Agent(BaseAgent):
             ValueError: If the max execution time is not a positive integer.
             RuntimeError: If the agent execution fails for other reasons.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         spreadsheets = read_spreadsheet_inputs(task_input_text(task))
         scope = enter_spreadsheet_scope(spreadsheets)
         try:
@@ -1231,6 +1234,8 @@ class Agent(BaseAgent):
             ValueError: If the max execution time is not a positive integer.
             RuntimeError: If the agent execution fails for other reasons.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         # Downloading and parsing block, so they stay off the event loop.
         spreadsheets = await asyncio.to_thread(
             read_spreadsheet_inputs, task_input_text(task)
@@ -1414,13 +1419,12 @@ class Agent(BaseAgent):
         """Create the AgentExecutor for the agent."""
         configured_tools = tools if tools is not None else self.tools or []
         raw_tools = self._add_skill_loader_tool(list(configured_tools), task=task)
-        parsed_tools = parse_tools(raw_tools)
-
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        # A run abandoned at its timeout must not touch the executor a later
-        # call may be using.
+        # A run abandoned at its timeout must not touch the executor or the
+        # tool usage counts a later call may be using.
         with run_scope_write_guard():
+            parsed_tools = parse_tools(raw_tools)
             if self.agent_executor is not None:
                 self._update_executor_parameters(
                     task=task,
@@ -1786,10 +1790,10 @@ class Agent(BaseAgent):
         """
         if spreadsheets is None:
             spreadsheets = read_spreadsheet_inputs(kickoff_input_text(messages))
-        self.reset_tool_failures()
-
-        if self.tools_handler:
-            self.tools_handler.last_used_tool = None
+        with run_scope_write_guard():
+            self.reset_tool_failures()
+            if self.tools_handler:
+                self.tools_handler.last_used_tool = None
 
         if self.apps:
             platform_tools = self.get_platform_tools(self.apps)
@@ -1818,7 +1822,8 @@ class Agent(BaseAgent):
             )
 
         raw_tools = self._add_skill_loader_tool(raw_tools)
-        parsed_tools = parse_tools(raw_tools)
+        with run_scope_write_guard():
+            parsed_tools = parse_tools(raw_tools)
 
         agent_info = {
             "id": self.id,
@@ -2069,6 +2074,8 @@ class Agent(BaseAgent):
         Note:
             For explicit async usage outside of Flow, use kickoff_async() directly.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         restored = apply_checkpoint(self, from_checkpoint)
         if restored is not None:
             return restored.kickoff(  # type: ignore[no-any-return]
@@ -2453,6 +2460,8 @@ class Agent(BaseAgent):
         Returns:
             LiteAgentOutput: The result of the agent execution.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         restored = apply_checkpoint(self, from_checkpoint)
         if restored is not None:
             return await restored.kickoff_async(  # type: ignore[no-any-return]

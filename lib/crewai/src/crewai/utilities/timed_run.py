@@ -148,6 +148,18 @@ def run_scope_abandoned() -> bool:
     return scope is not None and scope.abandoned
 
 
+def refuse_abandoned_run() -> None:
+    """Refuse to start work on an agent for a run abandoned at its timeout.
+
+    A no-op when no timed run is current.
+
+    Raises:
+        RunAbandonedError: The current scope was abandoned.
+    """
+    if run_scope_abandoned():
+        raise RunAbandonedError()
+
+
 @contextmanager
 def run_scope_write_guard() -> Generator[None, None, None]:
     """Guard a write to agent state against the current scope's abandonment.
