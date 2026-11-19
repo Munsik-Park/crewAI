@@ -523,6 +523,8 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
 
 The resumed flow continues as it would have if the review had been answered during the run: the reviewed method's own listeners and its outcome-label listeners run, `and_` joins count members that completed before the pause, and `or_` listeners that already fired do not fire again.
 
+One case differs. When the reviewed method is a listener, it runs while the method that triggered it is still routing. An `and_` join that waits on both the reviewed method and a method whose routing was still under way at the pause (the method the reviewed method listens to, or one further up a chain of routers that led to it) runs on resume together with the reviewed method's own listeners, before the outcome's routers and listeners, and receives the outcome string. In a run without a pause, the same join receives that method's output and runs after the outcome's routers.
+
 ### Key Types
 
 | Type | Description |
