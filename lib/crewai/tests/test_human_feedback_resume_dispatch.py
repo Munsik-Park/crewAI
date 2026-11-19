@@ -2081,6 +2081,111 @@ def test_resume_does_not_count_cancelled_racer_in_router_join(
     assert_parity(in_run, flatten(segments))
 
 
+def make_lost_racer() -> Factory:
+    """``b`` has lost the race for ``or_(a, b)`` but is not yet cancelled.
+
+    The shape of ``make_cancelled_racer``, but ``draft`` settles (pauses, or is
+    answered in-run) while ``w`` has fired for ``a`` and ``a``'s task, which
+    cancels ``b`` when it returns, is held in ``w``'s completion hop. ``b`` is
+    in its own hop until it is cancelled, so it is delivered in neither run.
+    """
+
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        b_in_hop = threading.Event()
+        b_cancelled = threading.Event()
+        w_ran = threading.Event()
+        draft_settled = threading.Event()
+        reviewer.on_save = draft_settled.set
+
+        class LostRacer(Flow):
+            def _persist_method_completion(self, method_name: Any) -> None:
+                super()._persist_method_completion(method_name)
+                if method_name == "b":
+                    b_in_hop.set()
+                    assert b_cancelled.wait(WAIT_SECONDS), "b was not cancelled"
+                elif method_name == "w":
+                    assert draft_settled.wait(WAIT_SECONDS), "draft did not settle"
+                elif method_name == "draft":
+                    draft_settled.set()
+
+            async def _execute_single_listener(
+                self, listener_name: Any, *args: Any, **kwargs: Any
+            ) -> Any:
+                try:
+                    return await super()._execute_single_listener(
+                        listener_name, *args, **kwargs
+                    )
+                except asyncio.CancelledError:
+                    if listener_name == "b":
+                        b_cancelled.set()
+                    raise
+
+            @start()
+            def begin(self):
+                log.append(("begin", None))
+                return "begin-output"
+
+            @listen(begin)
+            def a(self):
+                assert b_in_hop.wait(WAIT_SECONDS), "b did not reach its hop"
+                log.append(("a", None))
+                return "a-output"
+
+            @listen(begin)
+            def b(self):
+                log.append(("b", None))
+                return "b-output"
+
+            @listen(or_(a, b))
+            def w(self, r=None):
+                log.append(("w", payload(r)))
+                w_ran.set()
+
+            @start()
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                assert w_ran.wait(WAIT_SECONDS), "w did not run"
+                log.append(("draft", None))
+                return "draft-output"
+
+            @router(and_(b, "approved"))
+            def rj(self, r=None):
+                log.append(("rj", payload(r)))
+                return "x"
+
+            @listen("x")
+            def on_x(self, r=None):
+                log.append(("on_x", payload(r)))
+
+        return LostRacer
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_does_not_count_racer_lost_but_not_cancelled_at_pause(
+    resume_mode: str, db_path: str
+) -> None:
+    """A racer whose or_ fired for a sibling is not undelivered: rj runs in neither run."""
+    make = make_lost_racer()
+
+    in_run = run_in_run(make, WINDOW_ANSWERS)
+    segments, paused_on = run_paused(
+        make, WINDOW_ANSWERS, {"draft"}, resume_mode, db_path
+    )
+
+    assert paused_on == ["draft"]
+    assert {"a", "b", "w", "draft"} <= set(names(in_run))
+    assert {"a", "b", "w", "draft"} <= set(names(segments[0]))
+    assert "rj" not in names(in_run)
+    assert_parity(in_run, flatten(segments))
+
+
 def make_join_fired_in_earlier_cycle() -> Factory:
     def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
         delivered = threading.Event()
