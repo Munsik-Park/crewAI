@@ -159,6 +159,7 @@ from crewai.utilities.streaming import (
     create_frame_generator,
     create_frame_streaming_state,
 )
+from crewai.utilities.timed_run import RunAbandonedError
 
 
 # Runtime alias so Pydantic can resolve the ``execution_context`` field's
@@ -2763,7 +2764,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     logger.warning("FlowFailedEvent handler failed", exc_info=True)
 
         except Exception:
-            logger.warning("Failed to signal flow failure", exc_info=True)
+            # A run abandoned at its timeout may end at interpreter exit, when
+            # signalling can no longer be scheduled; its caller has moved on.
+            if not isinstance(error, RunAbandonedError):
+                logger.warning("Failed to signal flow failure", exc_info=True)
 
     async def akickoff(
         self,
@@ -3444,8 +3448,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             return (listener_result, finished_event_id)
 
         except Exception as e:
-            # Don't log HumanFeedbackPending as an error - it's expected control flow
-            if not isinstance(e, HumanFeedbackPending):
+            # Don't log HumanFeedbackPending or the stop of an abandoned run as
+            # an error - both are expected control flow
+            if not isinstance(e, (HumanFeedbackPending, RunAbandonedError)):
                 if not getattr(e, "_flow_listener_logged", False):
                     logger.error(f"Error executing listener {listener_name}: {e}")
                     e._flow_listener_logged = True  # type: ignore[attr-defined]

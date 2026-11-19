@@ -31,6 +31,7 @@ from crewai.tools.tool_failure import (
     failure_from_exception,
     reportable_failure,
 )
+from crewai.tools.tool_results import record_tool_result
 from crewai.utilities.agent_utils import (
     get_tool_names,
     render_text_description_and_args,
@@ -417,7 +418,7 @@ class ToolUsage:
                         data["result_as_answer"] = result_as_answer
 
                     if self.agent and hasattr(self.agent, "tools_results"):
-                        self.agent.tools_results.append(data)
+                        record_tool_result(self.agent, data)
 
                     if available_tool and hasattr(
                         available_tool, "_increment_usage_count"
@@ -674,7 +675,7 @@ class ToolUsage:
                         data["result_as_answer"] = result_as_answer
 
                     if self.agent and hasattr(self.agent, "tools_results"):
-                        self.agent.tools_results.append(data)
+                        record_tool_result(self.agent, data)
 
                     if available_tool and hasattr(
                         available_tool, "_increment_usage_count"

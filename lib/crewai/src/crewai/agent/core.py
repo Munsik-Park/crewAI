@@ -68,7 +68,6 @@ from crewai.agents.agent_builder.base_agent import (
 )
 from crewai.agents.agent_executor import AgentExecutor
 from crewai.agents.cache.cache_handler import CacheHandler
-from crewai.agents.tools_handler import ToolsHandler
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.event_context import _event_id_stack
 from crewai.events.types.agent_events import (
@@ -111,6 +110,7 @@ from crewai.tools.tool_failure import (
     merge_tool_failures,
     tool_failure_collector,
 )
+from crewai.tools.tool_results import tool_result_collector
 from crewai.types.callback import SerializableCallable
 from crewai.types.usage_metrics import UsageMetrics
 from crewai.utilities.agent_utils import (
@@ -136,6 +136,15 @@ from crewai.utilities.message_utils import message_content_text
 from crewai.utilities.prompts import Prompts, StandardPromptResult, SystemPromptResult
 from crewai.utilities.pydantic_schema_utils import generate_model_description
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import (
+    RunAbandonedError,
+    TimedRunScope,
+    current_run_scope,
+    detach_abandoned_executor,
+    reset_run_scope,
+    run_scope_write_guard,
+    set_run_scope,
+)
 from crewai.utilities.token_counter_callback import TokenCalcHandler
 from crewai.utilities.training_handler import CrewTrainingHandler
 
@@ -164,6 +173,7 @@ if TYPE_CHECKING:
 _passthrough_exceptions: tuple[type[Exception], ...] = (
     ToolExecutionFailedError,
     HookAborted,
+    RunAbandonedError,
 )
 
 # Names the worker threads of runs under max_execution_time, which can
@@ -921,6 +931,14 @@ class Agent(BaseAgent):
         Raises:
             Exception: If the error is from litellm, a passthrough, or retries are exhausted.
         """
+        if isinstance(e, RunAbandonedError):
+            # The run was abandoned at its timeout: close the scope this attempt
+            # opened, but neither retry it nor count it against the budget.
+            crewai_event_bus.emit(
+                self,
+                event=AgentExecutionErrorEvent(agent=self, task=task, error=str(e)),
+            )
+            raise
         if isinstance(e, _passthrough_exceptions):
             raise
         # A retry re-enters execute_task, which opens a new agent_execution_started
@@ -1030,7 +1048,8 @@ class Agent(BaseAgent):
         spreadsheets = read_spreadsheet_inputs(task_input_text(task))
         scope = enter_spreadsheet_scope(spreadsheets)
         try:
-            return self._execute_task(task, context, tools, spreadsheets)
+            with tool_result_collector(self):
+                return self._execute_task(task, context, tools, spreadsheets)
         finally:
             exit_spreadsheet_scope(scope)
 
@@ -1109,7 +1128,9 @@ class Agent(BaseAgent):
             RuntimeError: If execution fails for other reasons.
         """
         executor = self.agent_executor
+        run_scope = TimedRunScope(parent=current_run_scope())
         ctx = contextvars.copy_context()
+        ctx.run(set_run_scope, run_scope)
         # Owned explicitly rather than via `with`: leaving a `with` block joins
         # the worker, which would hold the TimeoutError until the run ends.
         pool = concurrent.futures.ThreadPoolExecutor(
@@ -1127,6 +1148,7 @@ class Agent(BaseAgent):
             try:
                 return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError as e:
+                run_scope.abandon()
                 self._detach_timed_out_run(executor)
                 raise TimeoutError(
                     f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
@@ -1139,18 +1161,16 @@ class Agent(BaseAgent):
                 raise RuntimeError(f"Task execution failed: {e!s}") from e
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+            run_scope.close()
 
     def _detach_timed_out_run(self, executor: AgentExecutor | None) -> None:
         """Leave a timed-out run its own executor and tools handler.
 
-        The run cannot be stopped and keeps using both, so the next call on
-        this agent gets fresh ones instead; the tool cache stays shared.
+        The run scope detaches the executors registered with it; this also
+        covers a run that timed out before its executor was registered.
         """
         if executor is not None:
-            executor.abandon()
-            if self.agent_executor is executor:
-                self.agent_executor = None
-        self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
+            detach_abandoned_executor(executor)
 
     def _execute_without_timeout(
         self,
@@ -1217,7 +1237,8 @@ class Agent(BaseAgent):
         )
         scope = enter_spreadsheet_scope(spreadsheets)
         try:
-            return await self._aexecute_task(task, context, tools, spreadsheets)
+            with tool_result_collector(self):
+                return await self._aexecute_task(task, context, tools, spreadsheets)
         finally:
             exit_spreadsheet_scope(scope)
 
@@ -1294,18 +1315,23 @@ class Agent(BaseAgent):
         # A cancelled run never emits the events that close the scopes it
         # opened; on Python 3.12+ wait_for runs it in this task's context.
         event_scope_token = _event_id_stack.set(_event_id_stack.get())
+        run_scope = TimedRunScope(parent=current_run_scope())
+        run_scope_token = set_run_scope(run_scope)
         try:
             return await asyncio.wait_for(
                 self._aexecute_without_timeout(task_prompt, task, executor=executor),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as e:
+            run_scope.abandon()
             self._detach_timed_out_run(executor)
             raise TimeoutError(
                 f"Task '{task.description}' execution timed out after {timeout} seconds. "
                 "Consider increasing max_execution_time or optimizing the task."
             ) from e
         finally:
+            reset_run_scope(run_scope_token)
+            run_scope.close()
             _event_id_stack.reset(event_scope_token)
 
     async def _aexecute_without_timeout(
@@ -1392,46 +1418,51 @@ class Agent(BaseAgent):
 
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        if self.agent_executor is not None:
-            self._update_executor_parameters(
-                task=task,
-                tools=parsed_tools,
-                raw_tools=raw_tools,
-                prompt=prompt,
-                stop_words=stop_words,
-                rpm_limit_fn=rpm_limit_fn,
-            )
-        else:
-            if not isinstance(self.llm, BaseLLM):
-                raise RuntimeError(
-                    "LLM must be resolved before creating agent executor."
+        # A run abandoned at its timeout must not touch the executor a later
+        # call may be using.
+        with run_scope_write_guard():
+            if self.agent_executor is not None:
+                self._update_executor_parameters(
+                    task=task,
+                    tools=parsed_tools,
+                    raw_tools=raw_tools,
+                    prompt=prompt,
+                    stop_words=stop_words,
+                    rpm_limit_fn=rpm_limit_fn,
                 )
-            self.agent_executor = self.executor_class(
-                llm=self.llm,
-                task=task,
-                agent=self,
-                crew=self.crew,
-                tools=parsed_tools,
-                prompt=prompt,
-                original_tools=raw_tools,
-                stop_words=stop_words,
-                max_iter=self.max_iter,
-                tools_handler=self.tools_handler,
-                tools_names=get_tool_names(parsed_tools),
-                tools_description=render_text_description_and_args(parsed_tools),
-                step_callback=self.step_callback,
-                function_calling_llm=self.function_calling_llm,
-                respect_context_window=self.respect_context_window,
-                request_within_rpm_limit=rpm_limit_fn,
-                callbacks=[TokenCalcHandler(self._token_process)],
-                response_model=(
-                    task.response_model or task.output_pydantic or task.output_json
+            else:
+                if not isinstance(self.llm, BaseLLM):
+                    raise RuntimeError(
+                        "LLM must be resolved before creating agent executor."
+                    )
+                self.agent_executor = self.executor_class(
+                    llm=self.llm,
+                    task=task,
+                    agent=self,
+                    crew=self.crew,
+                    tools=parsed_tools,
+                    prompt=prompt,
+                    original_tools=raw_tools,
+                    stop_words=stop_words,
+                    max_iter=self.max_iter,
+                    tools_handler=self.tools_handler,
+                    tools_names=get_tool_names(parsed_tools),
+                    tools_description=render_text_description_and_args(parsed_tools),
+                    step_callback=self.step_callback,
+                    function_calling_llm=self.function_calling_llm,
+                    respect_context_window=self.respect_context_window,
+                    request_within_rpm_limit=rpm_limit_fn,
+                    callbacks=[TokenCalcHandler(self._token_process)],
+                    response_model=(
+                        task.response_model or task.output_pydantic or task.output_json
+                    )
+                    if task
+                    else None,
                 )
-                if task
-                else None,
-            )
-            if isinstance(self.agent_executor, AgentExecutor):
-                self.agent_executor.use_better_compaction = self.use_better_compaction
+                if isinstance(self.agent_executor, AgentExecutor):
+                    self.agent_executor.use_better_compaction = (
+                        self.use_better_compaction
+                    )
 
     def _update_executor_parameters(
         self,

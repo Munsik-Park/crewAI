@@ -17,6 +17,7 @@ from crewai.events.types.knowledge_events import (
 )
 from crewai.hooks.dispatch import HookAborted
 from crewai.knowledge.utils.knowledge_utils import extract_knowledge_context
+from crewai.tools.tool_results import collected_tool_results
 from crewai.utilities.pydantic_schema_utils import generate_model_description
 from crewai.utilities.types import LLMMessage
 
@@ -240,6 +241,9 @@ def apply_training_data(agent: Agent, task_prompt: str) -> str:
 def process_tool_results(agent: Agent, result: Any) -> Any:
     """Process tool results, returning result_as_answer if applicable.
 
+    Reads the results of the agent's execution in progress, so an earlier
+    or concurrent execution's tool output never becomes this one's answer.
+
     Args:
         agent: The agent with tool results.
         result: The current result.
@@ -247,7 +251,10 @@ def process_tool_results(agent: Agent, result: Any) -> Any:
     Returns:
         The final result, potentially overridden by tool result_as_answer.
     """
-    for tool_result in agent.tools_results:
+    tool_results = collected_tool_results(agent)
+    if tool_results is None:
+        tool_results = agent.tools_results
+    for tool_result in tool_results:
         if tool_result.get("result_as_answer", False):
             result = tool_result["result"]
     return result
