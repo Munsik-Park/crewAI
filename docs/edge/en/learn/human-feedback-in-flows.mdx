@@ -551,7 +551,7 @@ class PendingFeedbackContext:
     requested_at: datetime
     execution_uuid: str | None  # Kickoff run id, kept so traces stay on the same run
     trace_context: tuple[int, int] | None  # Trace and span ids linking the resumed segment
-    resume_progress: object | None  # Execution progress at the pause, kept as stored
+    resume_progress: object | None  # Internal resume progress; serialized by to_dict(), not public API
 ```
 
 A custom persistence backend that stores selected context fields instead of `to_dict()` or the context object must keep all of them; a resume without `resume_progress` cannot run joins or skip `or_` listeners that depended on work done before the pause.

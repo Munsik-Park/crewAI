@@ -511,6 +511,8 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+O flow retomado continua como teria continuado se a revisão tivesse sido respondida durante a execução: os listeners do próprio método revisado e os listeners do label de outcome são executados, joins `and_` contam os membros concluídos antes da pausa, e listeners `or_` que já dispararam não disparam novamente.
+
 ### Tipos Principais
 
 | Tipo | Descrição |
@@ -537,7 +539,12 @@ class PendingFeedbackContext:
     metadata: dict         # Metadata customizado
     llm: str | None        # LLM para mapeamento de outcome
     requested_at: datetime
+    execution_uuid: str | None  # ID da execução do kickoff, mantido para que os traces fiquem na mesma execução
+    trace_context: tuple[int, int] | None  # IDs de trace e span que ligam o segmento retomado
+    resume_progress: object | None  # Progresso interno de retomada; serializado por to_dict(), não é API pública
 ```
+
+Um backend de persistência customizado que armazena campos selecionados do contexto em vez de `to_dict()` ou do objeto de contexto deve manter todos eles; uma retomada sem `resume_progress` não consegue executar joins nem pular listeners `or_` que dependiam de trabalho feito antes da pausa.
 
 ### Exemplo Completo de Flow Assíncrono
 

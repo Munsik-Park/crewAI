@@ -511,6 +511,8 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+재개된 Flow는 실행 중에 리뷰에 응답했을 때와 같이 계속됩니다: 리뷰된 메서드 자체의 리스너와 outcome 레이블 리스너가 실행되고, `and_` 조인은 일시 중지 전에 완료된 멤버를 포함하여 계산하며, 이미 실행된 `or_` 리스너는 다시 실행되지 않습니다.
+
 ### 주요 타입
 
 | 타입 | 설명 |
@@ -537,7 +539,12 @@ class PendingFeedbackContext:
     metadata: dict         # 커스텀 메타데이터
     llm: str | None        # outcome 매핑을 위한 LLM
     requested_at: datetime
+    execution_uuid: str | None  # 트레이스가 같은 실행에 남도록 유지되는 kickoff 실행 ID
+    trace_context: tuple[int, int] | None  # 재개된 구간을 연결하는 트레이스 및 스팬 ID
+    resume_progress: object | None  # 내부 재개 진행 상태; to_dict()로 직렬화되며 공개 API가 아님
 ```
+
+`to_dict()`나 컨텍스트 객체 대신 선택한 컨텍스트 필드만 저장하는 커스텀 영속성 백엔드는 모든 필드를 유지해야 합니다. `resume_progress` 없이 재개하면 일시 중지 전에 완료된 작업에 의존하는 조인을 실행하거나 `or_` 리스너를 건너뛸 수 없습니다.
 
 ### 완전한 비동기 Flow 예제
 
