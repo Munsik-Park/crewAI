@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -20,7 +20,16 @@ from crewai.events.types.flow_events import (
     MethodExecutionFinishedEvent,
     MethodExecutionStartedEvent,
 )
-from crewai.flow import Flow, and_, human_feedback, listen, or_, router, start
+from crewai.flow import (
+    Flow,
+    HumanFeedbackResult,
+    and_,
+    human_feedback,
+    listen,
+    or_,
+    router,
+    start,
+)
 from crewai.flow.async_feedback import HumanFeedbackPending, PendingFeedbackContext
 from crewai.flow.flow import FlowState
 from crewai.flow.flow_config import flow_config
@@ -4263,6 +4272,117 @@ def test_start_step_listening_to_its_own_outcome_reruns_after_resume():
         result = approving.resume("ship it")
 
     assert result == "published:ship it"
+
+
+_RESUME_DISPATCH_LOG: list[tuple[str, Any]] = []
+_RESUME_DISPATCH_PRE_DELIVERED = threading.Event()
+
+
+def _resume_dispatch_payload(value):
+    if isinstance(value, HumanFeedbackResult):
+        return ("feedback", value.method_name, value.outcome, value.feedback)
+    return value if value is None or isinstance(value, str) else type(value).__name__
+
+
+def _resume_dispatch_pre(flow):
+    _RESUME_DISPATCH_LOG.append(("pre", None))
+    return "pre-output"
+
+
+def _resume_dispatch_pre_delivered(flow):
+    _RESUME_DISPATCH_PRE_DELIVERED.set()
+
+
+def _resume_dispatch_draft(flow):
+    assert _RESUME_DISPATCH_PRE_DELIVERED.wait(10)
+    _RESUME_DISPATCH_LOG.append(("draft", None))
+    return "draft-content"
+
+
+def _resume_dispatch_audit(flow, result):
+    _RESUME_DISPATCH_LOG.append(("audit", _resume_dispatch_payload(result)))
+
+
+def _resume_dispatch_label_join(flow, result):
+    _RESUME_DISPATCH_LOG.append(("label_join", _resume_dispatch_payload(result)))
+
+
+class ApprovingProvider:
+    def request_feedback(self, context, flow):
+        return "ship it"
+
+
+def _resume_dispatch_yaml(provider: str) -> str:
+    return f"""
+schema: crewai.flow/v1
+name: PendingResumeDispatchFlow
+persist:
+  enabled: true
+  persistence:
+    persistence_type: DefinitionStoreBackend
+    store: hitl-resume-dispatch
+methods:
+  pre:
+    do:
+      ref: {__name__}:_resume_dispatch_pre
+    start: true
+  pre_delivered:
+    do:
+      ref: {__name__}:_resume_dispatch_pre_delivered
+    listen: pre
+  draft:
+    do:
+      ref: {__name__}:_resume_dispatch_draft
+    start: true
+    human_feedback:
+      message: "Review:"
+      emit: [approved, rejected]
+      llm: gpt-4o-mini
+      provider: {__name__}:{provider}
+  audit:
+    do:
+      ref: {__name__}:_resume_dispatch_audit
+    listen: draft
+  label_join:
+    do:
+      ref: {__name__}:_resume_dispatch_label_join
+    listen:
+      and: [pre, approved]
+"""
+
+
+def _run_resume_dispatch_flow(provider: str, resume_mode: str | None):
+    _RESUME_DISPATCH_LOG.clear()
+    _RESUME_DISPATCH_PRE_DELIVERED.clear()
+    definition = FlowDefinition.from_declaration(
+        contents=_resume_dispatch_yaml(provider)
+    )
+    with patch.object(Flow, "_collapse_to_outcome", return_value="approved"):
+        result = Flow.from_declaration(contents=definition).kickoff()
+        if resume_mode is not None:
+            assert isinstance(result, HumanFeedbackPending)
+            resumed = Flow.from_pending(
+                result.context.flow_id,
+                DefinitionStoreBackend(store="hitl-resume-dispatch"),
+                definition=definition,
+            )
+            if resume_mode == "sync":
+                resumed.resume("ship it")
+            else:
+                asyncio.run(resumed.resume_async("ship it"))
+    return list(_RESUME_DISPATCH_LOG)
+
+
+@pytest.mark.parametrize("resume_mode", ["sync", "async"])
+def test_declarative_routed_review_resume_dispatches_like_in_run(resume_mode):
+    """A YAML emit review restored through an object-storing backend runs its
+    own listener and the and_ join on its label, as when answered in the run."""
+    in_run = _run_resume_dispatch_flow("ApprovingProvider", None)
+    paused = _run_resume_dispatch_flow("PausingProvider", resume_mode)
+
+    assert ("audit", "approved") in in_run
+    assert "label_join" in [name for name, _ in in_run]
+    assert Counter(paused) == Counter(in_run), f"in-run: {in_run}\npaused: {paused}"
 
 
 @pytest.mark.parametrize("router", [False, True])
