@@ -168,9 +168,9 @@ class PendingFeedbackContext:
             execution segment. Absent when execution tracing was disabled.
         resume_progress: Execution progress at the pause (completed methods,
             join and ``or_`` progress, how the paused method was reached, and
-            cut label deliveries of enclosing routers). ``None`` for rows
-            persisted before this field existed, or when the stored value is
-            malformed; resume then starts from empty progress.
+            cut label deliveries of enclosing routers). ``None`` when the
+            stored context has no such key or its value is malformed; resume
+            then starts from empty progress.
 
     Example:
         ```python

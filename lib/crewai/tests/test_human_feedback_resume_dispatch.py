@@ -40,7 +40,7 @@ import pytest
 LLM = "gpt-4o-mini"
 WAIT_SECONDS = 10
 
-# Keys a PendingFeedbackContext row had before resume progress was carried.
+# Keys of a stored PendingFeedbackContext row that holds no resume progress.
 PRE_PROGRESS_CONTEXT_KEYS = frozenset(
     {
         "flow_id",
