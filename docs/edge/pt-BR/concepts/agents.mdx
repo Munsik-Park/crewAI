@@ -330,15 +330,18 @@ multimodal_agent = Agent(
 - `max_retry_limit`: Tentativas de correção em erros
 
 <Note>
-**Quando `max_execution_time` se esgota**, a chamada lança `TimeoutError` no limite, sem esperar o trabalho em andamento. O Python não consegue parar uma thread em execução, então esse trabalho não é interrompido:
+**Quando `max_execution_time` se esgota**, a chamada lança `TimeoutError` no limite, sem esperar o trabalho em andamento. O Python não consegue parar uma thread em execução, então a etapa em andamento quando o tempo acabou ainda termina: uma chamada de LLM, ou uma chamada de ferramenta com seus efeitos colaterais. Nada roda depois dela: nenhuma outra chamada de LLM ou de ferramenta, nenhum pedido de entrada humana e nenhum salvamento na memória (a menos que o salvamento já tivesse começado).
 
-- O resultado dele é descartado e não é salvo na memória, a menos que o salvamento já tivesse começado. Os tokens que ele usa continuam contando no uso do agente.
-- Uma chamada posterior no mesmo agente começa imediatamente e não é afetada por ele.
-- Cada chamada que expirou deixa seu próprio trabalho em segundo plano, então vários podem rodar ao mesmo tempo. `max_iter` limita cada um. Quando `max_rpm` está definido, ele também limita a taxa combinada de requisições deles; por padrão está desativado e, nesse caso, nada a limita.
-- **Execuções síncronas** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): a execução continua em uma thread em segundo plano pelas etapas restantes, incluindo chamadas de LLM e de ferramentas, com seus efeitos colaterais, até terminar. Ela não atrasa o fim de `asyncio.run`. Na saída do programa, o Python espera apenas as etapas em andamento (no modo de planejamento, várias etapas podem rodar ao mesmo tempo); as etapas restantes da execução não rodam, e um erro como "cannot schedule new futures after shutdown" pode ser exibido.
-- **Execuções assíncronas** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): a execução é cancelada. Apenas as etapas que já estão rodando em uma thread de trabalho (por exemplo, uma chamada síncrona de ferramenta ou de LLM) terminam, com seus efeitos colaterais, e nada roda depois delas. O fim de `asyncio.run` e a saída do programa esperam até essas etapas terminarem.
+- Um colega (coworker) para o qual o agente estava delegando para da mesma forma, depois da sua própria etapa em andamento.
+- No modo de planejamento, uma etapa é uma etapa inteira do plano, que pode fazer várias chamadas de LLM e de ferramentas, e várias etapas do plano podem estar em andamento ao mesmo tempo.
+- O resultado é descartado. Os tokens que a etapa usa continuam contando no uso do agente, então os totais de uso do agente, e o uso de uma chamada posterior lido deles, podem incluí-los.
+- Um pedido de entrada humana já exibido quando o tempo acabou permanece até ser respondido.
+- Uma chamada posterior no mesmo agente, ou em um colega para o qual ele estava delegando, começa imediatamente. O resultado dela não é afetado.
+- Cada chamada que expirou pode deixar uma etapa em andamento, então várias podem rodar ao mesmo tempo. Quando `max_rpm` está definido, ele limita a taxa combinada de requisições delas; por padrão está desativado e, nesse caso, nada a limita.
+- **Execuções síncronas** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): a etapa em andamento termina em uma thread em segundo plano. Ela não atrasa o fim de `asyncio.run`. Na saída do programa, o Python espera até ela terminar.
+- **Execuções assíncronas** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): a execução é cancelada. Uma etapa que já está rodando em uma thread de trabalho (por exemplo, uma chamada síncrona de ferramenta ou de LLM) termina. O fim de `asyncio.run` e a saída do programa esperam até ela terminar.
 
-Assim, uma ferramenta com efeitos colaterais ainda pode rodar depois do `TimeoutError`, possivelmente ao mesmo tempo que uma nova tentativa da mesma tarefa.
+Assim, uma ferramenta com efeitos colaterais ainda pode estar terminando depois do `TimeoutError`, possivelmente ao mesmo tempo que uma nova tentativa da mesma tarefa.
 </Note>
 
 #### Execução de Código

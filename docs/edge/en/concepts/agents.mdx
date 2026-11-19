@@ -292,15 +292,18 @@ multimodal_agent = Agent(
 - `max_retry_limit`: Retries on error
 
 <Note>
-**When `max_execution_time` runs out**, the call raises `TimeoutError` at the limit, without waiting for the work in progress. Python cannot stop a running thread, so that work is not stopped:
+**When `max_execution_time` runs out**, the call raises `TimeoutError` at the limit, without waiting for the work in progress. Python cannot stop a running thread, so the step in progress when the time ran out still finishes: an LLM call, or a tool call with its side effects. Nothing runs after it: no further LLM or tool call, no human-input prompt, and no memory save (unless the save had already begun).
 
-- Its result is discarded and not saved to memory, unless the save had already begun. The tokens it uses still count toward the agent's usage.
-- A later call on the same agent starts at once and is not affected by it.
-- Each timed-out call leaves its own background work, so several can run at the same time. `max_iter` bounds each one. When `max_rpm` is set, it also caps their combined request rate; it is off by default, and then nothing caps it.
-- **Synchronous runs** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): the run continues in a background thread through its remaining steps, LLM and tool calls included, with their side effects, until it finishes. It does not delay the end of `asyncio.run`. At program exit, Python waits only for the steps in progress (in planning mode, several steps can run at once); the run's remaining steps do not run, and an error such as "cannot schedule new futures after shutdown" may be printed.
-- **Asynchronous runs** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): the run is cancelled. Only steps already running in a worker thread (for example a synchronous tool or LLM call) finish, with their side effects, and nothing runs after them. The end of `asyncio.run` and program exit wait until those steps end.
+- A coworker the agent was delegating to stops the same way, after its own step in progress.
+- In planning mode, a step is a whole plan step, which can make several LLM and tool calls, and several plan steps can be in progress at once.
+- The result is discarded. The tokens the step uses still count toward the agent's usage, so the agent's usage totals, and a later call's usage read from them, can include them.
+- A human-input prompt already showing when the time ran out stays until it is answered.
+- A later call on the same agent, or on a coworker it was delegating to, starts at once. Its result is not affected.
+- Each timed-out call can leave a step in progress, so several can run at the same time. When `max_rpm` is set, it caps their combined request rate; it is off by default, and then nothing caps it.
+- **Synchronous runs** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): the step in progress finishes in a background thread. It does not delay the end of `asyncio.run`. At program exit, Python waits until it ends.
+- **Asynchronous runs** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): the run is cancelled. A step already running in a worker thread (for example a synchronous tool or LLM call) finishes. The end of `asyncio.run` and program exit wait until it ends.
 
-A tool with side effects can therefore still run after the `TimeoutError`, possibly at the same time as a retry of the same task.
+A tool with side effects can therefore still be finishing after the `TimeoutError`, possibly at the same time as a retry of the same task.
 </Note>
 
 #### Code Execution
