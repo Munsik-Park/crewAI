@@ -26,6 +26,11 @@ class RunAbandonedError(Exception):
     against the retry budget, and not reported.
     """
 
+    def __init__(
+        self, message: str = "The run was abandoned after its timeout."
+    ) -> None:
+        super().__init__(message)
+
 
 class TimedRunScope:
     """The executors one timed call's run is using, and whether it was abandoned.
@@ -65,7 +70,7 @@ class TimedRunScope:
         """
         with self._lock:
             if self.abandoned:
-                raise RunAbandonedError("The run was abandoned after its timeout.")
+                raise RunAbandonedError()
             self._executors.add(executor)
 
     def unregister(self, executor: Any) -> None:
@@ -81,7 +86,7 @@ class TimedRunScope:
         """
         with self._lock:
             if self.abandoned:
-                raise RunAbandonedError("The run was abandoned after its timeout.")
+                raise RunAbandonedError()
             yield
 
     def close(self) -> None:

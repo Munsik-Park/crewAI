@@ -8,6 +8,7 @@ import contextvars
 from datetime import datetime
 import inspect
 import json
+import logging
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
@@ -149,6 +150,8 @@ if TYPE_CHECKING:
     from crewai.agents.tools_handler import ToolsHandler
     from crewai.llms.base_llm import BaseLLM
     from crewai.tools.tool_types import ToolResult
+
+logger = logging.getLogger(__name__)
 
 _RouteT = TypeVar("_RouteT", bound=str)
 
@@ -3147,18 +3150,22 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         step in progress and makes no further LLM or tool call.
         """
         if self._run_abandoned():
-            raise RunAbandonedError("The run was abandoned after its timeout.")
+            raise RunAbandonedError()
         try:
             return await super()._execute_method(method_name, method, *args, **kwargs)
         except RunAbandonedError:
             raise
         except Exception as e:
             # Nobody receives the errors of a step that ends after its run was
-            # abandoned, such as scheduling failing at interpreter exit.
+            # abandoned, such as scheduling failing at interpreter exit; they
+            # are kept at debug level only.
             if self._run_abandoned():
-                raise RunAbandonedError(
-                    "The run was abandoned after its timeout."
-                ) from e
+                logger.debug(
+                    "Step %s of an abandoned run ended with an error",
+                    method_name,
+                    exc_info=True,
+                )
+                raise RunAbandonedError() from e
             raise
 
     def invoke(
