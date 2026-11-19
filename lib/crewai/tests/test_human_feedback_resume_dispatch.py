@@ -976,7 +976,13 @@ THREE_LEVEL_GROUPS = {
 def test_resume_keeps_carried_labels_innermost_first_across_repauses(
     entry: str, audit2_on: str, resume_mode: str, db_path: str
 ) -> None:
-    """V-7b: a re-pause keeps the labels it already carries, innermost first."""
+    """V-7b: a re-pause keeps the labels it already carries, innermost first.
+
+    When audit2 listens to "ok2", it pauses while "ok2" is being delivered.
+    That delivery is cut: after_audit, which "ok2" satisfies alone, is a
+    sibling of the paused review and is left unrun (as in V-12), so it is
+    checked against that rule rather than against the in-run log.
+    """
     make = make_three_levels(entry, audit2_on)
     answers = {"draft": ["approved"], "audit": ["ok2"], "audit2": ["ok3"]}
 
@@ -985,8 +991,15 @@ def test_resume_keeps_carried_labels_innermost_first_across_repauses(
         make, answers, {"audit", "audit2"}, resume_mode, db_path
     )
 
+    paused = flatten(segments)
+    compared_in_run = in_run
+    if audit2_on == "ok2":
+        assert "after_audit" in names(in_run)
+        assert "after_audit" not in names(paused)
+        compared_in_run = [record for record in in_run if record[0] != "after_audit"]
+
     assert "publish" in names(in_run)
-    assert_parity(in_run, flatten(segments), groups=THREE_LEVEL_GROUPS)
+    assert_parity(compared_in_run, paused, groups=THREE_LEVEL_GROUPS)
     assert paused_on == ["audit", "audit2"]
 
 
