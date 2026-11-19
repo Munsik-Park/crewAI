@@ -27,12 +27,21 @@ class BaseAgentExecutor(BaseModel):
     max_iter: int = Field(default=25)
     messages: list[LLMMessage] = Field(default_factory=list)
     _resuming: bool = PrivateAttr(default=False)
+    _abandoned: bool = PrivateAttr(default=False)
+
+    def abandon(self) -> None:
+        """Mark this executor's run as abandoned by its caller.
+
+        The run may still be in progress (a timed-out run keeps going in the
+        background); its result is discarded, so it is not saved to memory.
+        """
+        self._abandoned = True
 
     def _save_to_memory(self, output: AgentFinish) -> None:
         """Save task result to unified memory (memory or crew._memory)."""
         from crewai.hooks.dispatch import HookAborted
 
-        if self.agent is None:
+        if self.agent is None or self._abandoned:
             return
         memory = getattr(self.agent, "memory", None) or (
             getattr(self.crew, "_memory", None) if self.crew else None

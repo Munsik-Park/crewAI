@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import threading
 import time
 from functools import partial
 from hashlib import md5
@@ -1753,8 +1754,16 @@ def test_task_with_max_execution_time_exceeded():
         agent=researcher,
     )
 
-    with pytest.raises(TimeoutError):
-        task.execute_sync(agent=researcher)
+    before = set(threading.enumerate())
+    try:
+        with pytest.raises(TimeoutError):
+            task.execute_sync(agent=researcher)
+    finally:
+        # The timed-out run keeps going in the background; let it end here,
+        # inside this test's cassette, instead of during a later test.
+        for thread in threading.enumerate():
+            if thread not in before and thread.name.startswith("CrewAITimedRun"):
+                thread.join(30)
 
 
 @pytest.mark.vcr()

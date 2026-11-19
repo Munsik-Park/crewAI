@@ -68,7 +68,9 @@ from crewai.agents.agent_builder.base_agent import (
 )
 from crewai.agents.agent_executor import AgentExecutor
 from crewai.agents.cache.cache_handler import CacheHandler
+from crewai.agents.tools_handler import ToolsHandler
 from crewai.events.event_bus import crewai_event_bus
+from crewai.events.event_context import _event_id_stack
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
     AgentExecutionErrorEvent,
@@ -163,6 +165,10 @@ _passthrough_exceptions: tuple[type[Exception], ...] = (
     ToolExecutionFailedError,
     HookAborted,
 )
+
+# Names the worker threads of runs under max_execution_time, which can
+# outlive the call that timed out.
+_TIMED_RUN_THREAD_PREFIX = "CrewAITimedRun"
 
 _EXECUTOR_CLASS_MAP: dict[str, type] = {
     "AgentExecutor": AgentExecutor,
@@ -1102,49 +1108,76 @@ class Agent(BaseAgent):
             TimeoutError: If execution exceeds the timeout.
             RuntimeError: If execution fails for other reasons.
         """
+        executor = self.agent_executor
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
+        # Owned explicitly rather than via `with`: leaving a `with` block joins
+        # the worker, which would hold the TimeoutError until the run ends.
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=_TIMED_RUN_THREAD_PREFIX
+        )
+        try:
+            future = pool.submit(
                 ctx.run,
                 self._execute_without_timeout,
                 task_prompt=task_prompt,
                 task=task,
+                executor=executor,
             )
 
             try:
                 return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError as e:
-                future.cancel()
+                self._detach_timed_out_run(executor)
                 raise TimeoutError(
                     f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
                 ) from e
             except _passthrough_exceptions:
                 # Wrapping a deliberate stop in RuntimeError would hide it from
                 # _check_execution_error and trigger the retry loop instead.
-                future.cancel()
                 raise
             except Exception as e:
-                future.cancel()
                 raise RuntimeError(f"Task execution failed: {e!s}") from e
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    def _detach_timed_out_run(self, executor: AgentExecutor | None) -> None:
+        """Leave a timed-out run its own executor and tools handler.
+
+        The run cannot be stopped and keeps using both, so the next call on
+        this agent gets fresh ones instead; the tool cache stays shared.
+        """
+        if executor is not None:
+            executor.abandon()
+            if self.agent_executor is executor:
+                self.agent_executor = None
+        self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
+
+    def _execute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            executor: The executor to run; defaults to the agent's current one.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        if executor is None:
+            executor = self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        invoke_result = self.agent_executor.invoke(
+        invoke_result = executor.invoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1257,35 +1290,50 @@ class Agent(BaseAgent):
             TimeoutError: If execution exceeds the timeout.
             RuntimeError: If execution fails for other reasons.
         """
+        executor = self.agent_executor
+        # A cancelled run never emits the events that close the scopes it
+        # opened; on Python 3.12+ wait_for runs it in this task's context.
+        event_scope_token = _event_id_stack.set(_event_id_stack.get())
         try:
             return await asyncio.wait_for(
-                self._aexecute_without_timeout(task_prompt, task),
+                self._aexecute_without_timeout(task_prompt, task, executor=executor),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as e:
+            self._detach_timed_out_run(executor)
             raise TimeoutError(
                 f"Task '{task.description}' execution timed out after {timeout} seconds. "
                 "Consider increasing max_execution_time or optimizing the task."
             ) from e
+        finally:
+            _event_id_stack.reset(event_scope_token)
 
-    async def _aexecute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    async def _aexecute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout asynchronously.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            executor: The executor to run; defaults to the agent's current one.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        if executor is None:
+            executor = self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        result = await self.agent_executor.ainvoke(
+        result = await executor.ainvoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
