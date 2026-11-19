@@ -4,9 +4,9 @@ The run left behind by ``max_execution_time`` finishes only the call in flight
 at the limit. Some steps make more than one call: a failed tool is tried
 again, an empty LLM answer is asked for again, a free-form final answer is
 asked for once more in the response model, a request is preceded by context
-summarization, and native tool calls run one after another or queue for a
-worker. When the call in flight ends after the limit, none of the calls that
-would follow it may start.
+summarization, native tool calls run one after another or queue for a
+worker, and a plan that is not ready is refined. When the call in flight ends
+after the limit, none of the calls that would follow it may start.
 """
 
 from __future__ import annotations
@@ -20,12 +20,15 @@ from typing import Any
 from pydantic import BaseModel
 import pytest
 
+from crewai.agent.planning_config import PlanningConfig
 from crewai.tools import BaseTool, tool
 from tests.agents.test_agent_execution_timeout import (
     JOIN_BOUND,
     ORPHAN_BLOCK,
+    UNKNOWN_ERROR_PRINT,
     _action,
     _agent,
+    _crewai_error_records,
     _final,
     _join_timed_runs,
     _ScriptedLLM,
@@ -35,6 +38,13 @@ from tests.agents.test_agent_execution_timeout import (
 
 
 TOOL_FAILURE = "tool failed after the limit"
+QUIET_END_NOISE = (
+    UNKNOWN_ERROR_PRINT,
+    "Error during planning",
+    "Error in tool execution",
+    "RunAbandonedError",
+    "Traceback",
+)
 
 
 def _time_out(agent: Any, task: Any, release: threading.Event) -> None:
@@ -330,3 +340,35 @@ def test_timed_out_run_does_not_start_its_queued_native_tool_calls() -> None:
     assert sorted(started) == sorted(in_flight), (
         f"calls started after the limit: {sorted(set(started) - set(in_flight))}"
     )
+
+
+def test_timed_out_run_does_not_refine_a_plan_made_after_the_limit(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A plan that comes back not ready after the limit is not refined, and the run ends without reporting an error."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    def script(text: str) -> str:
+        calls.append(text)
+        if len(calls) == 1:
+            release.wait(ORPHAN_BLOCK)
+            return "Plan: look it up first. I still need more detail."
+        return "Plan: answer.\nREADY: I am ready to execute the task."
+
+    agent = _agent(
+        _ScriptedLLM(script),
+        planning_config=PlanningConfig(max_attempts=3),
+        verbose=True,
+    )
+
+    _time_out(agent, _task(agent, "TASK_ONE"), release)
+
+    assert len(calls) == 1, (
+        f"the LLM was called {len(calls)} times; only the call in flight at the "
+        "limit may run"
+    )
+    output = capsys.readouterr()
+    printed = output.out + output.err
+    assert [text for text in QUIET_END_NOISE if text in printed] == []
+    assert _crewai_error_records(caplog) == []
