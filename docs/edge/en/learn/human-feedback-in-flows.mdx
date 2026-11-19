@@ -521,6 +521,12 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+On resume, the reviewed method's completion and its outcome reach what listens to them as they would have if the review had been answered during the run. The reviewed method's own listeners and routers run, then the listeners of its outcome label, including `and_` joins on the label and, when the reviewed method is a listener, conditional starts gated on it. An `and_` join that includes the reviewed method also counts members that completed before the pause. An `or_` listener that includes the reviewed method or its label and already fired before the pause does not fire again.
+
+One join can run earlier and receive a different argument. When the reviewed method is a listener, it runs while the method that triggered it is still routing. An `and_` join that waits on both the reviewed method and a method whose routing was still under way at the pause (the method the reviewed method listens to, or one further up a chain of routers that led to it) runs on resume together with the reviewed method's own listeners, before the outcome's routers and listeners, and receives the outcome string. In a run without a pause, the same join receives that method's output and runs after the outcome's routers.
+
+Other work that the pause cut off while it was in progress is not continued on resume: methods still running alongside the review when it paused, and the delivery of other methods' results or router outcomes that was still under way.
+
 ### Key Types
 
 | Type | Description |
@@ -547,7 +553,12 @@ class PendingFeedbackContext:
     metadata: dict         # Custom metadata
     llm: str | None        # LLM for outcome collapsing
     requested_at: datetime
+    execution_uuid: str | None  # Kickoff run id, kept so traces stay on the same run
+    trace_context: tuple[int, int] | None  # Trace and span ids linking the resumed segment
+    resume_progress: object | None  # Internal resume progress; serialized by to_dict(), not public API
 ```
+
+A custom persistence backend that stores selected context fields instead of `to_dict()` or the context object must keep all of them; a resume without `resume_progress` cannot run joins or skip `or_` listeners that depended on work done before the pause.
 
 ### Complete Async Flow Example
 

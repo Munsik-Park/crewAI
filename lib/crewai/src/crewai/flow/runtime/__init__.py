@@ -85,9 +85,13 @@ from crewai.execution import (
     get_execution_uuid,
 )
 from crewai.flow.async_feedback.types import (
+    ENTRY_PATH_LISTENER,
+    ENTRY_PATH_START,
+    CarriedLabelDelivery,
     HumanFeedbackPending,
     HumanFeedbackProvider,
     PendingFeedbackContext,
+    ResumeProgress,
 )
 from crewai.flow.dsl._utils import build_flow_definition
 from crewai.flow.flow_context import (
@@ -786,6 +790,19 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
     _definition: FlowDefinition = PrivateAttr()
     _or_listeners_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _completed_methods: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    # Completed methods whose delivery has not yet offered their name to router
+    # conditions, and to the conditions of other listeners. A method leaves
+    # each set at the matching step of its delivery.
+    _unoffered_to_routers: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    _unoffered_to_listeners: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    # Races of or_() members under way, as (or_ listener, members), and the
+    # members whose or_ listener has already fired for another member of their
+    # race: the race has gone to that member, so a pause does not count them
+    # as completions still to be delivered.
+    _open_races: list[tuple[FlowMethodName, frozenset[FlowMethodName]]] = PrivateAttr(
+        default_factory=list
+    )
+    _lost_racers: set[FlowMethodName] = PrivateAttr(default_factory=set)
     _method_call_counts: dict[FlowMethodName, int] = PrivateAttr(default_factory=dict)
     # True on flows CrewAI runs for its own bookkeeping - the agent executor and
     # the memory encoding/recall flows. Declared rather than inferred from the
@@ -1132,6 +1149,201 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 if rearmable is not None:
                     rearmable.discard(listener_name)
 
+    def _snapshot_resume_progress(self) -> ResumeProgress:
+        """Copy the execution progress that a resume needs to continue.
+
+        Methods that completed but were not yet offered to waiting conditions
+        are recorded in the joins that include them, as their delivery would
+        have done.
+        """
+        with self._or_listeners_lock:
+            fired = sorted(str(name) for name in self._fired_or_listeners)
+        progress = ResumeProgress(
+            completed_methods=sorted(str(name) for name in self._completed_methods),
+            pending_events={
+                str(key): sorted(events) for key, events in self._pending_events.items()
+            },
+            fired_or_listeners=fired,
+        )
+        for routers, unoffered in (
+            (True, self._unoffered_to_routers),
+            (False, self._unoffered_to_listeners),
+        ):
+            targets = [
+                (str(name), condition)
+                for name, definition, condition in self._listener_methods()
+                if definition.router == routers
+            ]
+            for method_name in sorted(unoffered - self._lost_racers):
+                self._record_unsatisfied(progress, str(method_name), targets)
+        return progress
+
+    def _mark_completion_unoffered(self, method_name: FlowMethodName) -> None:
+        self._unoffered_to_routers.add(method_name)
+        self._unoffered_to_listeners.add(method_name)
+
+    def _drop_unoffered(self, method_name: FlowMethodName) -> None:
+        """Forget a completion whose delivery is cancelled before reaching all
+        conditions; it will not be offered to them in this run either."""
+        self._unoffered_to_routers.discard(method_name)
+        self._unoffered_to_listeners.discard(method_name)
+
+    def _mark_race_lost(
+        self, or_listener: FlowMethodName, winner: FlowMethodName
+    ) -> None:
+        for listener, members in self._open_races:
+            if listener == or_listener and winner in members:
+                self._lost_racers.update(members - {winner})
+
+    def _pause_progress(self, pending: HumanFeedbackPending) -> ResumeProgress:
+        progress = pending.context.resume_progress
+        if progress is None:
+            progress = self._snapshot_resume_progress()
+            pending.context.resume_progress = progress
+        return progress
+
+    def _restore_resume_progress(self, progress: ResumeProgress) -> None:
+        """Restore progress saved at a pause, ignoring names the flow lacks.
+
+        The saved join progress already counts every completion that had not
+        been offered at the pause, so none is left unoffered.
+        """
+        methods = self._definition.methods
+        self._unoffered_to_routers = set()
+        self._unoffered_to_listeners = set()
+        listen_keys = {
+            str(name) for name, definition in methods.items() if definition.listen
+        }
+        start_keys = {
+            f"start:{name}"
+            for name in methods
+            if self._start_condition(FlowMethodName(name)) is not None
+        }
+        self._completed_methods = {
+            FlowMethodName(name)
+            for name in progress.completed_methods
+            if name in methods
+        }
+        self._pending_events = {
+            PendingListenerKey(key): set(events)
+            for key, events in progress.pending_events.items()
+            if key in listen_keys or key in start_keys
+        }
+        with self._or_listeners_lock:
+            self._fired_or_listeners = {
+                FlowMethodName(name)
+                for name in progress.fired_or_listeners
+                if name in listen_keys
+            }
+        events: set[str] = set()
+        for name, definition in methods.items():
+            if definition.listen is not None:
+                events.update(_iter_condition_events(definition.listen))
+            start_condition = self._start_condition(FlowMethodName(name))
+            if start_condition is not None:
+                events.update(_iter_condition_events(start_condition))
+        progress.carried_labels = [
+            carried
+            for carried in progress.carried_labels
+            if carried.method_name in methods
+            and methods[carried.method_name].router
+            and carried.label in events
+        ]
+
+    def _infer_entry_path(self, method_name: str) -> str:
+        definition = self._definition.methods.get(method_name)
+        if definition is not None and definition.is_start:
+            return ENTRY_PATH_START
+        return ENTRY_PATH_LISTENER
+
+    def _mark_pause_entry_path(
+        self, pending: HumanFeedbackPending, entry_path: str
+    ) -> None:
+        progress = self._pause_progress(pending)
+        if progress.entry_path is None:
+            progress.entry_path = entry_path
+
+    def _carry_cut_label(
+        self,
+        pending: HumanFeedbackPending,
+        router_name: FlowMethodName,
+        router_result: Any,
+        entry_path: str,
+    ) -> None:
+        """Record a router's label delivery that the pause cut off."""
+        value = (
+            router_result.value
+            if isinstance(router_result, enum.Enum)
+            else router_result
+        )
+        self._pause_progress(pending).carried_labels.append(
+            CarriedLabelDelivery(
+                method_name=str(router_name), label=str(value), entry_path=entry_path
+            )
+        )
+
+    def _seed_cut_delivery(
+        self,
+        pending: HumanFeedbackPending,
+        trigger: FlowMethodName,
+        *,
+        listeners: bool,
+        starts: bool,
+        skip_starts: set[FlowMethodName] | None = None,
+    ) -> None:
+        """Record a delivery the pause cut in the joins still waiting on it.
+
+        Only conditions the trigger cannot satisfy on its own are recorded;
+        those it would satisfy alone stay unrun, as they were at the pause.
+        """
+        progress = self._pause_progress(pending)
+        trigger_name = str(trigger)
+        targets: list[tuple[str, FlowDefinitionCondition]] = []
+        if listeners:
+            targets.extend(
+                (str(name), condition)
+                for name, definition, condition in self._listener_methods()
+                if not definition.router
+            )
+        if starts:
+            for name in self._start_method_names():
+                condition = self._start_condition(name)
+                if condition is not None and name not in (skip_starts or set()):
+                    targets.append((f"start:{name}", condition))
+        self._record_unsatisfied(progress, trigger_name, targets)
+
+    @staticmethod
+    def _record_unsatisfied(
+        progress: ResumeProgress,
+        trigger_name: str,
+        targets: list[tuple[str, FlowDefinitionCondition]],
+    ) -> None:
+        """Add ``trigger_name`` to each target condition it does not satisfy."""
+        for key, condition in targets:
+            if trigger_name not in set(_iter_condition_events(condition)):
+                continue
+            seen = set(progress.pending_events.get(key, ()))
+            seen.add(trigger_name)
+            if _condition_satisfied(condition, seen):
+                continue
+            progress.pending_events[key] = sorted(seen)
+
+    async def _deliver_label(self, label: str, entry_path: str) -> None:
+        """Deliver a router label the way the run that produced it would have.
+
+        On the start path the label goes out on its own. On the listener path
+        it is a router result of the parent's dispatch, so routers on it run
+        first, fired ``or_`` listeners re-arm and gated starts are checked.
+        """
+        payload = (
+            self.last_human_feedback if self.last_human_feedback is not None else label
+        )
+        await self._execute_listeners(
+            FlowMethodName(label),
+            payload,
+            as_router_result=entry_path == ENTRY_PATH_LISTENER,
+        )
+
     def _build_racing_groups(self) -> dict[frozenset[FlowMethodName], FlowMethodName]:
         # Events of a multi-event or_() listener race: only the first to fire
         # should trigger it. We map {frozenset(racing events): listener}.
@@ -1241,17 +1453,25 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         ]
 
         if racing_tasks:
-            for coro in asyncio.as_completed(racing_tasks):
-                try:
-                    await coro
-                except Exception as e:
-                    logger.debug(f"Racing listener failed: {e}")
-                    continue
-                break
+            group = self._get_racing_group_for_listeners(list(racing_listeners))
+            race = (group[1] if group else FlowMethodName(""), racing_listeners)
+            self._open_races.append(race)
+            try:
+                for coro in asyncio.as_completed(racing_tasks):
+                    try:
+                        await coro
+                    except Exception as e:
+                        logger.debug(f"Racing listener failed: {e}")
+                        continue
+                    break
 
-            for task in racing_tasks:
-                if not task.done():
-                    task.cancel()
+                for name, task in zip(racing_listeners, racing_tasks, strict=True):
+                    if not task.done():
+                        task.cancel()
+                        self._drop_unoffered(name)
+            finally:
+                self._open_races.remove(race)
+                self._lost_racers -= racing_listeners
 
         if other_tasks:
             await asyncio.gather(*other_tasks, return_exceptions=True)
@@ -1318,6 +1538,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         )
         instance._initialize_state(state_data)
         instance._pending_feedback_context = pending_context
+        if pending_context.resume_progress is not None:
+            instance._restore_resume_progress(pending_context.resume_progress)
         instance._is_execution_resuming = True
         # Seed the match id so the resume-phase listener filters its own
         # LLM events (which run with `current_flow_id == instance.flow_id`)
@@ -1475,6 +1697,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             raise ValueError(
                 "No pending feedback context. Use from_pending() to restore a paused flow."
             )
+        # Continue from the progress saved with this context, also on the
+        # instance that paused again during a previous resume.
+        if context.resume_progress is not None:
+            self._restore_resume_progress(context.resume_progress)
         emit = context.emit
 
         if not self.suppress_flow_events:
@@ -1540,6 +1766,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     raise
 
             self._completed_methods.add(FlowMethodName(context.method_name))
+            self._mark_completion_unoffered(FlowMethodName(context.method_name))
 
             await asyncio.to_thread(
                 self._persist_method_completion, FlowMethodName(context.method_name)
@@ -1586,20 +1813,52 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
+        # Carried labels are the outcomes of routers enclosing this review whose
+        # delivery the pause cut off, innermost first.
+        progress = context.resume_progress
+        entry_path = (
+            progress.entry_path if progress is not None else None
+        ) or self._infer_entry_path(context.method_name)
+        carried_labels = list(progress.carried_labels) if progress is not None else []
+        routed = bool(emit and collapsed_outcome)
+        dispatch_step = "own"
+        carried_started = 0
         try:
-            if emit and collapsed_outcome:
+            if routed:
                 await self._execute_listeners(
-                    FlowMethodName(collapsed_outcome),
-                    result,
+                    FlowMethodName(context.method_name), collapsed_outcome
                 )
+                dispatch_step = "label"
+                await self._deliver_label(str(collapsed_outcome), entry_path)
             else:
                 await self._execute_listeners(
                     FlowMethodName(context.method_name),
                     result,
                 )
+            dispatch_step = "carried"
+            for carried in carried_labels:
+                carried_started += 1
+                await self._deliver_label(
+                    carried.label,
+                    carried.entry_path or self._infer_entry_path(carried.method_name),
+                )
         except Exception as e:
             # Check if flow was paused again for human feedback (loop case)
             if isinstance(e, HumanFeedbackPending):
+                repause_progress = self._pause_progress(e)
+                if dispatch_step == "own" and routed:
+                    repause_progress.carried_labels.append(
+                        CarriedLabelDelivery(
+                            method_name=context.method_name,
+                            label=str(collapsed_outcome),
+                            entry_path=entry_path,
+                        )
+                    )
+                repause_progress.carried_labels.extend(
+                    carried_labels[carried_started:]
+                    if dispatch_step == "carried"
+                    else carried_labels
+                )
                 self._pending_feedback_context = e.context
 
                 if self.persistence is None:
@@ -2333,6 +2592,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 self._completed_methods.clear()
                 self._method_outputs.clear()
                 self._pending_events.clear()
+                self._unoffered_to_routers.clear()
+                self._unoffered_to_listeners.clear()
                 self._clear_or_listeners()
                 self._method_call_counts.clear()
             else:
@@ -2862,14 +3123,24 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         method = self._methods[start_method_name]
         enhanced_method = self._inject_trigger_payload_for_start_method(method)
 
-        result, finished_event_id = await self._execute_method(
-            start_method_name, enhanced_method
-        )
+        try:
+            result, finished_event_id = await self._execute_method(
+                start_method_name, enhanced_method
+            )
+        except HumanFeedbackPending as e:
+            self._mark_pause_entry_path(e, ENTRY_PATH_START)
+            raise
 
         # If start method is a router, use its result as an additional trigger
         if self._is_router(start_method_name) and result is not None:
             # Execute listeners for the start method name first
-            await self._execute_listeners(start_method_name, result, finished_event_id)
+            try:
+                await self._execute_listeners(
+                    start_method_name, result, finished_event_id
+                )
+            except HumanFeedbackPending as e:
+                self._carry_cut_label(e, start_method_name, result, ENTRY_PATH_START)
+                raise
             # Then execute listeners for the router result (e.g., "approved")
             router_result = result.value if isinstance(result, enum.Enum) else result
             router_result_trigger = FlowMethodName(str(router_result))
@@ -3047,6 +3318,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             )
 
             self._completed_methods.add(method_name)
+            self._mark_completion_unoffered(method_name)
 
             await asyncio.to_thread(self._persist_method_completion, method_name)
 
@@ -3069,6 +3341,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             # Check if this is a HumanFeedbackPending exception (paused, not failed)
             if isinstance(e, HumanFeedbackPending):
                 e.context.method_name = method_name
+                e.context.resume_progress = self._snapshot_resume_progress()
 
                 if self.persistence is None:
                     from crewai.flow.persistence.factory import default_flow_persistence
@@ -3170,6 +3443,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         trigger_method: FlowMethodName,
         result: Any,
         triggering_event_id: str | None = None,
+        *,
+        as_router_result: bool = False,
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
@@ -3182,6 +3457,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             result: The result from the triggering method, passed to listeners that accept parameters.
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
+            as_router_result: Treat ``trigger_method`` as a router result of an
+                enclosing dispatch whose own trigger was already delivered, with
+                ``result`` as its payload.
 
         Note:
             - Routers are executed sequentially to maintain flow control
@@ -3201,60 +3479,90 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         # Methods already run per trigger, so a conditional start that also
         # listens to the same event is not run a second time below.
         ran_for_trigger: dict[str, set[FlowMethodName]] = {}
-
-        while True:
-            routers_triggered = self._find_triggered_methods(
-                current_trigger, router_only=True
-            )
-            if not routers_triggered:
-                break
-            ran_for_trigger.setdefault(str(current_trigger), set()).update(
-                routers_triggered
-            )
-
-            for router_name in routers_triggered:
-                # For routers triggered by a router outcome, pass the HumanFeedbackResult
-                router_input = router_result_to_feedback.get(
-                    str(current_trigger), current_result
-                )
-                (
-                    router_result,
-                    current_triggering_event_id,
-                ) = await self._execute_single_listener(
-                    router_name, router_input, current_triggering_event_id
-                )
-                if router_result is None:
-                    current_trigger = FlowMethodName("")
-                    continue
-
-                router_result = (
-                    router_result.value
-                    if isinstance(router_result, enum.Enum)
-                    else router_result
-                )
-                router_result_str = str(router_result)
-                router_result_event = FlowMethodName(router_result_str)
-                router_results.append(router_result_event)
-                router_result_payloads[router_result_str] = (
+        if as_router_result:
+            router_results.append(trigger_method)
+            router_result_payloads[str(trigger_method)] = result
+            if self.last_human_feedback is not None:
+                router_result_to_feedback[str(trigger_method)] = (
                     self.last_human_feedback
-                    if self.last_human_feedback is not None
-                    else router_result
                 )
 
-                if self.last_human_feedback is not None:
-                    router_result_to_feedback[router_result_str] = (
-                        self.last_human_feedback
-                    )
-                current_trigger = router_result_event
+        try:
+            while True:
+                routers_triggered = self._find_triggered_methods(
+                    current_trigger, router_only=True
+                )
+                if not routers_triggered:
+                    break
+                ran_for_trigger.setdefault(str(current_trigger), set()).update(
+                    routers_triggered
+                )
 
-        all_triggers = [trigger_method, *router_results]
+                for router_name in routers_triggered:
+                    # For routers triggered by a router outcome, pass the HumanFeedbackResult
+                    router_input = router_result_to_feedback.get(
+                        str(current_trigger), current_result
+                    )
+                    (
+                        router_result,
+                        current_triggering_event_id,
+                    ) = await self._execute_single_listener(
+                        router_name, router_input, current_triggering_event_id
+                    )
+                    if router_result is None:
+                        current_trigger = FlowMethodName("")
+                        continue
+
+                    router_result = (
+                        router_result.value
+                        if isinstance(router_result, enum.Enum)
+                        else router_result
+                    )
+                    router_result_str = str(router_result)
+                    router_result_event = FlowMethodName(router_result_str)
+                    router_results.append(router_result_event)
+                    router_result_payloads[router_result_str] = (
+                        self.last_human_feedback
+                        if self.last_human_feedback is not None
+                        else router_result
+                    )
+
+                    if self.last_human_feedback is not None:
+                        router_result_to_feedback[router_result_str] = (
+                            self.last_human_feedback
+                        )
+                    current_trigger = router_result_event
+        except HumanFeedbackPending as e:
+            # A pause in the router loop cuts the delivery of every trigger
+            # collected so far, before its listeners and gated starts.
+            cut = (
+                router_results
+                if as_router_result
+                else [trigger_method, *router_results]
+            )
+            for cut_trigger in cut:
+                self._seed_cut_delivery(
+                    e,
+                    cut_trigger,
+                    listeners=True,
+                    starts=cut_trigger in router_results,
+                    skip_starts=ran_for_trigger.get(str(cut_trigger)),
+                )
+            raise
+
+        all_triggers = (
+            router_results if as_router_result else [trigger_method, *router_results]
+        )
 
         with self._or_listeners_lock:
             rearmable: set[FlowMethodName] = set(self._fired_or_listeners)
 
         for idx, current_trigger in enumerate(all_triggers):
-            if current_trigger:
-                if idx > 0 and rearmable:
+            if not current_trigger:
+                continue
+            starts_checked = False
+            try:
+                if (as_router_result or idx > 0) and rearmable:
                     self._rearm_or_listeners_for_trigger(current_trigger, rearmable)
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
@@ -3294,6 +3602,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         await asyncio.gather(*tasks)
 
                 if current_trigger in router_results:
+                    starts_checked = True
                     for method_name in self._start_method_names():
                         if self._start_condition_triggered_by(
                             method_name, current_trigger
@@ -3308,6 +3617,27 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                                 self._is_execution_resuming = was_resuming
                             else:
                                 await self._execute_start_method(method_name)
+            except HumanFeedbackPending as e:
+                # The pause cuts this trigger's gated-start check (unless it was
+                # already under way) and every later trigger's delivery.
+                if current_trigger in router_results and not starts_checked:
+                    self._seed_cut_delivery(
+                        e,
+                        current_trigger,
+                        listeners=False,
+                        starts=True,
+                        skip_starts=ran_for_trigger.get(str(current_trigger)),
+                    )
+                for later_trigger in all_triggers[idx + 1 :]:
+                    if later_trigger:
+                        self._seed_cut_delivery(
+                            e,
+                            later_trigger,
+                            listeners=True,
+                            starts=later_trigger in router_results,
+                            skip_starts=ran_for_trigger.get(str(later_trigger)),
+                        )
+                raise
 
     def _condition_met(
         self,
@@ -3326,6 +3656,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self, trigger_method: FlowMethodName, router_only: bool
     ) -> list[FlowMethodName]:
         triggered: list[FlowMethodName] = []
+        unoffered = (
+            self._unoffered_to_routers if router_only else self._unoffered_to_listeners
+        )
+        unoffered.discard(trigger_method)
 
         for listener_name, method_definition, condition in self._listener_methods():
             is_router = method_definition.router
@@ -3342,6 +3676,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 triggered.append(listener_name)
                 if should_check_fired:
                     self._fired_or_listeners.add(listener_name)
+                    self._mark_race_lost(listener_name, trigger_method)
 
         return triggered
 
@@ -3416,30 +3751,36 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
             sig = inspect.signature(method)
             method_params = [p for p in sig.parameters.values() if p.name != "self"]
+            method_args = (result,) if method_params else ()
 
-            if triggering_event_id:
-                with triggered_by_scope(triggering_event_id):
-                    if method_params:
-                        listener_result, finished_event_id = await self._execute_method(
-                            listener_name, method, result
+            try:
+                if triggering_event_id:
+                    with triggered_by_scope(triggering_event_id):
+                        (
+                            listener_result,
+                            finished_event_id,
+                        ) = await self._execute_method(
+                            listener_name, method, *method_args
                         )
-                    else:
-                        listener_result, finished_event_id = await self._execute_method(
-                            listener_name, method
-                        )
-            else:
-                if method_params:
-                    listener_result, finished_event_id = await self._execute_method(
-                        listener_name, method, result
-                    )
                 else:
                     listener_result, finished_event_id = await self._execute_method(
-                        listener_name, method
+                        listener_name, method, *method_args
                     )
+            except HumanFeedbackPending as e:
+                self._mark_pause_entry_path(e, ENTRY_PATH_LISTENER)
+                raise
 
-            await self._execute_listeners(
-                listener_name, listener_result, finished_event_id
-            )
+            try:
+                await self._execute_listeners(
+                    listener_name, listener_result, finished_event_id
+                )
+            except HumanFeedbackPending as e:
+                if self._is_router(listener_name) and listener_result is not None:
+                    # The parent dispatch never receives this router's result.
+                    self._carry_cut_label(
+                        e, listener_name, listener_result, ENTRY_PATH_LISTENER
+                    )
+                raise
 
             return (listener_result, finished_event_id)
 
