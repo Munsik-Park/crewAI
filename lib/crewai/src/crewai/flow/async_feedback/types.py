@@ -77,8 +77,9 @@ class CarriedLabelDelivery:
 class ResumeProgress:
     """Execution progress of a flow at the moment a review paused it.
 
-    Restored on resume so the flow continues as it would have if the review
-    had been answered during the run.
+    Restored on resume, so the resumed run starts with the methods that had
+    completed, the events multi-event conditions had already seen, and the
+    ``or_`` listeners that had fired.
 
     Attributes:
         completed_methods: Methods that had completed.
