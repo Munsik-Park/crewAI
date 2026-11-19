@@ -323,7 +323,7 @@ multimodal_agent = Agent(
 - 그 결과는 버려지며, 저장이 이미 시작된 경우가 아니면 메모리에 저장되지 않습니다. 사용한 토큰은 에이전트의 사용량에 계속 포함됩니다.
 - 같은 에이전트에 대한 이후 호출은 바로 시작되며 그 작업의 영향을 받지 않습니다.
 - 시간 초과된 호출마다 자체 백그라운드 작업이 남으므로 여러 개가 동시에 실행될 수 있습니다. 각각은 `max_iter`로 제한됩니다. `max_rpm`이 설정되어 있으면 이들의 합산 요청 속도도 제한하며, 기본값은 꺼져 있어 그때는 아무것도 제한하지 않습니다.
-- **동기 실행** (`execute_task`, `Task.execute_sync`, `Crew.kickoff`, `Crew.kickoff_async`): 실행은 백그라운드 스레드에서 남은 단계(LLM 및 도구 호출과 그 부수 효과 포함)를 끝날 때까지 계속합니다. `asyncio.run`의 종료를 지연시키지 않습니다. 프로그램 종료 시 Python은 진행 중인 단계만 기다리며(planning 모드에서는 여러 단계가 동시에 실행될 수 있음), 실행의 나머지 단계는 실행되지 않고 "cannot schedule new futures after shutdown" 같은 오류가 출력될 수 있습니다.
+- **동기 실행** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): 실행은 백그라운드 스레드에서 남은 단계(LLM 및 도구 호출과 그 부수 효과 포함)를 끝날 때까지 계속합니다. `asyncio.run`의 종료를 지연시키지 않습니다. 프로그램 종료 시 Python은 진행 중인 단계만 기다리며(planning 모드에서는 여러 단계가 동시에 실행될 수 있음), 실행의 나머지 단계는 실행되지 않고 "cannot schedule new futures after shutdown" 같은 오류가 출력될 수 있습니다.
 - **비동기 실행** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): 실행은 취소됩니다. 워커 스레드에서 이미 실행 중인 단계(예: 동기 도구 또는 LLM 호출)만 부수 효과와 함께 끝나며, 그 이후에는 아무것도 실행되지 않습니다. `asyncio.run`의 종료와 프로그램 종료는 그 단계들이 끝날 때까지 기다립니다.
 
 따라서 부수 효과가 있는 도구는 `TimeoutError` 이후에도 실행될 수 있으며, 같은 작업의 재시도와 동시에 실행될 수도 있습니다.
