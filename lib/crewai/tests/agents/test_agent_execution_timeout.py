@@ -779,3 +779,165 @@ def test_timed_out_run_stops_before_its_next_step_quietly(
     assert tool_runs == [], "the timed-out run ran its next step"
     assert _crewai_error_records(caplog) == []
     assert UNKNOWN_ERROR_PRINT not in capsys.readouterr().out
+
+
+class _CoworkerState:
+    """A coworker that has already run a task, and what that run left on it.
+
+    The earlier task used ``lookup`` twice and a failing tool once, so the
+    coworker holds tool failures, a last used tool and a usage count.
+    """
+
+    def __init__(self) -> None:
+        self.llm_calls: list[str] = []
+
+        @tool("lookup")
+        def lookup(query: str) -> str:
+            """Look a query up."""
+            return f"LOOKUP_RESULT for {query}"
+
+        @tool("broken")
+        def broken() -> str:
+            """Always fails."""
+            raise RuntimeError("broken tool")
+
+        self.lookup = lookup
+
+        def script(text: str) -> str:
+            if "SUB_ONE" in text:
+                self.llm_calls.append("SUB_ONE")
+                return _final("COWORKER_ORPHAN_ANSWER")
+            if "LOOKUP_RESULT for b" not in text:
+                if "LOOKUP_RESULT for a" not in text:
+                    return _action("lookup", '{"query": "a"}')
+                return _action("lookup", '{"query": "b"}')
+            if "broken tool" not in text:
+                return _action("broken")
+            return _final("COWORKER_PRE_ANSWER")
+
+        self.agent = _agent(
+            _ScriptedLLM(script),
+            tools=[lookup, broken],
+            role="Coworker",
+            max_execution_time=None,
+        )
+        self.pre_task = _task(self.agent, "PRE")
+
+    def record(self, pre_answer: Any) -> None:
+        """Keep what the earlier task left on the coworker."""
+        assert pre_answer == "COWORKER_PRE_ANSWER"
+        self.failures = self.agent.last_tool_failures
+        self.handler = self.agent.tools_handler
+        self.last_used_tool = self.handler.last_used_tool if self.handler else None
+        self.usage_count = self.lookup.current_usage_count
+        assert self.failures, "the coworker's earlier task recorded no tool failure"
+        assert self.last_used_tool is not None
+        assert self.usage_count > 0
+
+    def assert_unchanged(self) -> None:
+        handler = self.agent.tools_handler
+        reset = [
+            name
+            for name, unchanged in (
+                ("tool failures", self.agent.last_tool_failures == self.failures),
+                (
+                    "last used tool",
+                    handler is self.handler
+                    and handler is not None
+                    and handler.last_used_tool is self.last_used_tool,
+                ),
+                (
+                    "tool usage count",
+                    self.lookup.current_usage_count == self.usage_count,
+                ),
+            )
+            if not unchanged
+        ]
+        assert reset == [], f"the timed-out run reset the coworker's {reset}"
+        assert self.llm_calls == []
+
+
+def _calling_coworker_tool(
+    coworker: Agent, release: threading.Event, outcome: list[str], entry: str
+) -> Any:
+    """A tool that waits for the test, then runs a task on ``coworker`` itself."""
+
+    @tool("ask_coworker")
+    def ask_coworker() -> str:
+        """Ask the coworker."""
+        release.wait(ORPHAN_BLOCK)
+        sub_task = _task(coworker, "SUB_ONE")
+        try:
+            if entry == "execute_task":
+                coworker.execute_task(sub_task)
+            else:
+                asyncio.run(coworker.aexecute_task(sub_task))
+            outcome.append("ran")
+        except BaseException as error:
+            outcome.append(type(error).__name__)
+        return "ASKED_COWORKER"
+
+    return ask_coworker
+
+
+def _asking_script(text: str) -> str:
+    if "ASKED_COWORKER" in text:
+        return _final("orphan answer")
+    return _action("ask_coworker")
+
+
+@pytest.mark.parametrize("entry", ["execute_task", "aexecute_task"])
+def test_timed_out_run_leaves_coworker_it_calls_after_the_limit_as_it_was(
+    entry: str,
+) -> None:
+    """A coworker task started from the step in flight after the limit leaves the coworker's tool failures, last used tool and tool usage counts as they were."""
+    coworker = _CoworkerState()
+    coworker.record(coworker.agent.execute_task(coworker.pre_task))
+    release = threading.Event()
+    outcome: list[str] = []
+    ask = _calling_coworker_tool(coworker.agent, release, outcome, entry)
+    agent = _agent(_ScriptedLLM(_asking_script), tools=[ask])
+
+    before = set(threading.enumerate())
+    try:
+        with pytest.raises(TimeoutError):
+            agent.execute_task(_task(agent, "TASK_ONE"))
+        assert not release.is_set()
+    finally:
+        release.set()
+        still_alive = _join_timed_runs(before)
+    assert still_alive == []
+    assert len(outcome) == 1, "the timed-out run's tool never called the coworker"
+    coworker.assert_unchanged()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["execute_task", "aexecute_task"])
+async def test_cancelled_run_leaves_coworker_it_calls_after_the_limit_as_it_was(
+    entry: str,
+) -> None:
+    """After an async timeout, a coworker task started from the step in flight leaves the coworker's tool failures, last used tool and tool usage counts as they were."""
+    loop = asyncio.get_running_loop()
+    pool = _TrackingExecutor()
+    loop.set_default_executor(pool)
+
+    coworker = _CoworkerState()
+    coworker.record(await coworker.agent.aexecute_task(coworker.pre_task))
+    release = threading.Event()
+    outcome: list[str] = []
+    in_flight_at_timeout: list[set[concurrent.futures.Future[Any]]] = []
+    ask = _calling_coworker_tool(coworker.agent, release, outcome, entry)
+    agent = _agent(_ScriptedLLM(_asking_script), tools=[ask])
+
+    try:
+        with pytest.raises(TimeoutError):
+            await agent.aexecute_task(_task(agent, "TASK_ONE"))
+        in_flight_at_timeout.append(pool.snapshot())
+        assert not release.is_set()
+    finally:
+        release.set()
+        if in_flight_at_timeout:
+            concurrent.futures.wait(in_flight_at_timeout[0], timeout=JOIN_BOUND)
+        pool.shutdown(wait=True)
+    assert len(outcome) == 1, "the timed-out run's tool never called the coworker"
+    coworker.assert_unchanged()
