@@ -33,6 +33,7 @@ from crewai.flow import (
 )
 from crewai.flow.async_feedback import HumanFeedbackPending
 from crewai.flow.persistence import SQLiteFlowPersistence
+from pydantic import PrivateAttr
 import pytest
 
 
@@ -69,19 +70,54 @@ def _offline_collapse():
 
 
 class Reviewer:
-    """Answers each review from a script, or pauses the reviews named in ``pause``."""
+    """Answers each review from a script, or pauses the reviews named in ``pause``.
 
-    def __init__(self, answers: dict[str, list[str]], pause: frozenset[str]) -> None:
+    ``pause_calls`` names, per review, the calls (counted from 0) that pause;
+    the review's other calls are answered. ``on_save`` is called after each
+    pending row is saved.
+    """
+
+    def __init__(
+        self,
+        answers: dict[str, list[str]],
+        pause: frozenset[str],
+        pause_calls: dict[str, frozenset[int]] | None = None,
+    ) -> None:
         self.answers = {name: list(replies) for name, replies in answers.items()}
         self.pause = pause
+        self.pause_calls = dict(pause_calls or {})
+        self.calls: Counter[str] = Counter()
+        self.on_save: Callable[[], None] | None = None
+
+    @property
+    def pauses(self) -> bool:
+        return bool(self.pause or self.pause_calls)
 
     def answer(self, method_name: str) -> str:
         return self.answers[method_name].pop(0)
 
     def request_feedback(self, context: Any, flow: Any) -> str:
-        if context.method_name in self.pause:
+        name = context.method_name
+        call = self.calls[name]
+        self.calls[name] += 1
+        if name in self.pause_calls:
+            pausing = call in self.pause_calls[name]
+        else:
+            pausing = name in self.pause
+        if pausing:
             raise HumanFeedbackPending(context=context)
-        return self.answer(context.method_name)
+        return self.answer(name)
+
+
+class NotifyingPersistence(SQLiteFlowPersistence):
+    """SQLite persistence that tells the reviewer when a pending row is saved."""
+
+    _on_save: Callable[[], None] | None = PrivateAttr(default=None)
+
+    def save_pending_feedback(self, *args: Any, **kwargs: Any) -> None:
+        super().save_pending_feedback(*args, **kwargs)
+        if self._on_save is not None:
+            self._on_save()
 
 
 def payload(value: Any) -> Any:
@@ -110,18 +146,25 @@ def run_paused(
     resume_mode: str,
     db_path: str,
     tamper: Tamper | None = None,
+    *,
+    pause_calls: dict[str, frozenset[int]] | None = None,
+    same_instance: frozenset[int] = frozenset(),
 ) -> tuple[list[list[Record]], list[str]]:
     """Kick off with the ``pause`` reviews pausing and resume until done.
 
-    Returns the log segments (pre-pause, then one per resume) and the name of
-    each method the flow paused on.
+    Each resume runs on an instance restored with ``from_pending()``, except
+    the resumes numbered (from 1) in ``same_instance``, which run on the
+    instance that re-paused. Returns the log segments (pre-pause, then one per
+    resume) and the name of each method the flow paused on.
     """
     log: list[Record] = []
-    reviewer = Reviewer(answers, frozenset(pause))
+    reviewer = Reviewer(answers, frozenset(pause), pause_calls)
     flow_class = make(reviewer, log)
-    persistence = SQLiteFlowPersistence(db_path)
+    persistence = NotifyingPersistence(db_path)
+    persistence._on_save = lambda: reviewer.on_save() if reviewer.on_save else None
 
-    result = flow_class(persistence=persistence).kickoff()
+    flow = flow_class(persistence=persistence)
+    result = flow.kickoff()
     assert isinstance(result, HumanFeedbackPending), "the flow did not pause"
     segments = [list(log)]
     paused_on = [result.context.method_name]
@@ -131,13 +174,14 @@ def run_paused(
         flow_id = result.context.flow_id
         if tamper is not None:
             tamper(persistence, flow_id, len(paused_on) - 1)
-        restored = flow_class.from_pending(flow_id, persistence)
+        if len(paused_on) not in same_instance:
+            flow = flow_class.from_pending(flow_id, persistence)
         feedback = reviewer.answer(result.context.method_name)
         start_at = len(log)
         if resume_mode == "sync":
-            result = restored.resume(feedback)
+            result = flow.resume(feedback)
         else:
-            result = asyncio.run(restored.resume_async(feedback))
+            result = asyncio.run(flow.resume_async(feedback))
         segments.append(log[start_at:])
         if isinstance(result, HumanFeedbackPending):
             paused_on.append(result.context.method_name)
@@ -1692,3 +1736,670 @@ def test_resume_delivers_enclosing_label_cut_at_kickoff(
         flatten(segments),
         groups={"after_audit": "inner-label", "publish": "outer", "gated": "outer"},
     )
+
+
+# ---------------------------------------------------------------------------
+# V-14: a member that completed but whose delivery had not started at the pause
+# ---------------------------------------------------------------------------
+
+
+class Hold:
+    """Holds ``method`` in its completion hop until the pending row is saved.
+
+    The hop is ``_persist_method_completion``, which runs after the method is
+    recorded as completed and before its delivery offers it to waiting
+    conditions. The hold is released by the save that follows the pause, so
+    the member cannot be delivered before the snapshot. It holds once, and only
+    in the paused run.
+    """
+
+    def __init__(self, method: str, reviewer: Reviewer) -> None:
+        self.method = method
+        self.enabled = reviewer.pauses
+        self.in_hop = threading.Event()
+        self.release = threading.Event()
+        reviewer.on_save = self.saved
+
+    def enter(self, method_name: Any) -> None:
+        if self.enabled and method_name == self.method and not self.in_hop.is_set():
+            self.in_hop.set()
+            assert self.release.wait(WAIT_SECONDS), f"{self.method} was not released"
+
+    def saved(self) -> None:
+        if self.in_hop.is_set():
+            self.release.set()
+
+    def wait(self, fallback: threading.Event) -> None:
+        """Paused run: wait until the member is in its hop; in-run: ``fallback``."""
+        event = self.in_hop if self.enabled else fallback
+        assert event.wait(WAIT_SECONDS)
+
+
+def make_window(entry: str, *, router_join: bool, between_steps: bool) -> Factory:
+    """``other`` completes while ``draft`` pauses, before ``other`` is delivered.
+
+    With ``between_steps``, ``@router(other) r_other`` is held instead, so
+    ``other`` has passed its router step but not its non-router step.
+    """
+
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        hold = Hold("r_other" if between_steps else "other", reviewer)
+        delivered = threading.Event()
+
+        class Window(Flow):
+            def _persist_method_completion(self, method_name: Any) -> None:
+                super()._persist_method_completion(method_name)
+                hold.enter(method_name)
+
+            if entry == "listener":
+
+                @start()
+                def begin(self):
+                    log.append(("begin", None))
+                    return "begin-output"
+
+            @start()
+            def other(self):
+                log.append(("other", None))
+                return "other-output"
+
+            @listen(other)
+            def other_delivered(self):
+                delivered.set()
+
+            if between_steps:
+
+                @router(other)
+                def r_other(self):
+                    log.append(("r_other", None))
+                    return "x"
+
+            @entry_point(entry)
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                hold.wait(delivered)
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(and_(draft, other))
+            def combine(self, r=None):
+                log.append(("combine", payload(r)))
+
+            if router_join:
+
+                @router(and_(draft, other))
+                def rjoin(self, r=None):
+                    log.append(("rjoin", payload(r)))
+                    return "joined"
+
+                @listen("joined")
+                def on_joined(self, r=None):
+                    log.append(("on_joined", payload(r)))
+
+            @listen("approved")
+            def publish(self, r=None):
+                log.append(("publish", payload(r)))
+
+        return Window
+
+    return make
+
+
+WINDOW_ANSWERS = {"draft": ["approved"]}
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+@pytest.mark.parametrize("entry", ENTRY_PATHS)
+def test_resume_counts_member_completed_but_undelivered_at_pause(
+    entry: str, resume_mode: str, db_path: str
+) -> None:
+    """V-14(a) S and (b) L: and_(draft, other), other held in its hop, runs."""
+    make = make_window(entry, router_join=False, between_steps=False)
+
+    in_run = run_in_run(make, WINDOW_ANSWERS)
+    segments, paused_on = run_paused(
+        make, WINDOW_ANSWERS, {"draft"}, resume_mode, db_path
+    )
+
+    assert paused_on == ["draft"]
+    assert "other" in names(segments[0])
+    assert "combine" in names(in_run)
+    assert_parity(in_run, flatten(segments))
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+@pytest.mark.parametrize("entry", ENTRY_PATHS)
+def test_resume_counts_undelivered_member_in_router_join(
+    entry: str, resume_mode: str, db_path: str
+) -> None:
+    """V-14(f): @router(and_(draft, other)) and its label listener run once."""
+    make = make_window(entry, router_join=True, between_steps=False)
+
+    in_run = run_in_run(make, WINDOW_ANSWERS)
+    segments, paused_on = run_paused(
+        make, WINDOW_ANSWERS, {"draft"}, resume_mode, db_path
+    )
+
+    assert paused_on == ["draft"]
+    assert names(in_run).count("rjoin") == 1
+    assert names(in_run).count("on_joined") == 1
+    assert_parity(in_run, flatten(segments))
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_counts_member_held_between_router_and_non_router_steps(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-14(g): other past its router step only; combine and rjoin run once."""
+    make = make_window("start", router_join=True, between_steps=True)
+
+    in_run = run_in_run(make, WINDOW_ANSWERS)
+    segments, paused_on = run_paused(
+        make, WINDOW_ANSWERS, {"draft"}, resume_mode, db_path
+    )
+
+    assert paused_on == ["draft"]
+    assert {"other", "r_other"} <= set(names(segments[0]))
+    assert names(in_run).count("combine") == 1
+    assert names(in_run).count("rjoin") == 1
+    assert_parity(in_run, flatten(segments))
+
+
+def make_router_join_refire() -> Factory:
+    """``first``'s "approved" fires ``other`` (an ``or_``, so once), whose router
+    step fires ``@router(and_(other, "approved"))`` before the pause. ``other``
+    is held before its non-router step while ``draft`` pauses, and the resume
+    of ``draft`` delivers "approved" again.
+    """
+
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        hold = Hold("rjoin", reviewer)
+        delivered = threading.Event()
+
+        class RouterJoinRefire(Flow):
+            def _persist_method_completion(self, method_name: Any) -> None:
+                super()._persist_method_completion(method_name)
+                hold.enter(method_name)
+
+            @start()
+            @human_feedback(
+                message="First",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def first(self):
+                log.append(("first", None))
+                return "first-output"
+
+            @listen(or_("approved", "rejected"))
+            def other(self, r=None):
+                log.append(("other", payload(r)))
+                return "other-output"
+
+            @listen(other)
+            def other_delivered(self):
+                delivered.set()
+
+            @router(and_(other, "approved"))
+            def rjoin(self, r=None):
+                log.append(("rjoin", payload(r)))
+                return "joined"
+
+            @start()
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                hold.wait(delivered)
+                log.append(("draft", None))
+                return "draft-output"
+
+        return RouterJoinRefire
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_does_not_refire_router_join_member_fired_in_router_step(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-14(g) variant (plan-5): rjoin, fired before the pause, runs once."""
+    make = make_router_join_refire()
+    answers = {"first": ["approved"], "draft": ["approved"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(make, answers, {"draft"}, resume_mode, db_path)
+
+    assert paused_on == ["draft"]
+    assert names(in_run).count("rjoin") == 1
+    assert "rjoin" in names(segments[0])
+    assert_parity(in_run, flatten(segments))
+
+
+def make_join_fired_in_earlier_cycle() -> Factory:
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        delivered = threading.Event()
+
+        class JoinFiredEarlier(Flow):
+            @start()
+            def other(self):
+                log.append(("other", None))
+                return "other-output"
+
+            @listen(other)
+            def other_delivered(self):
+                delivered.set()
+
+            @start()
+            @listen("revise")
+            @human_feedback(
+                message="Review",
+                emit=["approved", "revise"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                assert delivered.wait(WAIT_SECONDS)
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(and_(draft, other))
+            def combine(self, r=None):
+                log.append(("combine", payload(r)))
+
+            @listen("approved")
+            def publish(self, r=None):
+                log.append(("publish", payload(r)))
+
+        return JoinFiredEarlier
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_does_not_refire_join_fired_in_earlier_cycle(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-14(c) guard: combine fired in cycle 1; draft pauses in cycle 2."""
+    make = make_join_fired_in_earlier_cycle()
+    answers = {"draft": ["revise", "approved"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(
+        make,
+        answers,
+        {"draft"},
+        resume_mode,
+        db_path,
+        pause_calls={"draft": frozenset({1})},
+    )
+
+    assert paused_on == ["draft"]
+    assert names(in_run).count("combine") == 1
+    assert names(flatten(segments)).count("combine") == 1
+    assert_parity(in_run, flatten(segments))
+
+
+def make_window_on_repause() -> Factory:
+    """On resume, draft's own gather holds ``x`` (held) and a review that pauses."""
+
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        hold = Hold("x", reviewer)
+        delivered = threading.Event()
+
+        class WindowOnRepause(Flow):
+            def _persist_method_completion(self, method_name: Any) -> None:
+                super()._persist_method_completion(method_name)
+                hold.enter(method_name)
+
+            @start()
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(draft)
+            def x(self, r=None):
+                log.append(("x", payload(r)))
+                return "x-output"
+
+            @listen(x)
+            def x_delivered(self):
+                delivered.set()
+
+            @listen(draft)
+            @human_feedback(message="Check", llm=LLM, provider=reviewer)
+            def check(self, r=None):
+                hold.wait(delivered)
+                log.append(("check", payload(r)))
+                return "check-output"
+
+            @listen(and_(x, "approved"))
+            def j(self, r=None):
+                log.append(("j", payload(r)))
+
+        return WindowOnRepause
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_counts_member_undelivered_at_repause(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-14(d): x held at the re-pause; and_(x, "approved") runs on resume 2."""
+    make = make_window_on_repause()
+    answers = {"draft": ["approved"], "check": ["looks good"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(
+        make, answers, {"draft", "check"}, resume_mode, db_path
+    )
+
+    assert paused_on == ["draft", "check"]
+    assert "x" in names(segments[1])
+    assert "j" in names(in_run)
+    assert_parity(in_run, flatten(segments))
+
+
+def make_restored_completions() -> Factory:
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        delivered = threading.Event()
+
+        class RestoredCompletions(Flow):
+            @start()
+            def other(self):
+                log.append(("other", None))
+                return "other-output"
+
+            @listen(other)
+            def other_delivered(self):
+                delivered.set()
+
+            @start()
+            @listen("revise")
+            @human_feedback(
+                message="Review",
+                emit=["approved", "revise"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                assert delivered.wait(WAIT_SECONDS)
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(draft)
+            @human_feedback(
+                message="Audit", emit=["ok2", "no2"], llm=LLM, provider=reviewer
+            )
+            def audit(self, r=None):
+                log.append(("audit", payload(r)))
+                return "audit-output"
+
+            @listen(and_(other, "ok2"))
+            def join_j(self, r=None):
+                log.append(("join_j", payload(r)))
+
+        return RestoredCompletions
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_resume_does_not_count_restored_completions_as_undelivered(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-14(e) guard: J, fired in cycle 1, does not fire again over a re-pause."""
+    make = make_restored_completions()
+    answers = {"draft": ["revise", "approved"], "audit": ["ok2", "ok2"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(
+        make,
+        answers,
+        {"draft", "audit"},
+        resume_mode,
+        db_path,
+        pause_calls={"draft": frozenset({1}), "audit": frozenset({1})},
+    )
+
+    assert paused_on == ["draft", "audit"]
+    assert names(in_run).count("join_j") == 1
+    assert_parity(in_run, flatten(segments))
+
+
+# ---------------------------------------------------------------------------
+# V-15: a resume on the instance that re-paused continues from its progress
+# ---------------------------------------------------------------------------
+
+
+def make_same_instance() -> Factory:
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        class SameInstance(Flow):
+            @start()
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(draft)
+            @human_feedback(
+                message="Audit", emit=["ok2", "no2"], llm=LLM, provider=reviewer
+            )
+            def audit(self, r=None):
+                log.append(("audit", payload(r)))
+                return "audit-output"
+
+            @listen(and_(draft, "ok2"))
+            def join(self, r=None):
+                log.append(("join", payload(r)))
+
+        return SameInstance
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_same_instance_resume_after_repause_runs_join(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-15(a): resume 2 on the re-paused instance runs and_(draft, "ok2")."""
+    make = make_same_instance()
+    answers = {"draft": ["approved"], "audit": ["ok2"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(
+        make,
+        answers,
+        {"draft", "audit"},
+        resume_mode,
+        db_path,
+        same_instance=frozenset({2}),
+    )
+
+    assert paused_on == ["draft", "audit"]
+    assert "join" in names(in_run)
+    assert_parity(in_run, flatten(segments))
+
+
+def make_same_instance_twice() -> Factory:
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        class SameInstanceTwice(Flow):
+            @start()
+            @human_feedback(
+                message="Review",
+                emit=["approved", "rejected"],
+                llm=LLM,
+                provider=reviewer,
+            )
+            def draft(self):
+                log.append(("draft", None))
+                return "draft-output"
+
+            @listen(or_(draft, "again"))
+            @human_feedback(
+                message="Audit", emit=["ok2", "no2"], llm=LLM, provider=reviewer
+            )
+            def audit(self, r=None):
+                log.append(("audit", payload(r)))
+                return "audit-output"
+
+            @listen(and_(draft, "ok2"))
+            def join_j(self, r=None):
+                log.append(("join_j", payload(r)))
+
+            @listen("approved")
+            @human_feedback(
+                message="Final", emit=["again", "done"], llm=LLM, provider=reviewer
+            )
+            def final(self, r=None):
+                log.append(("final", payload(r)))
+                return "final-output"
+
+        return SameInstanceTwice
+
+    return make
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+def test_same_instance_resume_with_second_repause_runs_join_once(
+    resume_mode: str, db_path: str
+) -> None:
+    """V-15(b): J fires on the same-instance resume and not again after it."""
+    make = make_same_instance_twice()
+    answers = {"draft": ["approved"], "audit": ["ok2", "ok2"], "final": ["again"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(
+        make,
+        answers,
+        {"draft", "audit", "final"},
+        resume_mode,
+        db_path,
+        pause_calls={
+            "draft": frozenset({0}),
+            "audit": frozenset({0}),
+            "final": frozenset({0}),
+        },
+        same_instance=frozenset({2}),
+    )
+
+    assert paused_on == ["draft", "audit", "final"]
+    assert names(in_run).count("join_j") == 1
+    assert names(in_run).count("audit") == 2
+    assert_parity(in_run, flatten(segments))
+
+
+# ---------------------------------------------------------------------------
+# V-16: a join completed by a cut trigger, as the docs state it
+# ---------------------------------------------------------------------------
+
+
+def make_cut_trigger_join(shape: str) -> Factory:
+    def make(reviewer: Reviewer, log: list[Record]) -> type[Flow[Any]]:
+        class CutTriggerJoin(Flow):
+            @start()
+            def begin(self):
+                log.append(("begin", None))
+                return "begin-output"
+
+            if shape == "nested":
+
+                @listen(begin)
+                def mid(self):
+                    log.append(("mid", None))
+                    return "mid-output"
+
+                @listen(mid)
+                @human_feedback(
+                    message="Review",
+                    emit=["approved", "rejected"],
+                    llm=LLM,
+                    provider=reviewer,
+                )
+                def draft(self):
+                    log.append(("draft", None))
+                    return "draft-output"
+
+                @listen(and_(draft, mid))
+                def join_mid(self, r=None):
+                    log.append(("join_mid", payload(r)))
+
+            else:
+
+                @listen(begin)
+                @human_feedback(
+                    message="Review",
+                    emit=["approved", "rejected"],
+                    llm=LLM,
+                    provider=reviewer,
+                )
+                def draft(self):
+                    log.append(("draft", None))
+                    return "draft-output"
+
+            @listen(and_(draft, begin))
+            def join_begin(self, r=None):
+                log.append(("join_begin", payload(r)))
+
+            @router("approved")
+            def route_approved(self, r=None):
+                log.append(("route_approved", None))
+                return "routed"
+
+            @listen("approved")
+            def on_approved(self, r=None):
+                log.append(("on_approved", payload(r)))
+
+        return CutTriggerJoin
+
+    return make
+
+
+CUT_TRIGGER_JOINS = {"listener": ["join_begin"], "nested": ["join_mid", "join_begin"]}
+
+
+@pytest.mark.parametrize("resume_mode", RESUME_MODES)
+@pytest.mark.parametrize("shape", list(CUT_TRIGGER_JOINS))
+def test_resume_runs_cut_trigger_join_with_outcome_before_label_group(
+    shape: str, resume_mode: str, db_path: str
+) -> None:
+    """V-16: once, given the outcome string, before the "approved" listeners."""
+    make = make_cut_trigger_join(shape)
+    answers = {"draft": ["approved"]}
+
+    in_run = run_in_run(make, answers)
+    segments, paused_on = run_paused(make, answers, {"draft"}, resume_mode, db_path)
+
+    assert paused_on == ["draft"]
+    resumed = segments[1]
+    resumed_names = names(resumed)
+    for join in CUT_TRIGGER_JOINS[shape]:
+        assert names(in_run).count(join) == 1
+        assert names(flatten(segments)).count(join) == 1, f"{join}: {resumed}"
+        assert resumed_names.count(join) == 1, f"{join}: {resumed}"
+        assert dict(resumed)[join] == "approved", f"{join}: {resumed}"
+        for label_listener in ("route_approved", "on_approved"):
+            assert resumed_names.index(join) < resumed_names.index(label_listener), (
+                f"{join} after {label_listener}: {resumed}"
+            )
