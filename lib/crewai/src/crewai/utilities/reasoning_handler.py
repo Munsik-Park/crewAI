@@ -19,6 +19,7 @@ from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.llm_utils import create_llm
 from crewai.utilities.planning_types import PlanStep
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import run_scope_abandoned
 
 
 if TYPE_CHECKING:
@@ -294,6 +295,10 @@ class AgentReasoning:
         task_id = str(self.task.id) if self.task else "kickoff"
 
         while not ready and (max_attempts is None or attempt < max_attempts):
+            # Each refinement is a new LLM call; a run abandoned at its timeout
+            # keeps the plan it has, and its next step stops it.
+            if run_scope_abandoned():
+                break
             attempt += 1
 
             try:
@@ -417,6 +422,9 @@ class AgentReasoning:
         except HookAborted:
             raise
         except Exception as e:
+            if run_scope_abandoned():
+                # The fallback would be a new LLM call after the timeout.
+                return "Failed to generate a plan due to an error.", [], True
             self.logger.warning(
                 f"Error during function calling: {e!s}. Falling back to text parsing."
             )

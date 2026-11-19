@@ -49,6 +49,7 @@ from crewai.events.types.a2a_events import (
 )
 from crewai.lite_agent_output import LiteAgentOutput
 from crewai.task import Task
+from crewai.utilities.timed_run import refuse_abandoned_run
 
 
 if TYPE_CHECKING:
@@ -123,6 +124,9 @@ def wrap_agent_with_a2a_instance(
         tools: list[BaseTool] | None = None,
     ) -> str:
         """Execute task with A2A delegation support (sync)."""
+        # Fetching agent cards is remote work on this agent, which a run
+        # abandoned at its timeout does not start.
+        refuse_abandoned_run()
         if not self.a2a:
             return original_execute_task(self, task, context, tools)  # type: ignore[no-any-return]
 
@@ -147,6 +151,9 @@ def wrap_agent_with_a2a_instance(
         tools: list[BaseTool] | None = None,
     ) -> str:
         """Execute task with A2A delegation support (async)."""
+        # Fetching agent cards is remote work on this agent, which a run
+        # abandoned at its timeout does not start.
+        refuse_abandoned_run()
         if not self.a2a:
             return await original_aexecute_task(self, task, context, tools)  # type: ignore[no-any-return]
 
@@ -179,6 +186,7 @@ def wrap_agent_with_a2a_instance(
         input_files: dict[str, Any] | None = None,
     ) -> Any:
         """Execute agent kickoff with A2A delegation support."""
+        refuse_abandoned_run()
         if not self.a2a:
             return original_kickoff(self, messages, response_format, input_files)
 
@@ -206,6 +214,7 @@ def wrap_agent_with_a2a_instance(
         input_files: dict[str, Any] | None = None,
     ) -> Any:
         """Execute agent kickoff with A2A delegation support."""
+        refuse_abandoned_run()
         if not self.a2a:
             return await original_kickoff_async(
                 self, messages, response_format, input_files
@@ -1283,6 +1292,8 @@ def _delegate_to_a2a(
                     _extension_registry.prepare_all_metadata(_ext_states)
                 )
 
+            # Each turn is a new request to the remote agent.
+            refuse_abandoned_run()
             a2a_result = execute_a2a_delegation(
                 endpoint=ctx.agent_config.endpoint,
                 auth=ctx.agent_config.auth,
@@ -1639,6 +1650,7 @@ async def _adelegate_to_a2a(
                     _extension_registry.prepare_all_metadata(_ext_states)
                 )
 
+            refuse_abandoned_run()
             a2a_result = await aexecute_a2a_delegation(
                 endpoint=ctx.agent_config.endpoint,
                 auth=ctx.agent_config.auth,
