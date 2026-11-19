@@ -511,9 +511,11 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
-O flow retomado continua como teria continuado se a revisão tivesse sido respondida durante a execução: os listeners do próprio método revisado e os listeners do label de outcome são executados, joins `and_` contam os membros concluídos antes da pausa, e listeners `or_` que já dispararam não disparam novamente.
+Na retomada, a conclusão do método revisado e o seu outcome chegam ao que os escuta como teriam chegado se a revisão tivesse sido respondida durante a execução. Os listeners e routers do próprio método revisado são executados, e depois os listeners do label de outcome, incluindo joins `and_` no label e starts condicionais controlados por ele. Um join `and_` que inclui o método revisado também conta os membros concluídos antes da pausa. Um listener `or_` que inclui o método revisado ou o seu label e que já disparou antes da pausa não dispara novamente.
 
-Um caso é diferente. Quando o método revisado é um listener, ele é executado enquanto o método que o disparou ainda está roteando. Um join `and_` que espera tanto o método revisado quanto um método cujo roteamento ainda estava em andamento na pausa (o método que o método revisado escuta, ou um mais acima em uma cadeia de routers que levou até ele) é executado na retomada junto com os listeners do próprio método revisado, antes dos routers e listeners do outcome, e recebe a string do outcome. Em uma execução sem pausa, o mesmo join recebe a saída desse método e é executado depois dos routers do outcome.
+Um join pode ser executado mais cedo e receber um argumento diferente. Quando o método revisado é um listener, ele é executado enquanto o método que o disparou ainda está roteando. Um join `and_` que espera tanto o método revisado quanto um método cujo roteamento ainda estava em andamento na pausa (o método que o método revisado escuta, ou um mais acima em uma cadeia de routers que levou até ele) é executado na retomada junto com os listeners do próprio método revisado, antes dos routers e listeners do outcome, e recebe a string do outcome. Em uma execução sem pausa, o mesmo join recebe a saída desse método e é executado depois dos routers do outcome.
+
+Outro trabalho que a pausa interrompeu enquanto estava em andamento não continua na retomada: métodos que ainda estavam em execução junto com a revisão quando ela pausou, e a entrega de resultados de outros métodos ou de outcomes de routers que ainda estava em andamento.
 
 ### Tipos Principais
 
