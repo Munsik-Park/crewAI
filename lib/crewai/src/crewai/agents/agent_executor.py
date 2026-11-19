@@ -1719,6 +1719,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             )
             return "parser_error"
 
+        except RunAbandonedError:
+            raise
+
         except Exception as e:
             if is_context_length_exceeded(e):
                 self._last_context_error = e
@@ -1821,6 +1824,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
 
             return self._route_finish_with_todos("native_finished")
 
+        except RunAbandonedError:
+            raise
+
         except Exception as e:
             if is_native_tool_calling_unsupported_error(e):
                 self._downgrade_to_text_tool_calling()
@@ -1877,6 +1883,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         ):
             return answer
 
+        # A second request; the answer may have arrived after the timeout.
+        if self._run_abandoned():
+            raise RunAbandonedError()
         enforce_rpm_limit(self.request_within_rpm_limit)
         try:
             structured = get_llm_response(
@@ -1958,7 +1967,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             # policy abort back to the LLM as a recoverable observation.
             raise
 
-        except ToolExecutionFailedError:
+        except (ToolExecutionFailedError, RunAbandonedError):
             # A deliberate stop: the generic handler below would feed it back
             # to the LLM as a recoverable observation.
             raise
@@ -2092,7 +2101,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                     idx = future_to_idx[future]
                     try:
                         ordered_results[idx] = future.result()
-                    except (HookAborted, ToolExecutionFailedError):
+                    except (HookAborted, ToolExecutionFailedError, RunAbandonedError):
                         # A deliberate stop: folding it into a tool result would
                         # let the remaining parallel calls carry on. Cancel the
                         # siblings that have not started so they never run.
@@ -2238,6 +2247,10 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
 
     def _execute_single_native_tool_call(self, tool_call: Any) -> dict[str, Any]:
         """Execute a single native tool call and return metadata/result."""
+        # Calls run one after another, or wait for a free worker, so this one
+        # may start only after the run was abandoned at its timeout.
+        if self._run_abandoned():
+            raise RunAbandonedError()
         info = extract_tool_call_info(tool_call)
         if not info:
             call_id = (
@@ -3498,6 +3511,8 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             result: Agent's final output.
             human_feedback: Optional feedback from human.
         """
+        if self._run_abandoned():
+            raise RunAbandonedError()
         # Early return if no crew (standalone mode)
         if self.crew is None:
             return

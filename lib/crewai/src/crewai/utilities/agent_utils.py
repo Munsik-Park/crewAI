@@ -67,6 +67,7 @@ from crewai.utilities.message_utils import (
 )
 from crewai.utilities.pydantic_schema_utils import generate_model_description
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import refuse_abandoned_run
 from crewai.utilities.token_counter_callback import TokenCalcHandler
 from crewai.utilities.types import LLMMessage
 
@@ -546,6 +547,8 @@ def _call_llm_retrying_empty(
     with contextlib.suppress(EmptyLLMResponseError):
         if answer := call():
             return answer
+    # The repeat is a new request, which a run abandoned at its timeout does not make.
+    refuse_abandoned_run()
     _report_empty_llm_answer(printer, verbose, retrying=True)
     enforce_rpm_limit(request_within_rpm_limit)
     with contextlib.suppress(EmptyLLMResponseError):
@@ -566,6 +569,7 @@ async def _acall_llm_retrying_empty(
     with contextlib.suppress(EmptyLLMResponseError):
         if answer := await call():
             return answer
+    refuse_abandoned_run()
     _report_empty_llm_answer(printer, verbose, retrying=True)
     enforce_rpm_limit(request_within_rpm_limit)
     with contextlib.suppress(EmptyLLMResponseError):
@@ -761,6 +765,9 @@ def get_llm_response(
                 from_task=from_task,
                 from_agent=from_agent,
             )
+            # Summarizing can outlast the timeout; the request it prepared is
+            # then not sent.
+            refuse_abandoned_run()
         answer = _call_llm_retrying_empty(
             llm,
             lambda: llm.call(
@@ -838,6 +845,7 @@ async def aget_llm_response(
                 from_task=from_task,
                 from_agent=from_agent,
             )
+            refuse_abandoned_run()
         answer = await _acall_llm_retrying_empty(
             llm,
             lambda: llm.acall(

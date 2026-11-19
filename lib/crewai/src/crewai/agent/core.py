@@ -830,6 +830,7 @@ class Agent(BaseAgent):
         if not self._is_any_available_memory():
             return task_prompt
 
+        refuse_abandoned_run()
         crewai_event_bus.emit(
             self,
             event=MemoryRetrievalStartedEvent(
@@ -1795,18 +1796,23 @@ class Agent(BaseAgent):
             if self.tools_handler:
                 self.tools_handler.last_used_tool = None
 
+        # Loading tools can outlast the timeout, so each load and each write of
+        # the agent's tools is checked against it.
         if self.apps:
             platform_tools = self.get_platform_tools(self.apps)
             if platform_tools:
-                if self.tools is None:
-                    self.tools = []
-                self.tools.extend(platform_tools)
+                with run_scope_write_guard():
+                    if self.tools is None:
+                        self.tools = []
+                    self.tools.extend(platform_tools)
         if self.mcps:
+            refuse_abandoned_run()
             mcps = self.get_mcp_tools(self.mcps)
             if mcps:
-                if self.tools is None:
-                    self.tools = []
-                self.tools.extend(mcps)
+                with run_scope_write_guard():
+                    if self.tools is None:
+                        self.tools = []
+                    self.tools.extend(mcps)
 
         raw_tools = with_spreadsheet_tools(list(self.tools or []), spreadsheets)
 
@@ -1921,6 +1927,7 @@ class Agent(BaseAgent):
             formatted_messages += "\n\n" + spreadsheets.overview
 
         if agent_memory is not None:
+            refuse_abandoned_run()
             try:
                 crewai_event_bus.emit(
                     self,
@@ -2153,6 +2160,9 @@ class Agent(BaseAgent):
         Returns:
             The finalized output.
         """
+        # The run's last step, its conversion or its guardrail can each end
+        # after the timeout; what follows them is then not started.
+        refuse_abandoned_run()
         if self.guardrail is not None:
             output = self._process_kickoff_guardrail(
                 output=output,
@@ -2162,6 +2172,7 @@ class Agent(BaseAgent):
                 usage_baseline=usage_baseline,
             )
 
+        refuse_abandoned_run()
         self._save_kickoff_to_memory(messages, output.raw)
 
         crewai_event_bus.emit(
