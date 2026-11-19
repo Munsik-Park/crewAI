@@ -2592,6 +2592,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 self._completed_methods.clear()
                 self._method_outputs.clear()
                 self._pending_events.clear()
+                self._unoffered_to_routers.clear()
+                self._unoffered_to_listeners.clear()
                 self._clear_or_listeners()
                 self._method_call_counts.clear()
             else:
