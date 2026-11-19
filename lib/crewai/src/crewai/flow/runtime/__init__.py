@@ -795,6 +795,14 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
     # each set at the matching step of its delivery.
     _unoffered_to_routers: set[FlowMethodName] = PrivateAttr(default_factory=set)
     _unoffered_to_listeners: set[FlowMethodName] = PrivateAttr(default_factory=set)
+    # Races of or_() members under way, as (or_ listener, members), and the
+    # members whose or_ listener has already fired for another member of their
+    # race: the race has gone to that member, so a pause does not count them
+    # as completions still to be delivered.
+    _open_races: list[tuple[FlowMethodName, frozenset[FlowMethodName]]] = PrivateAttr(
+        default_factory=list
+    )
+    _lost_racers: set[FlowMethodName] = PrivateAttr(default_factory=set)
     _method_call_counts: dict[FlowMethodName, int] = PrivateAttr(default_factory=dict)
     # True on flows CrewAI runs for its own bookkeeping - the agent executor and
     # the memory encoding/recall flows. Declared rather than inferred from the
@@ -1166,7 +1174,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 for name, definition, condition in self._listener_methods()
                 if definition.router == routers
             ]
-            for method_name in sorted(unoffered):
+            for method_name in sorted(unoffered - self._lost_racers):
                 self._record_unsatisfied(progress, str(method_name), targets)
         return progress
 
@@ -1175,10 +1183,17 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self._unoffered_to_listeners.add(method_name)
 
     def _drop_unoffered(self, method_name: FlowMethodName) -> None:
-        """Forget a completion whose delivery was cancelled before reaching all
+        """Forget a completion whose delivery is cancelled before reaching all
         conditions; it will not be offered to them in this run either."""
         self._unoffered_to_routers.discard(method_name)
         self._unoffered_to_listeners.discard(method_name)
+
+    def _mark_race_lost(
+        self, or_listener: FlowMethodName, winner: FlowMethodName
+    ) -> None:
+        for listener, members in self._open_races:
+            if listener == or_listener and winner in members:
+                self._lost_racers.update(members - {winner})
 
     def _pause_progress(self, pending: HumanFeedbackPending) -> ResumeProgress:
         progress = pending.context.resume_progress
@@ -1438,17 +1453,25 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         ]
 
         if racing_tasks:
-            for coro in asyncio.as_completed(racing_tasks):
-                try:
-                    await coro
-                except Exception as e:
-                    logger.debug(f"Racing listener failed: {e}")
-                    continue
-                break
+            group = self._get_racing_group_for_listeners(list(racing_listeners))
+            race = (group[1] if group else FlowMethodName(""), racing_listeners)
+            self._open_races.append(race)
+            try:
+                for coro in asyncio.as_completed(racing_tasks):
+                    try:
+                        await coro
+                    except Exception as e:
+                        logger.debug(f"Racing listener failed: {e}")
+                        continue
+                    break
 
-            for task in racing_tasks:
-                if not task.done():
-                    task.cancel()
+                for name, task in zip(racing_listeners, racing_tasks, strict=True):
+                    if not task.done():
+                        task.cancel()
+                        self._drop_unoffered(name)
+            finally:
+                self._open_races.remove(race)
+                self._lost_racers -= racing_listeners
 
         if other_tasks:
             await asyncio.gather(*other_tasks, return_exceptions=True)
@@ -3295,11 +3318,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             self._completed_methods.add(method_name)
             self._mark_completion_unoffered(method_name)
 
-            try:
-                await asyncio.to_thread(self._persist_method_completion, method_name)
-            except asyncio.CancelledError:
-                self._drop_unoffered(method_name)
-                raise
+            await asyncio.to_thread(self._persist_method_completion, method_name)
 
             finished_event_id: str | None = None
             if not self.suppress_flow_events:
@@ -3511,9 +3530,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                             self.last_human_feedback
                         )
                     current_trigger = router_result_event
-        except asyncio.CancelledError:
-            self._drop_unoffered(trigger_method)
-            raise
         except HumanFeedbackPending as e:
             # A pause in the router loop cuts the delivery of every trigger
             # collected so far, before its listeners and gated starts.
@@ -3658,6 +3674,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 triggered.append(listener_name)
                 if should_check_fired:
                     self._fired_or_listeners.add(listener_name)
+                    self._mark_race_lost(listener_name, trigger_method)
 
         return triggered
 
