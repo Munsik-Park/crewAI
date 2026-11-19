@@ -1790,9 +1790,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
-        # Continue as the run would have after this review: its own listeners,
-        # then its outcome label, then the labels of enclosing routers that the
-        # pause cut off.
+        # Carried labels are the outcomes of routers enclosing this review whose
+        # delivery the pause cut off, innermost first.
         progress = context.resume_progress
         entry_path = (
             progress.entry_path if progress is not None else None
