@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import threading
 from threading import Lock
 import time
 from typing import (
@@ -68,6 +69,7 @@ from crewai.agents.agent_builder.base_agent import (
 )
 from crewai.agents.agent_executor import AgentExecutor
 from crewai.agents.cache.cache_handler import CacheHandler
+from crewai.agents.tools_handler import ToolsHandler
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
@@ -126,6 +128,7 @@ from crewai.utilities.constants import (
 )
 from crewai.utilities.converter import Converter, ConverterError
 from crewai.utilities.env import get_env_context
+from crewai.utilities.execution_stop import enter_timed_run
 from crewai.utilities.guardrail import process_guardrail, serialize_guardrail_for_json
 from crewai.utilities.guardrail_types import GuardrailCallable, GuardrailType
 from crewai.utilities.i18n import I18N_DEFAULT
@@ -1103,29 +1106,42 @@ class Agent(BaseAgent):
             RuntimeError: If execution fails for other reasons.
         """
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
-                ctx.run,
-                self._execute_without_timeout,
-                task_prompt=task_prompt,
-                task=task,
-            )
+        stop = threading.Event()
 
+        def run_timed() -> Any:
+            enter_timed_run(stop)
+            return self._execute_without_timeout(task_prompt=task_prompt, task=task)
+
+        # Not a ``with`` block: leaving it would join the worker, and the caller
+        # must not wait for work that outlives the deadline.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(ctx.run, run_timed)
             try:
                 return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError as e:
-                future.cancel()
+                self._detach_timed_out_run(stop)
                 raise TimeoutError(
                     f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
                 ) from e
             except _passthrough_exceptions:
                 # Wrapping a deliberate stop in RuntimeError would hide it from
                 # _check_execution_error and trigger the retry loop instead.
-                future.cancel()
                 raise
             except Exception as e:
-                future.cancel()
                 raise RuntimeError(f"Task execution failed: {e!s}") from e
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _detach_timed_out_run(self, stop: threading.Event) -> None:
+        """Stop a timed-out run and give the agent state it does not share.
+
+        The abandoned work keeps the executor and tools handler it was using,
+        so a later call builds new ones instead of running into them.
+        """
+        stop.set()
+        self.agent_executor = None
+        self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
 
     def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
         """Execute a task without a timeout.
@@ -1257,12 +1273,20 @@ class Agent(BaseAgent):
             TimeoutError: If execution exceeds the timeout.
             RuntimeError: If execution fails for other reasons.
         """
+        stop = threading.Event()
+
+        async def run_timed() -> Any:
+            enter_timed_run(stop)
+            return await self._aexecute_without_timeout(task_prompt, task)
+
+        # A task of its own copies the caller's context, so the stop mark set in
+        # it never reaches the caller (``wait_for`` would otherwise run the
+        # coroutine in the caller's task on Python 3.12+).
+        timed_run = asyncio.ensure_future(run_timed())
         try:
-            return await asyncio.wait_for(
-                self._aexecute_without_timeout(task_prompt, task),
-                timeout=timeout,
-            )
+            return await asyncio.wait_for(timed_run, timeout=timeout)
         except asyncio.TimeoutError as e:
+            self._detach_timed_out_run(stop)
             raise TimeoutError(
                 f"Task '{task.description}' execution timed out after {timeout} seconds. "
                 "Consider increasing max_execution_time or optimizing the task."

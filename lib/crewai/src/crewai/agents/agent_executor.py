@@ -117,6 +117,7 @@ from crewai.utilities.agent_utils import (
     track_delegation_if_needed,
 )
 from crewai.utilities.constants import TRAINING_DATA_FILE
+from crewai.utilities.execution_stop import execution_stopped
 from crewai.utilities.file_store import aget_all_files, get_all_files
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.message_utils import format_message_for_llm
@@ -3203,10 +3204,11 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not execution_stopped():
                     formatted_answer = self._handle_human_feedback(formatted_answer)
 
-            self._save_to_memory(formatted_answer)
+            if not execution_stopped():
+                self._save_to_memory(formatted_answer)
 
             return {"output": formatted_answer.output}
 
@@ -3294,12 +3296,13 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not execution_stopped():
                     formatted_answer = await self._ahandle_human_feedback(
                         formatted_answer
                     )
 
-            self._save_to_memory(formatted_answer)
+            if not execution_stopped():
+                self._save_to_memory(formatted_answer)
 
             return {"output": formatted_answer.output}
 

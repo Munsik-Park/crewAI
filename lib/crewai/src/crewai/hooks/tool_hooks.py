@@ -17,6 +17,7 @@ from crewai.hooks.types import (
     BeforeToolCallHookCallable,
     BeforeToolCallHookType,
 )
+from crewai.utilities.execution_stop import execution_stopped
 
 
 if TYPE_CHECKING:
@@ -176,8 +177,11 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
     Returns:
         True if a hook blocked execution (returned False or raised
         :class:`HookAborted`), False otherwise. Tool input mutations on the
-        context persist regardless.
+        context persist regardless. A run stopped by ``max_execution_time``
+        is reported as blocked without running any hook.
     """
+    if execution_stopped():
+        return True
     try:
         dispatch(
             InterceptionPoint.PRE_TOOL_CALL,

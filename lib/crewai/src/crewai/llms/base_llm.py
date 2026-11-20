@@ -47,6 +47,10 @@ from crewai.events.types.tool_usage_events import (
 from crewai.llms.retry import arun_with_rate_limit_retry, run_with_rate_limit_retry
 from crewai.types.streaming import StreamSession
 from crewai.types.usage_metrics import UsageMetrics
+from crewai.utilities.execution_stop import (
+    EXECUTION_STOPPED_MESSAGE,
+    execution_stopped,
+)
 from crewai.utilities.pydantic_schema_utils import serialize_model_class
 from crewai.utilities.streaming import (
     create_frame_generator,
@@ -260,6 +264,8 @@ class BaseLLM(BaseModel, ABC):
 
             @wraps(method)
             def wrapped_call(instance: BaseLLM, *args: Any, **kwargs: Any) -> Any:
+                if execution_stopped():
+                    raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
                 return run_with_rate_limit_retry(
                     lambda: method(instance, *args, **kwargs)
                 )
@@ -274,6 +280,8 @@ class BaseLLM(BaseModel, ABC):
             async def wrapped_acall(
                 instance: BaseLLM, *args: Any, **kwargs: Any
             ) -> Any:
+                if execution_stopped():
+                    raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
                 return await arun_with_rate_limit_retry(
                     lambda: method(instance, *args, **kwargs)
                 )
