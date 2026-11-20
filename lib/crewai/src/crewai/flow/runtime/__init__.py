@@ -599,6 +599,17 @@ def _is_str_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+def _is_valid_bookkeeping(record: dict[str, Any]) -> bool:
+    """Whether the join and ``or_`` bookkeeping a record saved lists method names."""
+    pending = record.get("pending_events", {})
+    return (
+        isinstance(pending, dict)
+        and all(_is_str_list(seen) for seen in pending.values())
+        and _is_str_list(record.get("fired_or_listeners", []))
+        and _is_str_list(record.get("completed_methods", []))
+    )
+
+
 def _is_valid_frame(frame: Any) -> bool:
     """Whether a recorded dispatch frame has every field, each of its type."""
     if not isinstance(frame, dict):
@@ -1521,12 +1532,14 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         record = context.resume_record
         if not isinstance(record, dict):
             return
+        if not _is_valid_bookkeeping(record):
+            # A record with malformed bookkeeping counts as absent.
+            context.resume_record = None
+            return
         pending = record.get("pending_events")
         if isinstance(pending, dict):
             self._pending_events = {
-                PendingListenerKey(key): set(seen)
-                for key, seen in pending.items()
-                if isinstance(seen, list)
+                PendingListenerKey(key): set(seen) for key, seen in pending.items()
             }
         fired = record.get("fired_or_listeners")
         if isinstance(fired, list):
