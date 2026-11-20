@@ -4414,3 +4414,111 @@ def test_user_dict_shaped_like_a_stored_review_result_resumes_as_that_dict(
 
     assert now == [("use", "dict", _TAGGED_USER_VALUE)]
     assert before + after == now
+
+
+# Flows whose reviews have no ``emit``: resume continues the work the pause
+# interrupted, as the run answered at once does.
+
+
+def _plain_review(review: _Review) -> Any:
+    return human_feedback(message="Review:", provider=review)
+
+
+def _plain_review_beside_a_gated_start(review: _Review, calls: list[Any]):
+    class Gated(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @start("go")
+        def gated(self):
+            calls.append("gated")
+
+        @listen(draft)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+        @listen(and_(seed, draft))
+        def joined(self):
+            calls.append("joined")
+
+    return Gated
+
+
+def _two_plain_reviews_in_a_chain(review: _Review, calls: list[Any]):
+    class Chain(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(a)
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_plain_review(review)
+        def again(self):
+            calls.append("again")
+            return "G"
+
+        @listen(again)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+        @listen(and_(a, again))
+        def joined(self):
+            calls.append("joined")
+
+    return Chain
+
+
+def _plain_reviewed_start(review: _Review, calls: list[Any]):
+    class StartReview(Flow):
+        @start()
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+    return StartReview
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize(
+    ("make", "pauses"),
+    [
+        (_plain_review_beside_a_gated_start, ["draft"]),
+        (_two_plain_reviews_in_a_chain, ["draft", "again"]),
+        (_plain_reviewed_start, ["draft"]),
+    ],
+    ids=["gated_start", "chain", "start"],
+)
+def test_reviews_without_emit_resume_as_answered_at_once(
+    make: ShapeFactory, pauses: list[str], second: str, how: str
+) -> None:
+    _assert_resumes_as_answered_at_once(make, how, second, pauses)
