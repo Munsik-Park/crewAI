@@ -6123,3 +6123,193 @@ def test_step_value_whose_copy_raises_still_pauses(at: str, second: str, how: st
         assert got[0][1] == stored
     else:
         assert got[0][1] is value
+
+
+# A restored run paused again while a frame carried over from the first pause
+# still holds a deep step value in its stored form. The re-pause saves that
+# form as it is; with the native JSON encoder and the default limit of 1000,
+# ``int_keys_350`` is built and encoded at kickoff, and the second save must
+# hold it too. ``shallow`` is a guard.
+
+
+@pytest.fixture
+def _recursion_limit_of_1000() -> Any:
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+_WAITING_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "shallow": lambda: _int_keys(10),
+    "int_keys_350": _DEEP_STEP_VALUES["int_keys_350"],
+}
+
+
+def _deep_value_waiting_while_a_second_review_pauses(value: Any) -> ShapeFactory:
+    """``draft`` and ``beside`` listen on ``seed``; ``second`` reviews after ``draft``."""
+
+    def make(review: _Review, calls: list[Any]):
+        class DeepValueWaiting(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return value
+
+            @listen(seed)
+            @_hf(review)
+            def draft(self, _):
+                calls.append("draft")
+                return "D"
+
+            @listen(seed)
+            def beside(self, _):
+                calls.append("beside")
+
+            @listen(draft)
+            @_hf(review)
+            def second(self, _):
+                calls.append("second")
+                return "S"
+
+            @listen("approved")
+            def publish(self, result):
+                calls.append(("publish", _value(result)))
+
+        return DeepValueWaiting
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize("name", list(_WAITING_STEP_VALUES))
+@pytest.mark.usefixtures("_recursion_limit_of_1000")
+def test_restored_run_paused_again_with_a_deep_value_waiting_saves_the_pause(
+    name: str, how: str
+) -> None:
+    """The second pause saves its row; the run makes the calls it makes at once."""
+    value, _ = _WAITING_STEP_VALUES[name]()
+    make = _deep_value_waiting_while_a_second_review_pauses(value)
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "draft"
+        flow_id = out.context.flow_id
+
+        restored = flow_cls.from_pending(flow_id, persistence)
+        out = _failing_on_recursion(lambda: _resume(restored, how))
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "second"
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].method_name == "second"
+
+        restored = flow_cls.from_pending(flow_id, persistence)
+        out = _failing_on_recursion(lambda: _resume(restored, how))
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert sorted(calls, key=repr) == sorted(now, key=repr)
+    assert calls.count("second") == 1
+
+
+@HOWS
+def test_pending_row_whose_record_has_no_json_form_saves_without_the_record(
+    how: str,
+) -> None:
+    """The row is saved and resumes as a row without a record.
+
+    The record's own key has no JSON form, so no value's string form makes
+    it encode.
+    """
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        saved = ctx.to_dict()
+        ctx.resume_record = {**(ctx.resume_record or {}), _OPAQUE: 1}
+
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].resume_record is None
+        assert {k: v for k, v in row[1].to_dict().items() if k != "resume_record"} == {
+            k: v for k, v in saved.items() if k != "resume_record"
+        }
+        calls.clear()
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# A record whose frames are malformed counts as absent, bookkeeping and queued
+# reviews with it. ``plain_listener`` restores join progress from its
+# bookkeeping; ``two_starts`` holds ``other``'s review queued behind ``draft``.
+_SHAPES_WITH_A_RECORD: dict[str, ShapeFactory] = {
+    "plain_listener": _ch7_review_under_a_plain_listener,
+    "two_starts": _two_reviewed_starts("other"),
+}
+_MALFORMED_FRAMES: dict[str, Any] = {
+    "not_a_list": "x",
+    "an_entry_of_another_type": [7],
+    "a_dispatch_frame_with_only_its_kind": [{"kind": "dispatch"}],
+}
+
+
+def _resume_with_record(
+    make: ShapeFactory, tmpdir: str, how: str, frames: Any
+) -> tuple[list[str], list[str]]:
+    """Kick off, set the row's frames (``None``: drop the record), resume to the end.
+
+    Returns the reviewed method of each later pause and the calls after the
+    first, each by its ``repr``, sorted.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, f"{len(os.listdir(tmpdir))}.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    flow_id = out.context.flow_id
+    state, ctx = persistence.load_pending_feedback(flow_id)
+    assert isinstance(ctx.resume_record, dict)
+    ctx.resume_record = (
+        None if frames is None else {**ctx.resume_record, "frames": frames}
+    )
+    persistence.save_pending_feedback(flow_uuid=flow_id, context=ctx, state_data=state)
+    calls.clear()
+    paused_for: list[str] = []
+    for _ in range(5):
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        if not isinstance(out, HumanFeedbackPending):
+            return paused_for, sorted(map(repr, calls))
+        paused_for.append(out.context.method_name)
+    raise AssertionError("the run kept pausing")
+
+
+@HOWS
+@pytest.mark.parametrize("frames", list(_MALFORMED_FRAMES))
+@pytest.mark.parametrize("shape", list(_SHAPES_WITH_A_RECORD))
+def test_record_with_malformed_frames_resumes_as_a_row_without_the_record(
+    shape: str, frames: str, how: str
+) -> None:
+    make = _SHAPES_WITH_A_RECORD[shape]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        without = _resume_with_record(make, tmpdir, how, None)
+        got = _resume_with_record(make, tmpdir, how, _MALFORMED_FRAMES[frames])
+
+    assert got == without
