@@ -22,7 +22,11 @@ from typing import Any
 import pytest
 from crewai import Agent, Task
 from crewai.hooks import (
+    register_after_tool_call_hook,
+    register_before_llm_call_hook,
     register_before_tool_call_hook,
+    unregister_after_tool_call_hook,
+    unregister_before_llm_call_hook,
     unregister_before_tool_call_hook,
 )
 from crewai.llms.base_llm import BaseLLM, LLMCallBlockedError
@@ -237,6 +241,21 @@ def _side_effect_tool(recorder: _Recorder) -> Any:
     return delete_file
 
 
+def _run_end(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """An event set when the agent's (possibly abandoned) execution ends."""
+    ended = threading.Event()
+    execute = agent._execute_without_timeout
+
+    def tracked(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return execute(*args, **kwargs)
+        finally:
+            ended.set()
+
+    monkeypatch.setattr(agent, "_execute_without_timeout", tracked)
+    return ended
+
+
 def _raise_time(call: Any) -> tuple[float, float]:
     """Runs ``call`` and returns (seconds until TimeoutError, monotonic raise time)."""
     start = time.monotonic()
@@ -443,7 +462,10 @@ def test_v3_async_later_calls_after_timeout_are_independent(
 
 
 def test_v6a_sync_gated_tool_after_deadline_is_not_started(
-    recorder: _Recorder, prompts: list[str], approval_gate: None
+    recorder: _Recorder,
+    prompts: list[str],
+    approval_gate: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """V6a: after the error, no approval prompt, no side effect, no LLM call."""
     llm = ScriptedLLM(
@@ -452,9 +474,11 @@ def test_v6a_sync_gated_tool_after_deadline_is_not_started(
         recorder,
     )
     agent = _agent(llm, [_side_effect_tool(recorder)])
+    run_ended = _run_end(agent, monkeypatch)
 
     _, raised_at = _raise_time(lambda: agent.execute_task(_task(agent)))
-    time.sleep(3)  # let the abandoned run reach its next boundaries
+    # The abandoned run passes its tool and model boundaries before it ends.
+    assert run_ended.wait(DRAIN_BOUND)
 
     after = recorder.after(raised_at)
     assert after.count("prompt") == 0, after
@@ -548,17 +572,19 @@ def test_v6d_sync_delegated_coworker_starts_nothing_after_deadline(
 
 
 def test_v6e_sync_final_answer_after_deadline_asks_no_feedback_saves_no_memory(
-    recorder: _Recorder, prompts: list[str]
+    recorder: _Recorder, prompts: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """V6e: a final answer after the deadline: no ``human_input`` prompt, no save."""
     llm = ScriptedLLM([(2, _final("LATE ANSWER"))], "run1", recorder)
     agent = _agent(llm, [])
     agent.memory = _RecordingMemory(recorder)
+    run_ended = _run_end(agent, monkeypatch)
 
     _, raised_at = _raise_time(
         lambda: agent.execute_task(_task(agent, human_input=True))
     )
-    time.sleep(3)  # the final answer arrives at about 2 s
+    # The feedback step and the memory save come after the final answer.
+    assert run_ended.wait(DRAIN_BOUND)
 
     after = recorder.after(raised_at)
     assert after.count("prompt") == 0, after
@@ -623,3 +649,117 @@ def test_v6f_async_converter_in_tool_in_flight_builds_no_client(
     after = recorder.after(raised_at)
     assert after.count("instructor-built") == 0, after
     assert isinstance(outcome.get("result"), ConverterError), outcome
+
+
+# --- I7: no hook runs for a call the stop refuses ------------------------------
+
+
+@pytest.fixture
+def model_and_tool_hooks(prompts: list[str], recorder: _Recorder) -> Iterator[None]:
+    """A global before-LLM approval gate and an after-tool hook, removed on teardown."""
+
+    def model_gate(context: Any) -> bool | None:
+        recorder.add("hook:before-llm")
+        context.request_human_input(prompt="Allow this model call?")
+        return None
+
+    def after_tool(context: Any) -> str | None:
+        recorder.add(f"hook:after-tool:{context.tool_name}")
+        return None
+
+    register_before_llm_call_hook(model_gate)
+    register_after_tool_call_hook(after_tool)
+    try:
+        yield
+    finally:
+        unregister_before_llm_call_hook(model_gate)
+        unregister_after_tool_call_hook(after_tool)
+
+
+def test_v6g_sync_refused_calls_run_no_hooks(
+    recorder: _Recorder,
+    prompts: list[str],
+    model_and_tool_hooks: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the error, the refused tool call and model call run no hooks.
+
+    The model answers after the deadline and asks for a tool; the stop refuses
+    that tool call and the next model call. Neither the after-tool hook nor the
+    before-LLM approval gate may run for them, so no prompt appears.
+    """
+    llm = ScriptedLLM(
+        [(2, _act("delete_file", '{"path": "x"}')), (0, _final("DONE"))],
+        "run1",
+        recorder,
+    )
+    agent = _agent(llm, [_side_effect_tool(recorder)])
+    run_ended = _run_end(agent, monkeypatch)
+
+    _, raised_at = _raise_time(lambda: agent.execute_task(_task(agent)))
+    assert run_ended.wait(DRAIN_BOUND)
+
+    after = recorder.after(raised_at)
+    assert [lb for lb in after if lb.startswith("hook:")] == [], after
+    assert after.count("prompt") == 0, after
+    assert after.count("side-effect") == 0, after
+    assert [lb for lb in after if lb.startswith("llm:")] == [], after
+
+
+def test_v6h_async_refused_model_call_in_flight_step_runs_no_hooks(
+    recorder: _Recorder, prompts: list[str], model_and_tool_hooks: None
+) -> None:
+    """On async, a co-worker started by the step in flight runs no model hook.
+
+    The tool in flight at the deadline delegates to a co-worker after 2 s. The
+    co-worker's model call is refused, and its before-LLM approval gate must
+    not run, so no prompt appears.
+    """
+    tool_done = threading.Event()
+    outcome: dict[str, Any] = {}
+    coworker = Agent(
+        role="Coworker",
+        goal="Help",
+        backstory="You help.",
+        llm=ScriptedLLM([(0, _final("CO-DONE"))], "coworker", recorder),
+        allow_delegation=False,
+        max_retry_limit=0,
+    )
+
+    @tool("ask_coworker")
+    def ask_coworker(q: str) -> str:
+        """Delegate the question to a co-worker after 2 seconds."""
+        try:
+            time.sleep(2)
+            try:
+                outcome["co"] = str(coworker.execute_task(_task(coworker, "Sub")))
+            except Exception as e:  # noqa: BLE001 - recorded and asserted below
+                outcome["co"] = e
+            return "asked"
+        finally:
+            tool_done.set()
+
+    outer = _agent(
+        ScriptedLLM([(0, _act("ask_coworker", '{"q": "x"}'))], "outer", recorder),
+        [ask_coworker],
+    )
+
+    async def scenario() -> float:
+        try:
+            await outer.aexecute_task(_task(outer))
+        except TimeoutError:
+            return time.monotonic()
+        pytest.fail("aexecute_task did not raise TimeoutError")
+
+    try:
+        raised_at = asyncio.run(scenario())
+    finally:
+        assert tool_done.wait(DRAIN_BOUND)
+
+    # The tool in flight runs to its end with its own hooks; only the model
+    # call it starts after the deadline is refused.
+    after = recorder.after(raised_at)
+    assert after.count("hook:before-llm") == 0, after
+    assert after.count("prompt") == 0, after
+    assert [lb for lb in after if lb.startswith("llm:")] == [], after
+    assert isinstance(outcome.get("co"), Exception), outcome
