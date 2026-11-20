@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import closing
 import enum
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 from datetime import datetime
@@ -4863,18 +4865,24 @@ def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_i
         pending = flow_cls(persistence=persistence).kickoff()
         assert isinstance(pending, HumanFeedbackPending)
         flow_id = pending.context.flow_id
-        state, ctx = persistence.load_pending_feedback(flow_id)
-        record = dict(ctx.resume_record or {})
-        frames = record["frames"]
-        assert any(frame["kind"] == "dispatch" for frame in frames)
-        record["frames"] = [
-            {**frame, "result": forged} if frame["kind"] == "dispatch" else frame
-            for frame in frames
-        ]
-        ctx.resume_record = record
-        persistence.save_pending_feedback(
-            flow_uuid=flow_id, context=ctx, state_data=state
-        )
+        # The row is written straight into SQLite: saving it through the
+        # persistence would build its stored form, which nests past the limit.
+        with closing(sqlite3.connect(persistence.db_path)) as conn, conn:
+            (text,) = conn.execute(
+                "SELECT context_json FROM pending_feedback WHERE flow_uuid = ?",
+                (flow_id,),
+            ).fetchone()
+            row = json.loads(text)
+            frames = row["resume_record"]["frames"]
+            assert any(frame["kind"] == "dispatch" for frame in frames)
+            row["resume_record"]["frames"] = [
+                {**frame, "result": forged} if frame["kind"] == "dispatch" else frame
+                for frame in frames
+            ]
+            conn.execute(
+                "UPDATE pending_feedback SET context_json = ? WHERE flow_uuid = ?",
+                (json.dumps(row), flow_id),
+            )
         calls.clear()
 
         out = _resume(flow_cls.from_pending(flow_id, persistence), how)
