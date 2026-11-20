@@ -9,11 +9,10 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
-# When searching the vector store, we ask for more results than the caller
-# requested so that post-search steps (composite scoring, deduplication,
-# category filtering) have enough candidates to fill the final result set.
-# For example, if the caller asks for 10 results and this is 2, we fetch 20
-# from the vector store and then trim down after scoring.
+# Default factor by which deep recall over-fetches from the vector store: it asks
+# for this many times the requested limit so that post-search steps (composite
+# scoring, deduplication, category filtering) have enough candidates to fill the
+# final result set.
 _RECALL_OVERSAMPLE_FACTOR = 2
 
 
