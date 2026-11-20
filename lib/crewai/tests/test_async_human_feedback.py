@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import closing
+import dataclasses
 import enum
 import json
 import os
@@ -5928,3 +5929,197 @@ def test_pending_review_with_a_value_without_a_json_form_still_pauses(
         or (isinstance(got, str) and got == stored)
         or (faithful and type(got) is type(value) and repr(got) == repr(value))
     ), f"fin got {type(got).__name__}"
+
+
+# Values whose conversion raises an exception other than a type, value or
+# recursion error: a string form that raises, and a dataclass whose copy
+# raises. The pause still saves, with the string form, or the type's name in
+# angle brackets when that raises too.
+class _RaisingStr:
+    def __str__(self) -> str:
+        raise RuntimeError("no string form")
+
+    __repr__ = __str__
+
+
+class _NoCopy:
+    def __deepcopy__(self, memo: Any) -> Any:
+        raise RuntimeError("no copy")
+
+
+@dataclasses.dataclass
+class _HoldsNoCopy:
+    item: Any
+
+
+_RAISING_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "plain": lambda: ("P", "P"),
+    "raising_str": lambda: (_RaisingStr(), "<_RaisingStr>"),
+    "dataclass_no_copy": lambda: (
+        (held := _HoldsNoCopy(_NoCopy())),
+        str(held),
+    ),
+}
+
+
+class _QueuedValuesReview:
+    """Pause for review; ``other``'s pause carries ``extra`` in its metadata and info."""
+
+    def __init__(self, extra: Any, field: str) -> None:
+        self.extra = extra
+        self.field = field
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if context.method_name != "other" or self.field == "output":
+            raise HumanFeedbackPending(context=context)
+        if self.field == "metadata":
+            context.metadata = {**context.metadata, "extra": self.extra}
+            raise HumanFeedbackPending(context=context)
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": "T", "extra": self.extra}
+        )
+
+
+def _queued_value_beside_a_review(
+    value: Any, field: str, at: str
+) -> Callable[..., type[Flow]]:
+    """``draft`` and ``other`` pause together; ``other`` is queued with ``value``.
+
+    ``value`` is ``other``'s output, an entry of its metadata or of its
+    callback info. Both are reviewed without ``emit``: a review with ``emit``
+    runs as a router, one at a time. With ``at="kickoff"`` both are starts;
+    with ``at="resume"`` both listen on ``first``, so they pause together
+    while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _QueuedValuesReview(value, field)
+        signal = _SignalledReview(review)  # type: ignore[arg-type]
+        signalled = human_feedback(message="Review:", provider=signal)
+        plain = human_feedback(message="Review:", provider=review)
+        output = value if field == "output" else "O"
+
+        class AtKickoff(Flow):
+            @start()
+            @signalled
+            def draft(self):
+                return "D"
+
+            @start()
+            @plain
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("other")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        class AtResume(Flow):
+            @start()
+            @plain
+            def first(self):
+                return "F"
+
+            @listen("first")
+            @signalled
+            def draft(self):
+                return "D"
+
+            @listen("first")
+            @plain
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("other")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+_QUEUED_RAISING = [
+    ("plain", "output"),
+    ("plain", "metadata"),
+    ("plain", "callback_info"),
+    ("raising_str", "output"),
+    ("raising_str", "metadata"),
+    ("raising_str", "callback_info"),
+    ("dataclass_no_copy", "output"),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES + [("kickoff", "same_instance")])
+@pytest.mark.parametrize(("name", "field"), _QUEUED_RAISING)
+def test_queued_review_with_a_value_whose_conversion_raises_still_pauses(
+    name: str, field: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row; ``other``'s value comes back live or as its string form."""
+    value, stored = _RAISING_VALUES[name]()
+    calls: list[Any] = []
+    flow_cls = _queued_value_beside_a_review(value, field, at)(calls)
+    expected = ["draft", "other"] if at == "kickoff" else ["first", "draft", "other"]
+    pauses: list[HumanFeedbackPending] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(out, HumanFeedbackPending)
+        pauses.append(out)
+        flow_id = out.context.flow_id
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == pauses[-1].context.method_name
+            out = _resume(flow, how)
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            pauses.append(out)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert [p.context.method_name for p in pauses] == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert len(calls) == 1
+    result = calls[0][1]
+    assert isinstance(result, HumanFeedbackResult)
+    assert result.method_name == "other"
+    if field == "output":
+        got = result.output
+    elif field == "metadata":
+        got = result.metadata.get("extra")
+    else:
+        info = pauses[-1].callback_info
+        assert isinstance(info, dict)
+        assert info.get("ticket") == "T"
+        got = info.get("extra")
+    assert got is value or (isinstance(got, str) and got == stored), (
+        f"got {type(got).__name__}"
+    )
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+def test_step_value_whose_copy_raises_still_pauses(at: str, second: str, how: str) -> None:
+    """``use`` gets the live dataclass, or after a restore its string form."""
+    value, stored = _RAISING_VALUES["dataclass_no_copy"]()
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if second == "restored":
+        assert got[0][1] == stored
+    else:
+        assert got[0][1] is value
