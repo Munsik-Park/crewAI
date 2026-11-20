@@ -18,6 +18,7 @@ import enum
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 from datetime import datetime
@@ -4806,18 +4807,40 @@ def _nested(depth: int, leaf: Any, wrap: Callable[[Any], Any]) -> Any:
     return value
 
 
+def _past_the_limit() -> int:
+    """A depth that no recursive walk reaches within the current recursion limit."""
+    return 5 * sys.getrecursionlimit()
+
+
+def _deep_dicts(depth: int) -> tuple[Any, str]:
+    """``{"k": {"k": ... 1}}`` ``depth`` deep, and the string form stored for it.
+
+    The string form is built without recursion. Python 3.10 and 3.11 cannot
+    take ``str()`` of a dict nested past the recursion limit; there the value
+    is stored as its type's name in angle brackets.
+    """
+    value = _nested(depth, 1, lambda v: {"k": v})
+    try:
+        str(value)
+    except RecursionError:
+        return value, "<dict>"
+    return value, "{'k': " * depth + "1" + "}" * depth
+
+
 _CYCLIC_DICT: dict[str, Any] = {"k": 1}
 _CYCLIC_DICT["self"] = _CYCLIC_DICT
 _CYCLIC_LIST: list[Any] = [1]
 _CYCLIC_LIST.append(_CYCLIC_LIST)
-_UNBUILDABLE_STEP_VALUES = {
-    "cyclic_dict": (_CYCLIC_DICT, "{'k': 1, 'self': {...}}"),
-    "cyclic_list": (_CYCLIC_LIST, "[1, [...]]"),
-    "deep_dicts": (
-        _nested(5000, 1, lambda v: {"k": v}),
-        None,
+# Each entry builds the value and the string form stored for it when the
+# test runs, so the depths follow the recursion limit in force.
+_UNBUILDABLE_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "cyclic_dict": lambda: (_CYCLIC_DICT, "{'k': 1, 'self': {...}}"),
+    "cyclic_list": lambda: (_CYCLIC_LIST, "[1, [...]]"),
+    "deep_dicts": lambda: _deep_dicts(_past_the_limit()),
+    "deep_repr": lambda: (
+        _nested(_past_the_limit(), None, _DeepRepr),
+        "<_DeepRepr>",
     ),
-    "deep_repr": (_nested(5000, None, _DeepRepr), "<_DeepRepr>"),
 }
 
 
@@ -4828,11 +4851,8 @@ _UNBUILDABLE_STEP_VALUES = {
 def test_step_value_with_no_buildable_stored_form_still_pauses(
     name: str, kind: str, at: str, second: str, how: str
 ) -> None:
-    """``use`` gets the live value, or after a restore its stored string form.
-
-    ``deep_dicts`` has a string form, so it is stored as ``str()`` of it.
-    """
-    value, stored = _UNBUILDABLE_STEP_VALUES[name]
+    """``use`` gets the live value, or after a restore its stored string form."""
+    value, stored = _UNBUILDABLE_STEP_VALUES[name]()
     make = _step_value_beside_a_review(value, kind, at)
     with tempfile.TemporaryDirectory() as tmpdir:
         now = _run_at_once(make, tmpdir)
@@ -4846,7 +4866,7 @@ def test_step_value_with_no_buildable_stored_form_still_pauses(
     got = [c for c in before + after if c[0] == "use"]
     assert len(got) == 1
     if kind == "emit" and second == "restored":
-        assert got[0][1] == (str(value) if stored is None else stored)
+        assert got[0][1] == stored
     else:
         assert got[0][1] is value
 
@@ -4858,8 +4878,17 @@ def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_i
     """A frame whose value cannot be rebuilt is malformed; resume ignores the frames."""
     calls: list[Any] = []
     flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
-    deep_key = _nested(900, "k", lambda v: {"__crewai_record_tuple__": [v]})
-    forged = {"__crewai_record_dict__": [[deep_key, "x"]]}
+    # A dict keyed by a tuple nested in tuples, past the limit. Its JSON is
+    # built as text, since encoding it would nest past the limit too.
+    depth = sys.getrecursionlimit() * 9 // 10
+    forged = (
+        '{"__crewai_record_dict__": [['
+        + '{"__crewai_record_tuple__": [' * depth
+        + '"k"'
+        + "]}" * depth
+        + ', "x"]]}'
+    )
+    placeholder = "forged frame result"
     with tempfile.TemporaryDirectory() as tmpdir:
         persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
         pending = flow_cls(persistence=persistence).kickoff()
@@ -4876,12 +4905,15 @@ def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_i
             frames = row["resume_record"]["frames"]
             assert any(frame["kind"] == "dispatch" for frame in frames)
             row["resume_record"]["frames"] = [
-                {**frame, "result": forged} if frame["kind"] == "dispatch" else frame
+                {**frame, "result": placeholder}
+                if frame["kind"] == "dispatch"
+                else frame
                 for frame in frames
             ]
+            text = json.dumps(row).replace(json.dumps(placeholder), forged)
             conn.execute(
                 "UPDATE pending_feedback SET context_json = ? WHERE flow_uuid = ?",
-                (json.dumps(row), flow_id),
+                (text, flow_id),
             )
         calls.clear()
 
@@ -5176,7 +5208,6 @@ def test_empty_outcome_reaches_the_reviewed_methods_listeners_after_resume(
 @pytest.fixture
 def _json_encoding_as_on_python_3_10(monkeypatch: pytest.MonkeyPatch) -> Any:
     import json.encoder
-    import sys
 
     monkeypatch.setattr(json.encoder, "c_make_encoder", None)
     limit = sys.getrecursionlimit()
@@ -5187,10 +5218,16 @@ def _json_encoding_as_on_python_3_10(monkeypatch: pytest.MonkeyPatch) -> Any:
         sys.setrecursionlimit(limit)
 
 
-# ``int_keys_350`` builds a stored form within the limit (about one frame per
-# level), and that form's JSON (three levels per level) nests past it.
-_DEEP_STEP_VALUES = {
-    "int_keys_350": (_nested(350, 1, lambda v: {1: v}), None),
+def _int_keys(depth: int) -> tuple[Any, str]:
+    """``{1: {1: ... 1}}`` ``depth`` deep, and its ``str()`` built without recursion."""
+    return _nested(depth, 1, lambda v: {1: v}), "{1: " * depth + "1" + "}" * depth
+
+
+# ``int_keys_350`` (350 deep at the limit of 1000) builds a stored form within
+# the limit (about one frame per level), and that form's JSON (three levels
+# per level) nests past it.
+_DEEP_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "int_keys_350": lambda: _int_keys(sys.getrecursionlimit() * 35 // 100),
     "deep_dicts": _UNBUILDABLE_STEP_VALUES["deep_dicts"],
     "deep_repr": _UNBUILDABLE_STEP_VALUES["deep_repr"],
 }
@@ -5205,7 +5242,7 @@ def test_deep_step_value_pauses_when_its_json_nests_past_the_limit(
     name: str, kind: str, at: str, second: str, how: str
 ) -> None:
     """The pause saves; after a restore ``use`` gets the value's stored string form."""
-    value, stored = _DEEP_STEP_VALUES[name]
+    value, stored = _DEEP_STEP_VALUES[name]()
     make = _step_value_beside_a_review(value, kind, at)
     with tempfile.TemporaryDirectory() as tmpdir:
         now = _run_at_once(make, tmpdir)
@@ -5219,6 +5256,332 @@ def test_deep_step_value_pauses_when_its_json_nests_past_the_limit(
     got = [c for c in before + after if c[0] == "use"]
     assert len(got) == 1
     if kind == "emit" and second == "restored":
-        assert got[0][1] == (str(value) if stored is None else stored)
+        assert got[0][1] == stored
     else:
         assert got[0][1] is value
+
+
+# ``and_`` and ``or_`` routers on a reviewed method, its trigger or the method
+# upstream of it. ``draft`` is reviewed twice: answered ``rejected``, which
+# runs it again, then ``approved``. Each paused run gives the same calls as
+# the run answered at once, so each router runs as often.
+
+_LOOP_ANSWERS = ("rejected", "approved")
+
+
+class _ScriptedReview:
+    """Answers the reviews in turn from ``_LOOP_ANSWERS``; pauses for those in ``pause_at``."""
+
+    def __init__(self, pause_at: tuple[int, ...]) -> None:
+        self.pause_at = set(pause_at)
+        self.asked = 0
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        index = self.asked
+        self.asked += 1
+        if index in self.pause_at:
+            raise HumanFeedbackPending(context=context)
+        return _LOOP_ANSWERS[index]
+
+
+def _feedback_as_outcome(
+    self: Flow, feedback: str, outcomes: Any, llm: Any
+) -> str:
+    """The feedback text is the outcome, so no LLM is called."""
+    return feedback.strip()
+
+
+_ROUTER_CONDITIONS: dict[str, Callable[[], Any]] = {
+    "and_upstream": lambda: and_("seed", "draft"),
+    "or_upstream": lambda: or_("seed", "draft"),
+    "and_trigger": lambda: and_("prep", "draft"),
+    "or_trigger": lambda: or_("prep", "draft"),
+    "and_outcome": lambda: and_("draft", "rejected"),
+    "or_outcome": lambda: or_("draft", "rejected"),
+}
+
+
+def _router_on_a_looping_review(role: str, condition: str) -> Callable[..., type[Flow]]:
+    """``gate`` routes on ``condition``; ``draft`` runs again on ``rejected``.
+
+    As a listener ``draft`` listens on ``prep``, which listens on ``seed``; as
+    a start it listens on ``rejected`` only.
+    """
+
+    def make(review: _ScriptedReview, calls: list[Any]) -> type[Flow]:
+        reviewed = human_feedback(
+            message="Review:",
+            emit=list(_LOOP_ANSWERS),
+            llm="gpt-4o-mini",
+            default_outcome="approved",
+            provider=review,
+        )
+
+        class ReviewedListener(Flow):
+            _collapse_to_outcome = _feedback_as_outcome
+
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @listen("seed")
+            def prep(self):
+                calls.append("prep")
+
+            @listen(or_("prep", "rejected"))
+            @reviewed
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @router(_ROUTER_CONDITIONS[condition]())
+            def gate(self):
+                calls.append("gate")
+                return "gated"
+
+            @listen("gated")
+            def after_gate(self):
+                calls.append("after_gate")
+
+            @listen("approved")
+            def done(self):
+                calls.append("done")
+
+        class ReviewedStart(Flow):
+            _collapse_to_outcome = _feedback_as_outcome
+
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @listen("seed")
+            def prep(self):
+                calls.append("prep")
+
+            @start()
+            @listen("rejected")
+            @reviewed
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @router(_ROUTER_CONDITIONS[condition]())
+            def gate(self):
+                calls.append("gate")
+                return "gated"
+
+            @listen("gated")
+            def after_gate(self):
+                calls.append("after_gate")
+
+            @listen("approved")
+            def done(self):
+                calls.append("done")
+
+        return ReviewedListener if role == "listener" else ReviewedStart
+
+    return make
+
+
+def _run_scripted(
+    make: Callable[..., type[Flow]],
+    tmpdir: str,
+    how: str,
+    pause_at: tuple[int, ...],
+    restore_each_time: bool,
+) -> tuple[list[Any], list[int]]:
+    """Kick off, then resume each pause with its scripted answer until the run ends.
+
+    Returns the calls and the index of each review paused for. The first
+    resume is on a restored flow; a later one is on a restored flow, or on the
+    flow first restored.
+    """
+    calls: list[Any] = []
+    review = _ScriptedReview(pause_at)
+    flow_cls = make(review, calls)
+    persistence = SQLiteFlowPersistence(
+        os.path.join(tmpdir, f"scripted-{'-'.join(map(str, pause_at))}.db")
+    )
+    out = flow_cls(persistence=persistence).kickoff()
+    paused_for: list[int] = []
+    flow: Flow | None = None
+    for _ in range(5):
+        if not isinstance(out, HumanFeedbackPending):
+            return calls, paused_for
+        paused_for.append(review.asked - 1)
+        if flow is None or restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+        out = _resume(flow, how, _LOOP_ANSWERS[review.asked - 1])
+    raise AssertionError("the run kept pausing")
+
+
+# The reviews paused for, and how a second pause is resumed.
+_LOOP_PAUSES = [
+    ((0,), "restored"),
+    ((1,), "restored"),
+    ((0, 1), "restored"),
+    ((0, 1), "same_instance"),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(
+    ("pause_at", "second"),
+    _LOOP_PAUSES,
+    ids=["first", "second", "both-restored", "both-same_instance"],
+)
+@pytest.mark.parametrize("condition", list(_ROUTER_CONDITIONS))
+@pytest.mark.parametrize("role", ["listener", "start"])
+def test_and_or_router_on_a_looping_review_runs_as_answered_at_once(
+    role: str, condition: str, pause_at: tuple[int, ...], second: str, how: str
+) -> None:
+    make = _router_on_a_looping_review(role, condition)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now, _ = _run_scripted(make, tmpdir, how, (), restore_each_time=True)
+        calls, paused_for = _run_scripted(
+            make, tmpdir, how, pause_at, restore_each_time=second == "restored"
+        )
+
+    # Where the run answered at once reviews ``draft`` once, the second
+    # review is never reached.
+    assert paused_for == [index for index in pause_at if index < now.count("draft")]
+    assert calls.count("gate") == now.count("gate")
+    assert sorted(calls) == sorted(now)
+
+
+# A review queued behind another whose provider gave ``callback_info`` with
+# no faithful JSON form: the pause still saves, and the queued review pauses
+# with the entries that have one and the string form of the others.
+
+
+def _callback_info(kind: str) -> dict[str, Any]:
+    if kind == "cyclic":
+        cycle: dict[str, Any] = {}
+        cycle["self"] = cycle
+        return {"ticket": "T", "extra": cycle}
+    if kind == "deep":
+        return {"ticket": "T", "extra": _nested(_past_the_limit(), 1, lambda v: {"k": v})}
+    return {"ticket": "T", "extra": _OPAQUE}
+
+
+class _InfoReview:
+    """Pause for review; ``other``'s pause gives ``info`` as its callback info."""
+
+    def __init__(self, info: dict[str, Any]) -> None:
+        self.info = info
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        info = self.info if context.method_name == "other" else {"ticket": "T-draft"}
+        raise HumanFeedbackPending(context=context, callback_info=info)
+
+
+def _failing_on_recursion(run: Callable[[], Any]) -> Any:
+    """``run()``; a ``RecursionError`` fails the test with its message only.
+
+    Its traceback is too deep for pytest to report within the test timeout,
+    so the failure is raised outside the handler, with no exception context.
+    """
+    try:
+        return run()
+    except RecursionError as error:
+        message = f"raised {error!r}"
+    pytest.fail(message, pytrace=False)
+
+
+@HOWS
+@pytest.mark.parametrize("kind", ["cyclic", "deep", "opaque"])
+def test_queued_review_with_callback_info_without_a_json_form_still_pauses(
+    kind: str, how: str
+) -> None:
+    calls: list[Any] = []
+    signal = _SignalledReview(_InfoReview(_callback_info(kind)))  # type: ignore[arg-type]
+
+    class Queued(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = _failing_on_recursion(Queued(persistence=persistence).kickoff)
+        assert isinstance(first, HumanFeedbackPending)
+        flow_id = first.context.flow_id
+        assert first.context.method_name == "draft"
+        assert persistence.load_pending_feedback(flow_id) is not None
+        second = _failing_on_recursion(
+            lambda: _resume(Queued.from_pending(flow_id, persistence), how)
+        )
+        assert isinstance(second, HumanFeedbackPending)
+        assert second.context.method_name == "other"
+        out = _failing_on_recursion(
+            lambda: _resume(Queued.from_pending(flow_id, persistence), how)
+        )
+
+    info = second.callback_info
+    assert isinstance(info, dict)
+    assert info["ticket"] == "T"
+    assert isinstance(info["extra"], str)
+    if kind == "opaque":
+        assert info["extra"] == "opaque"
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+
+
+# A saved record whose join and ``or_`` bookkeeping lists hold values that
+# cannot be set members is malformed: resume goes on as for a row without it.
+_UNHASHABLE_BOOKKEEPING: dict[str, tuple[str, Any]] = {
+    "pending_events_dict_member": ("pending_events", {"draft": [{}]}),
+    "pending_events_list_member": ("pending_events", {"draft": [["seed"]]}),
+    "fired_or_listeners_dict_member": ("fired_or_listeners", [{}]),
+    "fired_or_listeners_list_member": ("fired_or_listeners", [["audit"]]),
+    "completed_methods_dict_member": ("completed_methods", [{}]),
+    "completed_methods_list_member": ("completed_methods", [["seed"]]),
+}
+
+
+@HOWS
+@pytest.mark.parametrize("name", list(_UNHASHABLE_BOOKKEEPING))
+def test_record_with_unhashable_bookkeeping_resumes_as_a_row_without_it(
+    name: str, how: str
+) -> None:
+    key, broken = _UNHASHABLE_BOOKKEEPING[name]
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        assert isinstance(ctx.resume_record, dict)
+        assert key in ctx.resume_record
+        ctx.resume_record = {**ctx.resume_record, key: broken}
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
