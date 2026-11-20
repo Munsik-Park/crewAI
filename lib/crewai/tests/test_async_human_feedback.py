@@ -4779,3 +4779,137 @@ def test_step_value_shaped_like_a_record_tag_resumes_as_that_value(
 
     assert now == [("use", value)]
     assert repr(before + after) == repr(now)
+
+
+# Step values whose stored form cannot be built: cycles and nesting past the
+# recursion limit. The pause still saves, and the value is stored as its
+# string form, or as its type's name in angle brackets when that cannot be
+# taken either.
+
+
+class _DeepRepr:
+    """A chain of objects whose string form recurses once per link."""
+
+    def __init__(self, child: Any = None) -> None:
+        self.child = child
+
+    def __repr__(self) -> str:
+        return f"_DeepRepr({self.child!r})"
+
+
+def _nested(depth: int, leaf: Any, wrap: Callable[[Any], Any]) -> Any:
+    value = leaf
+    for _ in range(depth):
+        value = wrap(value)
+    return value
+
+
+_CYCLIC_DICT: dict[str, Any] = {"k": 1}
+_CYCLIC_DICT["self"] = _CYCLIC_DICT
+_CYCLIC_LIST: list[Any] = [1]
+_CYCLIC_LIST.append(_CYCLIC_LIST)
+_UNBUILDABLE_STEP_VALUES = {
+    "cyclic_dict": (_CYCLIC_DICT, "{'k': 1, 'self': {...}}"),
+    "cyclic_list": (_CYCLIC_LIST, "[1, [...]]"),
+    "deep_dicts": (
+        _nested(5000, 1, lambda v: {"k": v}),
+        None,
+    ),
+    "deep_repr": (_nested(5000, None, _DeepRepr), "<_DeepRepr>"),
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_UNBUILDABLE_STEP_VALUES))
+def test_step_value_with_no_buildable_stored_form_still_pauses(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """``use`` gets the live value, or after a restore its stored string form.
+
+    ``deep_dicts`` has a string form, so it is stored as ``str()`` of it.
+    """
+    value, stored = _UNBUILDABLE_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if kind == "emit" and second == "restored":
+        assert got[0][1] == (str(value) if stored is None else stored)
+    else:
+        assert got[0][1] is value
+
+
+@HOWS
+def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_its_frames(
+    how: str,
+) -> None:
+    """A frame whose value cannot be rebuilt is malformed; resume ignores the frames."""
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    deep_key = _nested(900, "k", lambda v: {"__crewai_record_tuple__": [v]})
+    forged = {"__crewai_record_dict__": [[deep_key, "x"]]}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        record = dict(ctx.resume_record or {})
+        frames = record["frames"]
+        assert any(frame["kind"] == "dispatch" for frame in frames)
+        record["frames"] = [
+            {**frame, "result": forged} if frame["kind"] == "dispatch" else frame
+            for frame in frames
+        ]
+        ctx.resume_record = record
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# User dicts shaped like the record's dict tag, at other depths and beside a
+# tuple-tag-shaped key: each comes back as that dict, not as a keyed dict.
+_DICT_TAG_SHAPED_STEP_VALUES = {
+    "in_a_list": [{"__crewai_record_dict__": [[1, "v"]]}],
+    "under_an_int_key": {1: {"__crewai_record_dict__": [["k", 2]]}},
+    "with_a_tuple_tag_key": {
+        "__crewai_record_dict__": [[{"__crewai_record_tuple__": ["a", 1]}, "x"]]
+    },
+    "in_a_review_output": {"out": {"__crewai_record_dict__": []}},
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_DICT_TAG_SHAPED_STEP_VALUES))
+def test_step_value_shaped_like_the_dict_tag_resumes_as_that_value(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _DICT_TAG_SHAPED_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    assert repr(before + after) == repr(now)
