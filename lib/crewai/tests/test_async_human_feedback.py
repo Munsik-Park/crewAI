@@ -1835,10 +1835,6 @@ class TestLearnOnResume:
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
 
 
-# Resuming a routed review gives the reviewed method's own subscribers what an
-# answer given at once gives them.
-
-
 class _Review:
     """Pause for review, or answer at once with an empty reply."""
 
