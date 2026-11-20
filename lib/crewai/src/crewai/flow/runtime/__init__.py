@@ -17,6 +17,7 @@ import dataclasses
 from datetime import datetime, timezone
 import enum
 import inspect
+import json
 import logging
 from pathlib import Path
 import threading
@@ -492,12 +493,20 @@ def _stored_form(value: Any) -> Any:
 def _stored_record_value(value: Any) -> Any:
     """The form a record value is saved in; its string form when it has none.
 
-    A cycle, or nesting past the recursion limit, also has no stored form.
+    A cycle, nesting past the recursion limit, or a stored form whose JSON
+    encoding nests past that limit also has no stored form. The JSON encoding
+    is tried here, where the call stack already holds the levels of the record
+    around the value.
     """
     try:
-        return _stored_form(value)
+        stored = _stored_form(value)
     except (_NoStoredForm, TypeError, ValueError, RecursionError):
         return _string_form(value)
+    try:
+        json.dumps(stored, default=str)
+    except RecursionError:
+        return _string_form(value)
+    return stored
 
 
 def _encode_record_value(value: Any) -> LiveRecordValue:
