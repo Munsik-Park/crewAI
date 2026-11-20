@@ -382,10 +382,11 @@ class _DispatchState(_DispatchStateKeys, total=False):
     ``batch`` holds the routers of the current trigger not yet finished,
     ``trigger_index`` the trigger whose listeners run next, and ``stage``
     whether that trigger's listeners or only its gated starts remain.
-    ``started`` holds the gated starts already run for that trigger. ``ran``
-    holds the methods already run per trigger, so a conditional start that also
-    listens to the same event is not run a second time. ``inflight_result`` is
-    the result of the first router in ``batch`` when it has already returned.
+    ``started`` holds the starts whose condition was already checked for that
+    trigger. ``ran`` holds the methods already run per trigger, so a
+    conditional start that also listens to the same event is not run a second
+    time. ``inflight_result`` is the result of the first router in ``batch``
+    when it has already returned.
     """
 
     inflight_result: str | None
@@ -3787,16 +3788,15 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         )
             if trigger and trigger in router_results:
                 for method_name in self._start_method_names():
-                    if (
-                        method_name in ran.get(trigger, set())
-                        or method_name in st["started"]
-                    ):
-                        continue
-                    if not self._start_condition_triggered_by(
-                        method_name, current_trigger
-                    ):
+                    if method_name in st["started"]:
                         continue
                     st["started"].append(str(method_name))
+                    # The condition records the trigger even for a start that
+                    # already ran as one of the trigger's listeners.
+                    if not self._start_condition_triggered_by(
+                        method_name, current_trigger
+                    ) or method_name in ran.get(trigger, set()):
+                        continue
                     if method_name in self._completed_methods:
                         # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
                         was_resuming = self._is_execution_resuming
