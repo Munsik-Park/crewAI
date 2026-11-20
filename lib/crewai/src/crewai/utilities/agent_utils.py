@@ -60,6 +60,10 @@ from crewai.utilities.errors import AgentRepositoryError
 from crewai.utilities.exceptions.context_window_exceeding_exception import (
     LLMContextLengthExceededError,
 )
+from crewai.utilities.execution_stop import (
+    EXECUTION_STOPPED_MESSAGE,
+    execution_stopped,
+)
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.message_utils import (
     format_message_for_llm,
@@ -501,6 +505,10 @@ def _prepare_llm_call(
     if executor_context is None:
         yield messages
         return
+
+    # Refuse before the hooks run, so a stopped run gets no approval prompt.
+    if execution_stopped():
+        raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
 
     if not _setup_before_llm_call_hooks(executor_context, printer, verbose=verbose):
         raise LLMCallBlockedError("LLM call blocked by before_llm_call hook")
@@ -1559,6 +1567,7 @@ def execute_single_native_tool_call(
     )
     from crewai.hooks.tool_hooks import (
         ToolCallHookContext,
+        refused_by_stop,
         run_after_tool_call_hooks,
         run_before_tool_call_hooks,
     )
@@ -1721,7 +1730,11 @@ def execute_single_native_tool_call(
         tool_result=result,
         raw_tool_result=raw_tool_result,
     )
-    modified_result = run_after_tool_call_hooks(after_hook_context)
+    modified_result = (
+        None
+        if refused_by_stop(hook_blocked)
+        else run_after_tool_call_hooks(after_hook_context)
+    )
     if modified_result is not None:
         result = modified_result
 

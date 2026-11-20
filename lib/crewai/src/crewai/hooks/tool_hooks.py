@@ -194,6 +194,15 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
         return True
 
 
+def refused_by_stop(blocked: bool) -> bool:
+    """Whether a blocked tool call was refused because its run was stopped.
+
+    Such a call runs no ``post_tool_call`` hook either, since the run that
+    asked for it is over.
+    """
+    return blocked and execution_stopped()
+
+
 def run_after_tool_call_hooks(context: ToolCallHookContext) -> str | None:
     """Run all ``post_tool_call`` hooks against a context.
 

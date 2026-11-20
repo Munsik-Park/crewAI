@@ -1107,10 +1107,14 @@ class Agent(BaseAgent):
         """
         ctx = contextvars.copy_context()
         stop = threading.Event()
+        # Bound now: the worker may start after the deadline has detached it.
+        run_executor = self.agent_executor
 
         def run_timed() -> Any:
             enter_timed_run(stop)
-            return self._execute_without_timeout(task_prompt=task_prompt, task=task)
+            return self._execute_without_timeout(
+                task_prompt=task_prompt, task=task, agent_executor=run_executor
+            )
 
         # Not a ``with`` block: leaving it would join the worker, and the caller
         # must not wait for work that outlives the deadline.
@@ -1143,24 +1147,31 @@ class Agent(BaseAgent):
         self.agent_executor = None
         self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
 
-    def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    def _execute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        agent_executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            agent_executor: The executor to run; defaults to the agent's.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        executor = agent_executor or self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        invoke_result = self.agent_executor.invoke(
+        invoke_result = executor.invoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1274,10 +1285,13 @@ class Agent(BaseAgent):
             RuntimeError: If execution fails for other reasons.
         """
         stop = threading.Event()
+        run_executor = self.agent_executor
 
         async def run_timed() -> Any:
             enter_timed_run(stop)
-            return await self._aexecute_without_timeout(task_prompt, task)
+            return await self._aexecute_without_timeout(
+                task_prompt, task, agent_executor=run_executor
+            )
 
         # A task of its own copies the caller's context, so the stop mark set in
         # it never reaches the caller (``wait_for`` would otherwise run the
@@ -1292,24 +1306,31 @@ class Agent(BaseAgent):
                 "Consider increasing max_execution_time or optimizing the task."
             ) from e
 
-    async def _aexecute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    async def _aexecute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        agent_executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout asynchronously.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            agent_executor: The executor to run; defaults to the agent's.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        executor = agent_executor or self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        result = await self.agent_executor.ainvoke(
+        result = await executor.ainvoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )

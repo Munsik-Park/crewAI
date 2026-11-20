@@ -66,6 +66,7 @@ from crewai.hooks.llm_hooks import (
 )
 from crewai.hooks.tool_hooks import (
     ToolCallHookContext,
+    refused_by_stop,
     run_after_tool_call_hooks,
     run_before_tool_call_hooks,
 )
@@ -2408,7 +2409,8 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         elif not from_cache:
             tool_failure = self._unknown_tool_failure(func_name, result)
 
-        # Execute after_tool_call hooks (even if blocked, to allow logging/monitoring)
+        # Execute after_tool_call hooks (even if blocked, to allow logging/monitoring),
+        # except for a call refused because the run was stopped.
         after_hook_context = ToolCallHookContext(
             tool_name=func_name,
             tool_input=args_dict,
@@ -2419,7 +2421,11 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             tool_result=result,
             raw_tool_result=raw_tool_result,
         )
-        modified_result = run_after_tool_call_hooks(after_hook_context)
+        modified_result = (
+            None
+            if refused_by_stop(hook_blocked)
+            else run_after_tool_call_hooks(after_hook_context)
+        )
         if modified_result is not None:
             result = modified_result
 

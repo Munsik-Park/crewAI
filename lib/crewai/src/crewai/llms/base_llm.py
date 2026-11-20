@@ -80,7 +80,11 @@ class JsonResponseFormat(TypedDict):
 
 
 class LLMCallBlockedError(ValueError):
-    """A ``before_llm_call`` hook blocked the call by returning ``False``.
+    """A model call was refused before it was made.
+
+    Raised when a ``before_llm_call`` hook blocks the call by returning
+    ``False``, and when the agent run making the call was stopped because it
+    exceeded ``max_execution_time``.
 
     A ``ValueError`` so the fail-open handlers around internal model calls keep
     absorbing it, and its own type so a provider can report it as the decision
