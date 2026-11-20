@@ -5813,3 +5813,118 @@ def test_queued_review_with_output_without_a_json_form_still_pauses(
         or (isinstance(got, str) and got == stored)
         or (faithful and type(got) is type(output) and repr(got) == repr(output))
     ), f"fin got {type(got).__name__}"
+
+
+class _MetadataReview:
+    """Pause for review, putting ``extra`` in the context's metadata when given."""
+
+    def __init__(self, extra: Any) -> None:
+        self.extra = extra
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if self.extra is not None:
+            context.metadata = {**context.metadata, "extra": self.extra}
+        raise HumanFeedbackPending(context=context)
+
+
+def _pending_value_under_review(value: Any, field: str, at: str) -> Callable[..., type[Flow]]:
+    """``draft`` is reviewed alone; ``value`` is its output or its metadata's ``extra``.
+
+    The decorator's metadata is stored in its JSON form when the flow is
+    defined, so the provider puts ``value`` in the context's metadata. With
+    ``at="kickoff"`` ``draft`` is a start; with ``at="resume"`` it listens on
+    the outcome of ``first``'s review, so it pauses while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _Review(pause=True)
+        reviewed = human_feedback(
+            message="Review:",
+            emit=["ok", "no"],
+            llm="gpt-4o-mini",
+            default_outcome="ok",
+            provider=_MetadataReview(value if field == "metadata" else None),
+        )
+        output = value if field == "output" else "D"
+
+        class AtKickoff(Flow):
+            @start()
+            @reviewed
+            def draft(self):
+                return output
+
+            @listen("ok")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review, ("go", "stop"))
+            def first(self):
+                return "F"
+
+            @listen("go")
+            @reviewed
+            def draft(self):
+                return output
+
+            @listen("ok")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("field", ["output", "metadata"])
+@pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+def test_pending_review_with_a_value_without_a_json_form_still_pauses(
+    name: str, field: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row, and ``fin`` gets ``draft``'s value as documented.
+
+    That is the live value, the value given back equal by a restore where it
+    has a faithful stored form, or its string form.
+    """
+    value, stored, faithful = _QUEUED_OUTPUTS[name]()
+    calls: list[Any] = []
+    flow_cls = _pending_value_under_review(value, field, at)(calls)
+    expected = ["draft"] if at == "kickoff" else ["first", "draft"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        flow_id = out.context.flow_id
+        paused_for = [out.context.method_name]
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == paused_for[-1]
+            out = _failing_on_recursion(lambda: _resume(flow, how))  # noqa: B023
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            paused_for.append(out.context.method_name)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert paused_for == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert len(calls) == 1
+    result = calls[0][1]
+    assert isinstance(result, HumanFeedbackResult)
+    assert (result.method_name, result.outcome) == ("draft", "ok")
+    if field == "output":
+        got = result.output
+    else:
+        assert isinstance(result.metadata, dict)
+        assert list(result.metadata) == ["extra"]
+        got = result.metadata["extra"]
+    assert (
+        got is value
+        or (isinstance(got, str) and got == stored)
+        or (faithful and type(got) is type(value) and repr(got) == repr(value))
+    ), f"fin got {type(got).__name__}"
