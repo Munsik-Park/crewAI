@@ -488,18 +488,16 @@ def _stored_form(value: Any) -> Any:
 def _stored_record_value(value: Any) -> Any:
     """The form a record value is saved in; its string form when it has none.
 
-    A cycle, nesting past the recursion limit, or a stored form whose JSON
-    encoding nests past that limit also has no stored form. The JSON encoding
-    is tried here, where the call stack already holds the levels of the record
-    around the value.
+    A cycle, nesting past the recursion limit, a stored form whose JSON
+    encoding nests past that limit, or any error raised while the form is
+    built or encoded also leaves no stored form. The JSON encoding is tried
+    here, where the call stack already holds the levels of the record around
+    the value.
     """
     try:
         stored = _stored_form(value)
-    except (_NoStoredForm, TypeError, ValueError, RecursionError):
-        return _string_form(value)
-    try:
         json.dumps(stored, default=str)
-    except RecursionError:
+    except Exception:
         return _string_form(value)
     return stored
 

@@ -208,14 +208,15 @@ def _string_form(value: Any) -> str:
 def _json_safe_or_string(value: Any) -> Any:
     """``value``'s JSON-safe form, or its string form when that has no encoding.
 
-    A dict key other than a string, number, boolean or ``None``, a cycle and
-    nesting past the recursion limit have none. The encoding is tried where
-    the call stack already holds the levels of the row around the value.
+    A dict key other than a string, number, boolean or ``None``, a cycle,
+    nesting past the recursion limit, and any error raised while the form is
+    built leave none. The encoding is tried where the call stack already holds
+    the levels of the row around the value.
     """
     try:
         safe = PendingFeedbackContext._make_json_safe(value)
         json.dumps(safe)
-    except (RecursionError, TypeError, ValueError):
+    except Exception:
         return _string_form(value)
     return safe
 
