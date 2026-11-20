@@ -638,6 +638,35 @@ def _valid_frames(record: Any) -> list[_RecordFrame] | None:
     return None
 
 
+def _restored_frames(frames: Any) -> list[_RecordFrame] | None:
+    """Saved dispatch frames with their values rebuilt and held as they are.
+
+    ``None`` when a frame is malformed or a value cannot be rebuilt within
+    the recursion limit.
+    """
+    if not (isinstance(frames, list) and frames and all(map(_is_valid_frame, frames))):
+        return None
+    restored: list[_RecordFrame] = []
+    try:
+        for frame in cast(list[_RecordFrame], frames):
+            if frame["kind"] == "dispatch":
+                st = _dispatch_state(frame)
+                frame = {
+                    **frame,
+                    "result": _encode_record_value(st["result"]),
+                    "payloads": {
+                        k: _encode_record_value(v) for k, v in st["payloads"].items()
+                    },
+                    "feedback": {
+                        k: _encode_record_value(v) for k, v in st["feedback"].items()
+                    },
+                }
+            restored.append(frame)
+    except RecursionError:
+        return None
+    return restored
+
+
 def _dispatch_frame(st: _DispatchState) -> _DispatchFrame:
     """A dispatch position as a record frame of plain values."""
     frame: _DispatchFrame = {
@@ -1499,14 +1528,24 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         context.resume_record = record
 
     def _restore_resume_record(self, context: PendingFeedbackContext) -> None:
-        """Restore the run bookkeeping saved with a pending context, if any."""
+        """Restore the run bookkeeping saved with a pending context, if any.
+
+        A record whose bookkeeping, frames or queue is malformed is dropped
+        whole, so the context resumes as one saved without a record.
+        """
         record = context.resume_record
         if not isinstance(record, dict):
             return
-        if not _is_valid_bookkeeping(record):
-            # A record with malformed bookkeeping counts as absent.
+        frames = _restored_frames(record["frames"]) if "frames" in record else []
+        if (
+            not _is_valid_bookkeeping(record)
+            or frames is None
+            or not isinstance(record.get("queued", []), list)
+        ):
             context.resume_record = None
             return
+        if frames:
+            record["frames"] = frames
         pending = record.get("pending_events")
         if isinstance(pending, dict):
             self._pending_events = {
