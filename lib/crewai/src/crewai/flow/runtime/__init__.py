@@ -3459,7 +3459,13 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 router_name = FlowMethodName(st["batch"][0])
                 if "inflight_result" in st:
                     router_result = st.pop("inflight_result")
-                elif router_name not in self._methods:
+                elif not (
+                    router_name in self._methods
+                    and str(router_name) in self._definition.methods
+                    and self._is_router(router_name)
+                ):
+                    # A restored batch can name a method the flow no longer
+                    # defines as a router; it is not run from the batch.
                     st["batch"].pop(0)
                     continue
                 else:
