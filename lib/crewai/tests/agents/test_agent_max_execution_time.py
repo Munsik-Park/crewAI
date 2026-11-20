@@ -2105,3 +2105,82 @@ def test_v2l_later_and_overlapping_calls(
     enters, retries and writes nothing on an agent after the error.
     """
     _OVERLAP_ROWS[row](recorder, caught, monkeypatch, path)
+
+
+# --- The deadline does not wait for another agent's executor build -----------
+
+
+@pytest.mark.parametrize("path", ["sync", "async"])
+def test_v1_deadline_does_not_wait_for_another_agents_executor_build(
+    recorder: _Recorder, path: str
+) -> None:
+    """V1-B: another agent building its executor across the deadline does not
+    delay the ``TimeoutError``."""
+    from crewai.agents.agent_executor import AgentExecutor
+
+    in_constructor = threading.Event()
+    release_constructor = threading.Event()
+    release_tool = threading.Event()
+    tool_done = threading.Event()
+    built: dict[str, Any] = {}
+
+    class BlockedExecutor(AgentExecutor):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            in_constructor.set()
+            release_constructor.wait(HOLD_BOUND)
+            super().__init__(*args, **kwargs)
+
+    other = Agent(
+        role="Other",
+        goal="Answer the task",
+        backstory="You answer tasks.",
+        llm=ScriptedLLM([], "other", recorder),
+        executor_class=BlockedExecutor,
+    )
+
+    def build_other() -> None:
+        built["outcome"] = _outcome(other.create_agent_executor)
+
+    builder = threading.Thread(target=build_other, daemon=True)
+
+    @tool("wait_tool")
+    def wait_tool(q: str) -> str:
+        """A tool that runs while another agent builds its executor."""
+        try:
+            builder.start()
+            in_constructor.wait(HOLD_BOUND)
+            release_tool.wait(DRAIN_BOUND)
+            return "waited"
+        finally:
+            tool_done.set()
+
+    llm = ScriptedLLM([(0, _act("wait_tool", '{"q": "x"}'))], "run1", recorder)
+    agent = _agent(llm, [wait_tool])
+
+    async def ascenario() -> float:
+        # Leaving asyncio.run waits for the tool's thread, so the raise is
+        # timed here and the tool released before the loop closes.
+        start = time.monotonic()
+        try:
+            await agent.aexecute_task(_task(agent))
+        except TimeoutError:
+            return time.monotonic() - start
+        finally:
+            release_tool.set()
+        pytest.fail("aexecute_task did not raise TimeoutError")
+
+    try:
+        if path == "sync":
+            elapsed, _ = _raise_time(lambda: agent.execute_task(_task(agent)))
+        else:
+            elapsed = asyncio.run(ascenario())
+        assert in_constructor.is_set()
+        assert not release_constructor.is_set()
+        assert elapsed < RAISE_BOUND, f"TimeoutError took {elapsed:.2f}s"
+    finally:
+        release_constructor.set()
+        release_tool.set()
+        assert tool_done.wait(DRAIN_BOUND)
+        builder.join(DRAIN_BOUND)
+    assert built.get("outcome") is None, built
+    assert isinstance(other.agent_executor, BlockedExecutor)
