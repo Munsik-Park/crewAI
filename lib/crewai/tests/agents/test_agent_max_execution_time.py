@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextvars
 import threading
 import time
 from collections.abc import Iterator
@@ -21,6 +22,8 @@ from typing import Any
 
 import pytest
 from crewai import Agent, Task
+from crewai.events.base_events import BaseEvent
+from crewai.events.event_bus import crewai_event_bus
 from crewai.hooks import (
     register_after_llm_call_hook,
     register_after_tool_call_hook,
@@ -767,16 +770,46 @@ def test_v6h_async_refused_model_call_in_flight_step_runs_no_hooks(
     assert isinstance(outcome.get("co"), Exception), outcome
 
 
-# --- I7: the hook boundary around the stop, case by case -----------------------
+# --- I7 / I8: the hook boundary around the stop, case by case -----------------
 #
-# The rule: a call the stop refuses runs no hook, before or after. A call that
-# was already in progress at the deadline, including one held in its own
-# before-hook, keeps the hooks it would have had without a deadline: allowed,
-# it runs and gets its after-hooks; blocked by its before-hook, it gets what a
-# blocked call always gets (after-tool hooks for a tool; nothing for a model).
+# The rule: a call checks the stop where it would begin. A call the stop refuses
+# before its before-hooks runs no hook, before or after. A call still held in
+# its before-hooks at the deadline does not execute afterwards, whatever those
+# hooks decide: a tool call is treated as blocked (its after-tool hooks run), a
+# model call is refused (no after-hooks). Late work in these tests waits for
+# the caller to catch the TimeoutError, never for a fixed time.
 
 TARGET = "Target"
-HOLD = 2.0  # how long a held before-hook waits, past the 1 s limit
+HOLD_BOUND = 5.0  # bound on late work waiting for the caller to catch the error
+AFTER_ERROR = -1.0  # a scripted delay that waits for the caller to catch the error
+
+
+class _GatedLLM(ScriptedLLM):
+    """A ScriptedLLM whose ``AFTER_ERROR`` delay waits on the ``caught`` event."""
+
+    def __init__(
+        self,
+        script: list[tuple[float, str]],
+        name: str,
+        recorder: _Recorder,
+        caught: threading.Event,
+    ) -> None:
+        super().__init__(script, name, recorder)
+        self.caught = caught
+
+    def _next(self, messages: Any) -> tuple[float, str]:
+        delay, reply = super()._next(messages)
+        if delay == AFTER_ERROR:
+            self.caught.wait(HOLD_BOUND)
+            return 0.0, reply
+        return delay, reply
+
+
+@pytest.fixture
+def caught() -> threading.Event:
+    """Set by the test once its caller has caught the TimeoutError."""
+    return threading.Event()
+
 
 # Events counted after the TimeoutError, per kind of call.
 _BOUNDARY_EXPECTED = {
@@ -789,7 +822,7 @@ _BOUNDARY_EXPECTED = {
     ("tool", "allowed"): {
         "before-tool:start": 0,
         "before-tool:end": 1,
-        "tool-ran": 1,
+        "tool-ran": 0,
         "after-tool": 1,
     },
     ("tool", "blocked"): {
@@ -807,8 +840,8 @@ _BOUNDARY_EXPECTED = {
     ("model", "allowed"): {
         "before-llm:start": 0,
         "before-llm:end": 1,
-        "llm:target": 1,
-        "after-llm": 1,
+        "llm:target": 0,
+        "after-llm": 0,
     },
     ("model", "blocked"): {
         "before-llm:start": 0,
@@ -825,12 +858,12 @@ def _is_target(context: Any) -> bool:
 
 @pytest.fixture
 def boundary_hooks(
-    recorder: _Recorder, request: pytest.FixtureRequest
+    recorder: _Recorder, caught: threading.Event, request: pytest.FixtureRequest
 ) -> Iterator[None]:
     """Global hooks around the target agent's calls, removed on teardown.
 
-    For a held case the matching before-hook waits past the deadline on its
-    first call, then allows or blocks that call.
+    For a held case the matching before-hook holds its first call until the
+    caller has caught the TimeoutError, then allows or blocks that call.
     """
     kind, case = request.param
     held = case in ("allowed", "blocked")
@@ -843,7 +876,7 @@ def boundary_hooks(
         recorder.add("before-tool:start")
         hold, held_tool[0] = held_tool[0], False
         if hold:
-            time.sleep(HOLD)
+            caught.wait(HOLD_BOUND)
         recorder.add("before-tool:end")
         return False if hold and case == "blocked" else None
 
@@ -858,7 +891,7 @@ def boundary_hooks(
         recorder.add("before-llm:start")
         hold, held_model[0] = held_model[0], False
         if hold:
-            time.sleep(HOLD)
+            caught.wait(HOLD_BOUND)
         recorder.add("before-llm:end")
         return False if hold and case == "blocked" else None
 
@@ -880,7 +913,13 @@ def boundary_hooks(
         unregister_after_llm_call_hook(after_llm)
 
 
-def _boundary_target(kind: str, case: str, recorder: _Recorder, **kwargs: Any) -> Agent:
+def _boundary_target(
+    kind: str,
+    case: str,
+    recorder: _Recorder,
+    caught: threading.Event,
+    **kwargs: Any,
+) -> Agent:
     """The agent whose calls the hooks watch, scripted for one case."""
 
     @tool("probe_tool")
@@ -891,12 +930,13 @@ def _boundary_target(kind: str, case: str, recorder: _Recorder, **kwargs: Any) -
 
     @tool("slow_tool")
     def slow_tool(x: str) -> str:
-        """Runs past the deadline, so the next model call starts after it."""
-        time.sleep(HOLD)
+        """Runs until the error is caught, so the next model call starts after it."""
+        caught.wait(HOLD_BOUND)
         return "slow"
 
     if kind == "tool":
-        first = (HOLD if case == "refused" else 0, _act("probe_tool", '{"x": "a"}'))
+        delay = AFTER_ERROR if case == "refused" else 0
+        first = (delay, _act("probe_tool", '{"x": "a"}'))
         script = [first, (0, _final("DONE"))]
     elif case == "refused":
         script = [(0, _act("slow_tool", '{"x": "a"}')), (0, _final("DONE"))]
@@ -906,7 +946,7 @@ def _boundary_target(kind: str, case: str, recorder: _Recorder, **kwargs: Any) -
         role=TARGET,
         goal="Answer the task",
         backstory="You answer tasks.",
-        llm=ScriptedLLM(script, "target", recorder),
+        llm=_GatedLLM(script, "target", recorder, caught),
         tools=[probe_tool, slow_tool],
         allow_delegation=False,
         max_retry_limit=0,
@@ -928,6 +968,7 @@ _BOUNDARY_CASES = [
 def test_v6i_hooks_around_the_stop_follow_the_rule(
     recorder: _Recorder,
     prompts: list[str],
+    caught: threading.Event,
     boundary_hooks: None,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
@@ -941,12 +982,17 @@ def test_v6i_hooks_around_the_stop_follow_the_rule(
     kind, case = request.node.callspec.params["boundary_hooks"]
 
     if path == "sync":
-        target = _boundary_target(kind, case, recorder, max_execution_time=LIMIT)
+        target = _boundary_target(
+            kind, case, recorder, caught, max_execution_time=LIMIT
+        )
         run_ended = _run_end(target, monkeypatch)
-        _, raised_at = _raise_time(lambda: target.execute_task(_task(target)))
+        try:
+            _, raised_at = _raise_time(lambda: target.execute_task(_task(target)))
+        finally:
+            caught.set()
         assert run_ended.wait(DRAIN_BOUND)
     else:
-        coworker = _boundary_target(kind, case, recorder)
+        coworker = _boundary_target(kind, case, recorder, caught)
         delegated = threading.Event()
 
         @tool("delegate")
@@ -954,7 +1000,7 @@ def test_v6i_hooks_around_the_stop_follow_the_rule(
             """Run the co-worker."""
             try:
                 if kind == "model" and case == "refused":
-                    time.sleep(HOLD)  # the co-worker's first model call is after it
+                    caught.wait(HOLD_BOUND)  # the co-worker's first call is after it
                 try:
                     return str(coworker.execute_task(_task(coworker, "Sub")))
                 except Exception as e:  # noqa: BLE001 - a refused run may raise
@@ -977,16 +1023,310 @@ def test_v6i_hooks_around_the_stop_follow_the_rule(
             try:
                 await outer.aexecute_task(_task(outer))
             except TimeoutError:
-                return time.monotonic()
+                raised = time.monotonic()
+                caught.set()
+                return raised
             pytest.fail("aexecute_task did not raise TimeoutError")
 
         try:
             raised_at = asyncio.run(scenario())
         finally:
+            caught.set()
             assert delegated.wait(DRAIN_BOUND)
 
     after = recorder.after(raised_at)
     expected = _BOUNDARY_EXPECTED[(kind, case)]
     observed = {label: after.count(label) for label in expected}
     assert observed == expected, after
+    assert after.count("prompt") == 0, after
+
+
+# --- I7 / I8: work that starts after the error inside the work in flight -------
+#
+# Each row starts one piece of late work from inside the call executing at the
+# deadline, after the caller has caught the TimeoutError, and checks that its
+# model request is not sent. Requests are recorded inside the fake model's body,
+# below every check, so a refused request records nothing.
+
+
+class _LateEvent(BaseEvent):
+    type: str = "max_execution_time_late_work"
+
+
+class _FnLLM(BaseLLM):
+    """A fake model whose reply to its n-th request comes from ``reply(n)``.
+
+    With ``dispatch_hooks`` it dispatches ``PRE_MODEL_CALL`` inside its own
+    call, as the native providers do.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        recorder: _Recorder,
+        reply: Any,
+        areply: Any = None,
+        dispatch_hooks: bool = False,
+    ) -> None:
+        super().__init__(model="test-model")
+        self.name = name
+        self.recorder = recorder
+        self.reply = reply
+        self.areply = areply
+        self.dispatch_hooks = dispatch_hooks
+        self.requests = 0
+
+    def _start(self, messages: Any, from_agent: Any) -> int:
+        if self.dispatch_hooks:
+            self._invoke_before_llm_call_hooks(messages, from_agent)
+        self.requests += 1
+        self.recorder.add(f"llm:{self.name}")
+        return self.requests
+
+    def call(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        return self.reply(self._start(messages, from_agent))
+
+    async def acall(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        n = self._start(messages, from_agent)
+        if self.areply is not None:
+            return await self.areply(n)
+        return self.reply(n)
+
+    def supports_function_calling(self) -> bool:
+        return False
+
+    def supports_stop_words(self) -> bool:
+        return False
+
+    def get_context_window_size(self) -> int:
+        return 8192
+
+
+_LATE_ROWS = {
+    "j1": "a sync event listener, for an event emitted inside the model request",
+    "j2": "an async event listener, for an event emitted inside the model request",
+    "j3": "a thread started with copy_context() inside the model request",
+    "j4": "a custom model in flight that calls another model after the error",
+    "j5": "the empty-answer retry of the model request in flight",
+    "j6": "the rate-limit retry of the model request in flight",
+    "j7": "an event listener, for an event emitted inside the tool in flight",
+    "j8": "a thread started with copy_context() inside the tool in flight",
+    "j9": "a task created inside an acall the tool in flight is awaiting",
+    "j10": "a model call from the tool in flight, held in its own before-hook",
+}
+
+_LATE_CASES = [
+    pytest.param(row, path, id=f"{row}-{path}")
+    for row in _LATE_ROWS
+    for path in ("sync", "async")
+    if not (row == "j9" and path == "sync")
+]
+
+
+@pytest.mark.parametrize(("row", "path"), _LATE_CASES)
+def test_v6j_work_started_after_the_error_sends_no_request(
+    recorder: _Recorder,
+    prompts: list[str],
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    row: str,
+    path: str,
+) -> None:
+    """No model request is sent by late work started inside the work in flight.
+
+    Sync: the target agent itself has the limit. Async: the target is a
+    co-worker run by the outer agent's tool, the step in flight at the deadline.
+    """
+    late_done = threading.Event()
+    retry_row = row in ("j5", "j6")
+    probe = "llm:target" if retry_row else "llm:side"
+    side = _FnLLM("side", recorder, lambda n: "SIDE", dispatch_hooks=row == "j10")
+
+    def side_request() -> None:
+        try:
+            side.call([{"role": "user", "content": "late"}])
+        except LLMCallBlockedError:
+            pass
+        finally:
+            late_done.set()
+
+    def late_after_error() -> None:
+        caught.wait(HOLD_BOUND)
+        recorder.add("late:start")
+        side_request()
+
+    def listener(source: Any, event: Any) -> None:
+        recorder.add("late:start")
+        side_request()
+
+    async def alistener(source: Any, event: Any) -> None:
+        recorder.add("late:start")
+        side_request()
+
+    def held_side_hook(context: Any) -> bool | None:
+        if context.llm is not side:
+            return None
+        caught.wait(HOLD_BOUND)
+        recorder.add("late:start")
+        return None
+
+    async def late_task() -> None:
+        await asyncio.to_thread(caught.wait, HOLD_BOUND)
+        recorder.add("late:start")
+        try:
+            await side.acall([{"role": "user", "content": "late"}])
+        except LLMCallBlockedError:
+            pass
+        finally:
+            late_done.set()
+
+    async def inflight_areply(n: int) -> str:
+        await asyncio.get_running_loop().create_task(late_task())
+        return "IN-FLIGHT"
+
+    inflight = _FnLLM("inflight", recorder, lambda n: "", areply=inflight_areply)
+
+    def target_reply(n: int) -> str:
+        if row in ("j7", "j8", "j9", "j10"):
+            return _act("worker", '{"x": "a"}') if n == 1 else _final("DONE")
+        if n > 1:
+            return _final("DONE")
+        if row in ("j1", "j2"):
+            caught.wait(HOLD_BOUND)
+            crewai_event_bus.emit(target, _LateEvent())
+            late_done.wait(DRAIN_BOUND)
+        elif row == "j3":
+            ctx = contextvars.copy_context()
+            threading.Thread(target=ctx.run, args=(late_after_error,)).start()
+            caught.wait(HOLD_BOUND)
+        elif row == "j4":
+            late_after_error()
+        elif row == "j5":
+            caught.wait(HOLD_BOUND)
+            recorder.add("late:start")
+            return ""
+        elif row == "j6":
+            caught.wait(HOLD_BOUND)
+            recorder.add("late:start")
+            raise RuntimeError("rate limit exceeded")
+        return _final("DONE")
+
+    @tool("worker")
+    def worker(x: str) -> str:
+        """The tool in flight at the deadline."""
+        if row == "j7":
+            caught.wait(HOLD_BOUND)
+            crewai_event_bus.emit(None, _LateEvent())
+            late_done.wait(DRAIN_BOUND)
+        elif row == "j8":
+            ctx = contextvars.copy_context()
+            threading.Thread(target=ctx.run, args=(late_after_error,)).start()
+            caught.wait(HOLD_BOUND)
+        elif row == "j9":
+            asyncio.run(inflight.acall([{"role": "user", "content": "work"}]))
+        elif row == "j10":
+            side_request()
+        return "worked"
+
+    if row in ("j1", "j7"):
+        crewai_event_bus.on(_LateEvent)(listener)
+        handler: Any = listener
+    elif row == "j2":
+        crewai_event_bus.on(_LateEvent)(alistener)
+        handler = alistener
+    else:
+        handler = None
+    if row == "j10":
+        register_before_llm_call_hook(held_side_hook)
+
+    target = Agent(
+        role=TARGET,
+        goal="Answer the task",
+        backstory="You answer tasks.",
+        llm=_FnLLM("target", recorder, target_reply),
+        tools=[worker],
+        allow_delegation=False,
+        max_retry_limit=0,
+        **({"max_execution_time": LIMIT} if path == "sync" else {}),
+    )
+
+    try:
+        if path == "sync":
+            run_ended = _run_end(target, monkeypatch)
+            try:
+                _, raised_at = _raise_time(lambda: target.execute_task(_task(target)))
+            finally:
+                caught.set()
+            assert run_ended.wait(DRAIN_BOUND)
+        else:
+            run_ended = threading.Event()
+
+            @tool("delegate")
+            def delegate(q: str) -> str:
+                """Run the co-worker."""
+                try:
+                    return str(target.execute_task(_task(target, "Sub")))
+                except Exception as e:  # noqa: BLE001 - a refused run may raise
+                    return f"failed: {type(e).__name__}"
+                finally:
+                    run_ended.set()
+
+            outer = Agent(
+                role="Outer",
+                goal="Delegate",
+                backstory="You delegate.",
+                llm=ScriptedLLM(
+                    [(0, _act("delegate", '{"q": "x"}'))], "outer", recorder
+                ),
+                tools=[delegate],
+                allow_delegation=False,
+                max_retry_limit=0,
+                max_execution_time=LIMIT,
+            )
+
+            async def scenario() -> float:
+                try:
+                    await outer.aexecute_task(_task(outer))
+                except TimeoutError:
+                    raised = time.monotonic()
+                    caught.set()
+                    return raised
+                pytest.fail("aexecute_task did not raise TimeoutError")
+
+            try:
+                raised_at = asyncio.run(scenario())
+            finally:
+                caught.set()
+            assert run_ended.wait(DRAIN_BOUND)
+        if not retry_row:
+            assert late_done.wait(DRAIN_BOUND)
+    finally:
+        if handler is not None:
+            crewai_event_bus.off(_LateEvent, handler)
+        if row == "j10":
+            unregister_before_llm_call_hook(held_side_hook)
+
+    after = recorder.after(raised_at)
+    assert after.count("late:start") == 1, (_LATE_ROWS[row], after)
+    assert after.count(probe) == 0, (_LATE_ROWS[row], after)
     assert after.count("prompt") == 0, after
