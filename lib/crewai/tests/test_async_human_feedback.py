@@ -4921,3 +4921,78 @@ def test_step_value_shaped_like_the_dict_tag_resumes_as_that_value(
 
     assert now == [("use", value)]
     assert repr(before + after) == repr(now)
+
+
+# An earlier review's result passed on across a later review's pause: its
+# output keeps its dict keys after a restore.
+_EARLIER_REVIEW_OUTPUTS = {
+    "tuple_keys": {("a", 1): "v", ("b", None): [1, 2]},
+    "int_keys": {1: "v", 2: {3: "w"}},
+}
+
+
+class _AnsweredAtOnce:
+    """A review answered at once with an empty reply, even in a paused run."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        return ""
+
+
+def _earlier_review_result_beside_a_review(output: Any) -> ShapeFactory:
+    """``first``'s outcome reaches ``use`` with its result after ``draft`` pauses.
+
+    ``zero`` pauses first, so ``draft``'s pause is reached while resuming.
+    ``first`` is answered at once and returns ``output``. ``classify`` routes
+    its outcome to ``draft``, which pauses in that outcome's router loop, so
+    ``use`` gets ``first``'s result from the record.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        class EarlierReview(Flow):
+            @start()
+            @_hf(review, emit=("begin", "stop"))
+            def zero(self):
+                return "Z"
+
+            @listen("begin")
+            @_hf(_AnsweredAtOnce())  # type: ignore[arg-type]
+            def first(self):
+                return output
+
+            @router("approved")
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @_hf(review, emit=("ok", "no"))
+            def draft(self):
+                return "D"
+
+            @listen("approved")
+            def use(self, result):
+                calls.append(("use", _value(result)))
+
+        return EarlierReview
+
+    return make
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize("name", list(_EARLIER_REVIEW_OUTPUTS))
+def test_earlier_review_result_keeps_its_output_across_a_later_pause(
+    name: str, second: str, how: str
+) -> None:
+    make = _earlier_review_result_beside_a_review(_EARLIER_REVIEW_OUTPUTS[name])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [
+        ("use", ("review", "first", _EARLIER_REVIEW_OUTPUTS[name], "approved"))
+    ]
+    assert paused_for == ["zero", "draft"]
+    assert before == []
+    assert repr(after) == repr(now)
