@@ -3933,8 +3933,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     continue
             else:
                 continue
-            # Skip an entry for another flow, for a method this flow lacks, or
-            # with a field the pause event and the saved row cannot take.
             if (
                 ctx.flow_id != self.flow_id
                 or not isinstance(ctx.method_name, str)
@@ -3946,7 +3944,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             pause = HumanFeedbackPending(
                 context=ctx, callback_info=info if isinstance(info, dict) else None
             )
-            # The rest of the queue moves onto this pause and ``queued`` empties.
             _queue_pauses(pause, queued)
             raise pause
 
