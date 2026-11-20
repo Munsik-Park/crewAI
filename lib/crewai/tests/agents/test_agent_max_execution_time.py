@@ -17,13 +17,14 @@ import builtins
 import contextvars
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
 from crewai import Agent, Task
 from crewai.events.base_events import BaseEvent
 from crewai.events.event_bus import crewai_event_bus
+from crewai.events.types.agent_events import AgentExecutionStartedEvent
 from crewai.hooks import (
     register_after_llm_call_hook,
     register_after_tool_call_hook,
@@ -1330,3 +1331,777 @@ def test_v6j_work_started_after_the_error_sends_no_request(
     assert after.count("late:start") == 1, (_LATE_ROWS[row], after)
     assert after.count(probe) == 0, (_LATE_ROWS[row], after)
     assert after.count("prompt") == 0, after
+
+
+# --- C2b, I3, I9: later and overlapping calls (V2-L) -------------------------
+#
+# V2 and V3 above are rows L1 to L3. Each row below is a call that meets work
+# a timed-out run still holds, or a call next to a live call on one agent.
+# Every ordering is set by an Event, each wait bounded; each run's replies are
+# chosen by the task named in its request, so no run can consume another's.
+
+SUB_TASK = "SUB-TASK-FIRST"
+LATER_TASK = "LATER-TASK"
+
+
+class _ByTaskLLM(BaseLLM):
+    """A fake model that answers each request with the reply of the task in it."""
+
+    def __init__(
+        self, name: str, recorder: _Recorder, replies: dict[str, Callable[[], str]]
+    ) -> None:
+        super().__init__(model="test-model")
+        self.name = name
+        self.recorder = recorder
+        self.replies = replies
+        self.inputs: list[str] = []
+        self.answered = {marker: threading.Event() for marker in replies}
+        self._lock = threading.Lock()
+
+    def _reply(self, messages: Any) -> str:
+        text = _text(messages)
+        with self._lock:
+            self.inputs.append(text)
+        self.recorder.add(f"llm:{self.name}")
+        for marker, reply in self.replies.items():
+            if marker in text:
+                try:
+                    return reply()
+                finally:
+                    self.answered[marker].set()
+        return _final("UNEXPECTED")
+
+    def inputs_for(self, marker: str) -> list[str]:
+        with self._lock:
+            return [text for text in self.inputs if marker in text]
+
+    def call(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        return self._reply(messages)
+
+    async def acall(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        return await asyncio.to_thread(self._reply, messages)
+
+    def supports_function_calling(self) -> bool:
+        return False
+
+    def supports_stop_words(self) -> bool:
+        return False
+
+    def get_context_window_size(self) -> int:
+        return 8192
+
+
+def _held(event: threading.Event, reply: str) -> Callable[[], str]:
+    """A reply given once ``event`` is set (bounded)."""
+
+    def answer() -> str:
+        event.wait(HOLD_BOUND)
+        return reply
+
+    return answer
+
+
+def _outcome(call: Callable[[], Any]) -> Any:
+    try:
+        return call()
+    except Exception as e:  # noqa: BLE001 - the row asserts on it
+        return e
+
+
+async def _aoutcome(awaitable: Any) -> Any:
+    try:
+        return await awaitable
+    except Exception as e:  # noqa: BLE001 - the row asserts on it
+        return e
+
+
+def _already_running(outcome: Any) -> bool:
+    return isinstance(outcome, Exception) and "Executor is already running" in str(
+        outcome
+    )
+
+
+def _messages_text(messages: Any) -> str:
+    return " ".join(str(m.get("content", "")) for m in messages or [])
+
+
+class _CoworkerRun:
+    """An outer agent with the limit whose tool delegates to a co-worker."""
+
+    def __init__(
+        self,
+        recorder: _Recorder,
+        monkeypatch: pytest.MonkeyPatch,
+        replies: dict[str, Callable[[], str]],
+        tools: list[Any] | None = None,
+        max_retry_limit: int = 0,
+    ) -> None:
+        self.llm = _ByTaskLLM("coworker", recorder, replies)
+        self.coworker = Agent(
+            role="Coworker",
+            goal="Help",
+            backstory="You help.",
+            llm=self.llm,
+            tools=tools or [],
+            allow_delegation=False,
+            max_retry_limit=max_retry_limit,
+        )
+        self.delegation_errors: list[Exception] = []
+        self._idle = threading.Condition()
+        self._attempts = 0
+        self._in_flight = 0
+
+        @tool("ask_coworker")
+        def ask_coworker(q: str) -> str:
+            """Delegate the question to a co-worker."""
+            with self._idle:
+                self._attempts += 1
+                self._in_flight += 1
+            try:
+                return str(self.coworker.execute_task(_task(self.coworker, SUB_TASK)))
+            except Exception as e:
+                self.delegation_errors.append(e)
+                raise
+            finally:
+                with self._idle:
+                    self._in_flight -= 1
+                    self._idle.notify_all()
+
+        self.outer = _agent(
+            ScriptedLLM([(0, _act("ask_coworker", '{"q": "x"}'))], "outer", recorder),
+            [ask_coworker],
+        )
+        self.outer_ended = _run_end(self.outer, monkeypatch)
+        self.path = "sync"
+
+    def delegation_running(self) -> bool:
+        with self._idle:
+            return self._in_flight > 0
+
+    def drained(self) -> bool:
+        """Waits for the abandoned work to end (bounded).
+
+        On sync the timed worker ends with it. On async the timed task is
+        cancelled at the deadline while its step thread runs on, so the end
+        is that of the delegation attempts.
+        """
+        if self.path == "sync":
+            return self.outer_ended.wait(DRAIN_BOUND)
+        with self._idle:
+            return self._idle.wait_for(
+                lambda: self._attempts > 0 and self._in_flight == 0, DRAIN_BOUND
+            )
+
+    def time_out_then(self, path: str, caught: threading.Event, later: Any) -> Any:
+        """Runs the outer agent into its limit, then ``later`` in the caller.
+
+        ``later`` takes the co-worker and returns its outcome (a coroutine
+        function on the async path).
+        """
+        self.path = path
+        if path == "sync":
+            try:
+                with pytest.raises(TimeoutError):
+                    self.outer.execute_task(_task(self.outer))
+            finally:
+                caught.set()
+            return later(self.coworker)
+
+        async def scenario() -> Any:
+            try:
+                with pytest.raises(TimeoutError):
+                    await self.outer.aexecute_task(_task(self.outer))
+            finally:
+                caught.set()
+            return await later(self.coworker)
+
+        return asyncio.run(scenario())
+
+
+def _row_coworker_later_call(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L4, L5: a later call on the co-worker whose delegated call still runs."""
+    later_done = threading.Event()
+    run = _CoworkerRun(
+        recorder,
+        monkeypatch,
+        {
+            SUB_TASK: _held(later_done, _final("CO-FIRST")),
+            LATER_TASK: lambda: _final("LATER-OWN"),
+        },
+    )
+    still_running: list[bool] = []
+
+    def later(coworker: Agent) -> Any:
+        still_running.append(run.delegation_running())
+        try:
+            return _outcome(lambda: coworker.execute_task(_task(coworker, LATER_TASK)))
+        finally:
+            later_done.set()
+
+    async def alater(coworker: Agent) -> Any:
+        still_running.append(run.delegation_running())
+        try:
+            return await _aoutcome(coworker.aexecute_task(_task(coworker, LATER_TASK)))
+        finally:
+            later_done.set()
+
+    try:
+        outcome = run.time_out_then(path, caught, later if path == "sync" else alater)
+    finally:
+        later_done.set()
+        assert run.drained()
+
+    assert still_running == [True], "the delegated call ended before the later call"
+    assert not isinstance(outcome, Exception), repr(outcome)
+    assert str(outcome) == "LATER-OWN"
+    later_inputs = run.llm.inputs_for(LATER_TASK)
+    assert later_inputs, "the later call sent no request"
+    for text in later_inputs:
+        assert SUB_TASK not in text and "CO-FIRST" not in text
+
+
+def _same_agent_overlap(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    a_step_ended: bool,
+) -> None:
+    """C is prepared before A's deadline and starts running after it."""
+    a_started = threading.Event()
+    c_returned = threading.Event()
+    a_release = caught if a_step_ended else c_returned
+
+    def a_reply() -> str:
+        a_started.set()
+        a_release.wait(HOLD_BOUND)
+        return _final("A-OWN")
+
+    llm = _ByTaskLLM(
+        "shared", recorder, {"A-TASK": a_reply, "C-TASK": lambda: _final("C-OWN")}
+    )
+    agent = _agent(llm, [])
+    a_task, c_task = _task(agent, "A-TASK"), _task(agent, "C-TASK")
+    a_step_done = llm.answered["A-TASK"]
+    c_prepared_at: list[float] = []
+    a_out: dict[str, Any] = {}
+
+    if path == "sync":
+        timed = agent._execute_with_timeout
+
+        def gated(task_prompt: str, task: Task, timeout: int) -> Any:
+            if task is c_task:
+                c_prepared_at.append(time.monotonic())
+                caught.wait(HOLD_BOUND)
+                if a_step_ended:
+                    a_step_done.wait(HOLD_BOUND)
+            return timed(task_prompt, task, timeout)
+
+        monkeypatch.setattr(agent, "_execute_with_timeout", gated)
+
+        def run_a() -> None:
+            try:
+                agent.execute_task(a_task)
+            except Exception as e:  # noqa: BLE001 - asserted below
+                a_out["A"] = e
+                a_out["raised_at"] = time.monotonic()
+            finally:
+                caught.set()
+
+        thread_a = threading.Thread(target=run_a)
+        thread_a.start()
+        try:
+            assert a_started.wait(HOLD_BOUND)
+            c_out = _outcome(lambda: agent.execute_task(c_task))
+        finally:
+            c_returned.set()
+            thread_a.join(DRAIN_BOUND)
+    else:
+        atimed = agent._aexecute_with_timeout
+
+        async def agated(task_prompt: str, task: Task, timeout: int) -> Any:
+            if task is c_task:
+                c_prepared_at.append(time.monotonic())
+                await asyncio.to_thread(caught.wait, HOLD_BOUND)
+                if a_step_ended:
+                    await asyncio.to_thread(a_step_done.wait, HOLD_BOUND)
+            return await atimed(task_prompt, task, timeout)
+
+        monkeypatch.setattr(agent, "_aexecute_with_timeout", agated)
+
+        async def scenario() -> Any:
+            async def run_a() -> None:
+                try:
+                    await agent.aexecute_task(a_task)
+                except Exception as e:  # noqa: BLE001 - asserted below
+                    a_out["A"] = e
+                    a_out["raised_at"] = time.monotonic()
+                finally:
+                    caught.set()
+
+            async def run_c() -> Any:
+                try:
+                    assert await asyncio.to_thread(a_started.wait, HOLD_BOUND)
+                    return await _aoutcome(agent.aexecute_task(c_task))
+                finally:
+                    c_returned.set()
+
+            _, c = await asyncio.gather(run_a(), run_c())
+            return c
+
+        try:
+            c_out = asyncio.run(scenario())
+        finally:
+            c_returned.set()
+    assert a_step_done.wait(DRAIN_BOUND)
+
+    assert isinstance(a_out.get("A"), TimeoutError), a_out
+    assert c_prepared_at and c_prepared_at[0] < a_out["raised_at"], (
+        "C was not prepared before A's deadline"
+    )
+    assert not isinstance(c_out, Exception), repr(c_out)
+    assert str(c_out) == "C-OWN"
+    for text in llm.inputs_for("C-TASK"):
+        assert "A-TASK" not in text and "A-OWN" not in text
+    for text in llm.inputs_for("A-TASK"):
+        assert "C-TASK" not in text
+
+
+def _row_prepared_before_step_running(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L6, L8: A's step still runs when C starts running."""
+    _same_agent_overlap(recorder, caught, monkeypatch, path, a_step_ended=False)
+
+
+def _row_prepared_before_step_ended(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L7, L9: A's step has ended before C starts running."""
+    _same_agent_overlap(recorder, caught, monkeypatch, path, a_step_ended=True)
+
+
+def _row_stopped_coworker_reentry(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L10: stopped work calls the co-worker again while a later call runs."""
+
+    @tool("noop")
+    def noop(x: str) -> str:
+        """Do nothing."""
+        return "NOOP"
+
+    outer_done = threading.Event()
+    run = _CoworkerRun(
+        recorder,
+        monkeypatch,
+        {
+            SUB_TASK: _held(caught, _act("noop", '{"x": "a"}')),
+            LATER_TASK: _held(outer_done, _final("LATER-OWN")),
+        },
+        tools=[noop],
+        max_retry_limit=2,
+    )
+    starts: list[str] = []
+    starts_lock = threading.Lock()
+
+    def on_start(source: Any, event: AgentExecutionStartedEvent) -> None:
+        if getattr(event.agent, "role", None) == "Coworker":
+            with starts_lock:
+                starts.append(str(event.task.description))
+
+    def watch_outer() -> None:
+        run.drained()
+        outer_done.set()
+
+    def later(coworker: Agent) -> Any:
+        threading.Thread(target=watch_outer, daemon=True).start()
+        return _outcome(lambda: coworker.execute_task(_task(coworker, LATER_TASK)))
+
+    async def alater(coworker: Agent) -> Any:
+        threading.Thread(target=watch_outer, daemon=True).start()
+        return await _aoutcome(coworker.aexecute_task(_task(coworker, LATER_TASK)))
+
+    crewai_event_bus.on(AgentExecutionStartedEvent)(on_start)
+    try:
+        try:
+            outcome = run.time_out_then(
+                path, caught, later if path == "sync" else alater
+            )
+        finally:
+            outer_done.set()
+            assert run.drained()
+        assert crewai_event_bus.flush(timeout=10)
+    finally:
+        crewai_event_bus.off(AgentExecutionStartedEvent, on_start)
+
+    assert not isinstance(outcome, Exception), repr(outcome)
+    assert str(outcome) == "LATER-OWN"
+    with starts_lock:
+        begun = list(starts)
+    # One co-worker call began before the error; after it, only the later one.
+    assert begun.count(SUB_TASK) == 1, begun
+    assert begun.count(LATER_TASK) == 1, begun
+
+
+def _row_coworker_end_of_call_state(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L11: the abandoned co-worker call ends after a later one has ended."""
+    later_done = threading.Event()
+    run = _CoworkerRun(
+        recorder,
+        monkeypatch,
+        {
+            SUB_TASK: _held(later_done, _final("CO-FIRST")),
+            LATER_TASK: lambda: _final("LATER-OWN"),
+        },
+    )
+
+    def later(coworker: Agent) -> Any:
+        try:
+            return _outcome(
+                lambda: _task(coworker, LATER_TASK).execute_sync(agent=coworker)
+            )
+        finally:
+            later_done.set()
+
+    async def alater(coworker: Agent) -> Any:
+        try:
+            return await _aoutcome(
+                _task(coworker, LATER_TASK).aexecute_sync(agent=coworker)
+            )
+        finally:
+            later_done.set()
+
+    try:
+        output = run.time_out_then(path, caught, later if path == "sync" else alater)
+    finally:
+        later_done.set()
+        assert run.drained()
+
+    assert not isinstance(output, Exception), repr(output)
+    assert output.raw == "LATER-OWN"
+    for label, messages in (
+        ("task output", output.messages),
+        ("co-worker", run.coworker.last_messages),
+    ):
+        text = _messages_text(messages)
+        assert LATER_TASK in text, (label, text)
+        assert SUB_TASK not in text, (label, text)
+
+
+def _row_live_calls_on_one_agent(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L12: C starts while A runs and has not timed out."""
+    a_started = threading.Event()
+    c_returned = threading.Event()
+
+    def a_reply() -> str:
+        a_started.set()
+        c_returned.wait(HOLD_BOUND)
+        return _final("A-OWN")
+
+    @tool("tool_a")
+    def tool_a(x: str) -> str:
+        """A's tool."""
+        return "A"
+
+    @tool("tool_b")
+    def tool_b(x: str) -> str:
+        """C's tool."""
+        return "B"
+
+    llm = _ByTaskLLM(
+        "shared", recorder, {"A-TASK": a_reply, "C-TASK": lambda: _final("C-OWN")}
+    )
+    agent = _agent(llm, [], max_execution_time=30)
+    a_task = _task(agent, "A-TASK")
+    c_task = _task(agent, "C-TASK", output_json=_Extracted)
+    seen: dict[str, Any] = {}
+
+    def held_state() -> dict[str, Any]:
+        executor = seen["held"]
+        return {
+            "task": executor.task,
+            "response_model": executor.response_model,
+            "tools": sorted(t.name for t in executor.tools),
+        }
+
+    if path == "sync":
+        a_out: dict[str, Any] = {}
+        thread_a = threading.Thread(
+            target=lambda: a_out.__setitem__(
+                "A", _outcome(lambda: agent.execute_task(a_task, tools=[tool_a]))
+            )
+        )
+        thread_a.start()
+        try:
+            assert a_started.wait(HOLD_BOUND)
+            seen["held"] = agent.agent_executor
+            c_out = _outcome(lambda: agent.execute_task(c_task, tools=[tool_b]))
+            seen["after_c"] = held_state()
+        finally:
+            c_returned.set()
+            thread_a.join(DRAIN_BOUND)
+        a_result = a_out.get("A")
+    else:
+
+        async def scenario() -> tuple[Any, Any]:
+            async def run_c() -> Any:
+                try:
+                    assert await asyncio.to_thread(a_started.wait, HOLD_BOUND)
+                    seen["held"] = agent.agent_executor
+                    out = await _aoutcome(agent.aexecute_task(c_task, tools=[tool_b]))
+                    seen["after_c"] = held_state()
+                    return out
+                finally:
+                    c_returned.set()
+
+            return await asyncio.gather(
+                _aoutcome(agent.aexecute_task(a_task, tools=[tool_a])), run_c()
+            )
+
+        try:
+            a_result, c_out = asyncio.run(scenario())
+        finally:
+            c_returned.set()
+
+    assert _already_running(c_out), repr(c_out)
+    assert seen["after_c"] == {
+        "task": a_task,
+        "response_model": None,
+        "tools": ["tool_a"],
+    }, seen["after_c"]
+    assert not isinstance(a_result, Exception), repr(a_result)
+    assert str(a_result) == "A-OWN"
+    for text in llm.inputs_for("A-TASK"):
+        assert "C-TASK" not in text
+
+
+def _row_two_calls_choose_after_one_retirement(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L13: C and D, prepared before A's deadline, start together after it."""
+    a_started = threading.Event()
+    one_returned = threading.Event()
+    both_returned = threading.Event()
+
+    def a_reply() -> str:
+        a_started.set()
+        both_returned.wait(HOLD_BOUND)
+        return _final("A-OWN")
+
+    llm = _ByTaskLLM(
+        "shared",
+        recorder,
+        {
+            "A-TASK": a_reply,
+            "C-TASK": _held(one_returned, _final("C-OWN")),
+            "D-TASK": _held(one_returned, _final("D-OWN")),
+        },
+    )
+    agent = _agent(llm, [])
+    a_task = _task(agent, "A-TASK")
+    late = {"C": _task(agent, "C-TASK"), "D": _task(agent, "D-TASK")}
+    late_tasks = list(late.values())
+    outs: dict[str, Any] = {}
+    a_out: dict[str, Any] = {}
+
+    def returned(name: str, outcome: Any) -> None:
+        outs[name] = outcome
+        one_returned.set()
+        if len(outs) == 2:
+            both_returned.set()
+
+    if path == "sync":
+        barrier = threading.Barrier(2)
+        timed = agent._execute_with_timeout
+
+        def gated(task_prompt: str, task: Task, timeout: int) -> Any:
+            if task in late_tasks:
+                caught.wait(HOLD_BOUND)
+                barrier.wait(HOLD_BOUND)
+            return timed(task_prompt, task, timeout)
+
+        monkeypatch.setattr(agent, "_execute_with_timeout", gated)
+
+        def run_a() -> None:
+            try:
+                agent.execute_task(a_task)
+            except Exception as e:  # noqa: BLE001 - asserted below
+                a_out["A"] = e
+            finally:
+                caught.set()
+
+        def run_late(name: str) -> None:
+            returned(name, _outcome(lambda: agent.execute_task(late[name])))
+
+        thread_a = threading.Thread(target=run_a)
+        thread_a.start()
+        threads: list[threading.Thread] = []
+        try:
+            assert a_started.wait(HOLD_BOUND)
+            threads = [threading.Thread(target=run_late, args=(n,)) for n in late]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(DRAIN_BOUND)
+        finally:
+            both_returned.set()
+            thread_a.join(DRAIN_BOUND)
+    else:
+        atimed = agent._aexecute_with_timeout
+        arrived: list[str] = []
+
+        async def agated(task_prompt: str, task: Task, timeout: int) -> Any:
+            if task in late_tasks:
+                await asyncio.to_thread(caught.wait, HOLD_BOUND)
+                arrived.append(task.description)
+                while len(arrived) < 2:
+                    await asyncio.sleep(0)
+            return await atimed(task_prompt, task, timeout)
+
+        monkeypatch.setattr(agent, "_aexecute_with_timeout", agated)
+
+        async def scenario() -> None:
+            async def run_a() -> None:
+                try:
+                    await agent.aexecute_task(a_task)
+                except Exception as e:  # noqa: BLE001 - asserted below
+                    a_out["A"] = e
+                finally:
+                    caught.set()
+
+            async def run_late(name: str) -> None:
+                assert await asyncio.to_thread(a_started.wait, HOLD_BOUND)
+                returned(name, await _aoutcome(agent.aexecute_task(late[name])))
+
+            await asyncio.wait_for(
+                asyncio.gather(run_a(), run_late("C"), run_late("D")), DRAIN_BOUND
+            )
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            both_returned.set()
+    assert llm.answered["A-TASK"].wait(DRAIN_BOUND)
+
+    assert isinstance(a_out.get("A"), TimeoutError), a_out
+    assert set(outs) == {"C", "D"}, outs
+    own = [n for n, o in outs.items() if str(o) == f"{n}-OWN"]
+    refused = [n for n, o in outs.items() if _already_running(o)]
+    assert len(own) == 1 and len(refused) == 1, outs
+
+
+def _row_coworker_chooses_in_stopped_run(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """L14: a co-worker call whose preparation spans the outer deadline."""
+    from crewai.utilities.execution_stop import EXECUTION_STOPPED_MESSAGE
+
+    run = _CoworkerRun(recorder, monkeypatch, {SUB_TASK: lambda: _final("CO")})
+    coworker = run.coworker
+    finalize = coworker._finalize_task_prompt
+    prepared: list[Any] = []
+
+    def slow_preparation(task_prompt: str, tools: Any, task: Task) -> str:
+        prompt = finalize(task_prompt, tools, task)
+        prepared.append(coworker.agent_executor)
+        caught.wait(HOLD_BOUND)
+        return prompt
+
+    monkeypatch.setattr(coworker, "_finalize_task_prompt", slow_preparation)
+
+    def later(_: Agent) -> None:
+        return None
+
+    async def alater(_: Agent) -> None:
+        return None
+
+    try:
+        run.time_out_then(path, caught, later if path == "sync" else alater)
+    finally:
+        assert run.drained()
+
+    assert len(prepared) == 1, prepared
+    assert [str(e) for e in run.delegation_errors][:1] == [EXECUTION_STOPPED_MESSAGE]
+    assert coworker.agent_executor is prepared[0]
+    assert prepared[0] is not None and list(prepared[0].messages) == []
+    assert run.llm.inputs == []
+
+
+_OVERLAP_ROWS: dict[str, Callable[..., None]] = {
+    "L4-L5": _row_coworker_later_call,
+    "L6-L8": _row_prepared_before_step_running,
+    "L7-L9": _row_prepared_before_step_ended,
+    "L10": _row_stopped_coworker_reentry,
+    "L11": _row_coworker_end_of_call_state,
+    "L12": _row_live_calls_on_one_agent,
+    "L13": _row_two_calls_choose_after_one_retirement,
+    "L14": _row_coworker_chooses_in_stopped_run,
+}
+
+
+@pytest.mark.parametrize("path", ["sync", "async"])
+@pytest.mark.parametrize("row", list(_OVERLAP_ROWS))
+def test_v2l_later_and_overlapping_calls(
+    recorder: _Recorder,
+    caught: threading.Event,
+    monkeypatch: pytest.MonkeyPatch,
+    row: str,
+    path: str,
+) -> None:
+    """V2-L: a call that starts after the error is independent of the run.
+
+    Two live calls on one agent are still refused, and the stopped run
+    enters, retries and writes nothing on an agent after the error.
+    """
+    _OVERLAP_ROWS[row](recorder, caught, monkeypatch, path)
