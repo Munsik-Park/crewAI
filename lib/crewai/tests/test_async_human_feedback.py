@@ -3176,6 +3176,52 @@ def test_start_gated_on_an_outcome_two_routers_return_runs_for_each() -> None:
 
 
 @HOWS
+def test_start_gated_on_a_router_outcome_under_review_does_not_rerun(
+    how: str,
+) -> None:
+    """``gated`` waits on ``classify``'s outcome and pauses for its own review."""
+
+    def make(review: _Review, calls: list[Any]):
+        class GatedReview(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def classify(self):
+                calls.append("classify")
+                return "go"
+
+            @start("go")
+            @_hf(review)
+            def gated(self):
+                calls.append("gated")
+                return "G"
+
+            @listen("go")
+            def on_go(self):
+                calls.append("on_go")
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return GatedReview
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    assert now.count("gated") == 1
+    assert before.count("gated") == 1
+    assert "gated" not in after
+    for name in ("seed", "classify", "on_go"):
+        assert name not in after
+    assert _named(after, "publish") == _named(now, "publish")
+
+
+@HOWS
 def test_restored_batch_naming_a_removed_router(how: str) -> None:
     """``post`` follows the reviewed listener on ``seed`` and is gone on restore."""
     calls: list[Any] = []
