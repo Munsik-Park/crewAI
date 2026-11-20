@@ -515,6 +515,27 @@ def _encode_record_value(value: Any) -> LiveRecordValue:
     return LiveRecordValue(value, _stored_record_value)
 
 
+def _json_safe_or_string(value: Any) -> Any:
+    """``value``'s JSON-safe form, or its string form when that has no encoding.
+
+    A cycle or nesting past the recursion limit has none. The encoding is
+    tried where the call stack already holds the record's levels.
+    """
+    try:
+        safe = PendingFeedbackContext._make_json_safe(value)
+        json.dumps(safe)
+    except (RecursionError, TypeError, ValueError):
+        return _string_form(value)
+    return safe
+
+
+def _stored_callback_info(info: Any) -> Any:
+    """A queued review's callback info as saved: each entry in its JSON form."""
+    if isinstance(info, dict):
+        return {str(key): _json_safe_or_string(value) for key, value in info.items()}
+    return _json_safe_or_string(info)
+
+
 def _restored_key(key: Any) -> Any:
     if _is_tagged(key, _RECORD_TUPLE_TAG) and isinstance(key[_RECORD_TUPLE_TAG], list):
         return tuple(_restored_key(item) for item in key[_RECORD_TUPLE_TAG])
@@ -711,7 +732,11 @@ def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
             queue.append(
                 {
                     "context": other.context,
-                    "callback_info": other.callback_info or None,
+                    "callback_info": (
+                        LiveRecordValue(other.callback_info, _stored_callback_info)
+                        if other.callback_info
+                        else None
+                    ),
                 }
             )
         else:
@@ -3944,6 +3969,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             ):
                 continue
             info = entry.get("callback_info")
+            if isinstance(info, LiveRecordValue):
+                info = info.value
             pause = HumanFeedbackPending(
                 context=ctx, callback_info=info if isinstance(info, dict) else None
             )
