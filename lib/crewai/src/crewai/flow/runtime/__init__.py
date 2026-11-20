@@ -342,6 +342,141 @@ def _serialize_input_provider(value: Any) -> str | None:
     return _instance_to_dotted_path(value)
 
 
+_FEEDBACK_RESULT_TAG = "__crewai_human_feedback_result__"
+
+_DISPATCH_FRAME_KEYS = frozenset(
+    {
+        "kind",
+        "trigger_method",
+        "result",
+        "current_trigger",
+        "router_results",
+        "payloads",
+        "feedback",
+        "ran",
+        "batch",
+        "rearmable",
+        "trigger_index",
+        "stage",
+        "rearm_first",
+    }
+)
+
+
+def _router_outcome(value: Any) -> str | None:
+    """The event a router's return value triggers: its ``Enum`` value or string."""
+    if value is None:
+        return None
+    return str(value.value if isinstance(value, enum.Enum) else value)
+
+
+def _encode_record_value(value: Any) -> Any:
+    """Tag a ``HumanFeedbackResult`` so a restored record rebuilds it."""
+    if isinstance(value, HumanFeedbackResult):
+        return {
+            _FEEDBACK_RESULT_TAG: {
+                "output": value.output,
+                "feedback": value.feedback,
+                "outcome": value.outcome,
+                "timestamp": value.timestamp.isoformat(),
+                "method_name": value.method_name,
+                "metadata": value.metadata,
+            }
+        }
+    return value
+
+
+def _decode_record_value(value: Any) -> Any:
+    """Rebuild a value tagged by ``_encode_record_value``; return others as is."""
+    if not (isinstance(value, dict) and set(value) == {_FEEDBACK_RESULT_TAG}):
+        return value
+    fields = value[_FEEDBACK_RESULT_TAG]
+    if not isinstance(fields, dict):
+        return value
+    try:
+        return HumanFeedbackResult(
+            output=fields.get("output"),
+            feedback=str(fields.get("feedback", "")),
+            outcome=fields.get("outcome"),
+            timestamp=datetime.fromisoformat(str(fields.get("timestamp"))),
+            method_name=str(fields.get("method_name", "")),
+            metadata=dict(fields.get("metadata") or {}),
+        )
+    except (TypeError, ValueError):
+        return value
+
+
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_valid_frame(frame: Any) -> bool:
+    """Whether a recorded dispatch frame has every field, each of its type."""
+    if not isinstance(frame, dict):
+        return False
+    if frame.get("kind") == "start_outcome":
+        return isinstance(frame.get("result"), str)
+    if frame.get("kind") != "dispatch" or not _DISPATCH_FRAME_KEYS <= frame.keys():
+        return False
+    ran = frame["ran"]
+    trigger_index = frame["trigger_index"]
+    inflight = frame.get("inflight_result")
+    return (
+        isinstance(frame["trigger_method"], str)
+        and isinstance(frame["current_trigger"], str)
+        and _is_str_list(frame["router_results"])
+        and isinstance(frame["payloads"], dict)
+        and isinstance(frame["feedback"], dict)
+        and isinstance(ran, dict)
+        and all(_is_str_list(names) for names in ran.values())
+        and (frame["batch"] is None or _is_str_list(frame["batch"]))
+        and (frame["rearmable"] is None or _is_str_list(frame["rearmable"]))
+        and isinstance(trigger_index, int)
+        and not isinstance(trigger_index, bool)
+        and 0 <= trigger_index <= len(frame["router_results"]) + 1
+        and frame["stage"] in ("listeners", "starts")
+        and isinstance(frame["rearm_first"], bool)
+        and (inflight is None or isinstance(inflight, str))
+    )
+
+
+def _valid_frames(record: Any) -> list[dict[str, Any]] | None:
+    """The recorded dispatch frames, or ``None`` when absent or malformed."""
+    frames = record.get("frames") if isinstance(record, dict) else None
+    if isinstance(frames, list) and frames and all(map(_is_valid_frame, frames)):
+        return frames
+    return None
+
+
+def _dispatch_frame(st: dict[str, Any]) -> dict[str, Any]:
+    """A dispatch position as a record frame of plain values."""
+    frame = dict(st)
+    frame.update(
+        kind="dispatch",
+        result=_encode_record_value(st["result"]),
+        router_results=list(st["router_results"]),
+        payloads={k: _encode_record_value(v) for k, v in st["payloads"].items()},
+        feedback={k: _encode_record_value(v) for k, v in st["feedback"].items()},
+        ran={k: sorted(v) for k, v in st["ran"].items()},
+        batch=list(st["batch"]) if st["batch"] is not None else None,
+        rearmable=sorted(st["rearmable"]) if st["rearmable"] is not None else None,
+    )
+    return frame
+
+
+def _dispatch_state(frame: dict[str, Any]) -> dict[str, Any]:
+    """The dispatch position a record frame holds, with its values rebuilt."""
+    st = dict(frame)
+    st.update(
+        result=_decode_record_value(frame["result"]),
+        router_results=list(frame["router_results"]),
+        payloads={k: _decode_record_value(v) for k, v in frame["payloads"].items()},
+        feedback={k: _decode_record_value(v) for k, v in frame["feedback"].items()},
+        batch=list(frame["batch"]) if frame["batch"] is not None else None,
+    )
+    return st
+
+
 _INITIAL_STATE_CLASS_MARKER = "__crewai_pydantic_class_schema__"
 
 
@@ -1090,6 +1225,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         with self._or_listeners_lock:
             record["fired_or_listeners"] = sorted(self._fired_or_listeners)
         record["completed_methods"] = sorted(self._completed_methods)
+        record.pop("returned", None)
+        if not context.emit:
+            # Only a review with ``emit`` continues the recorded dispatches.
+            record.pop("frames", None)
         context.resume_record = record
 
     def _restore_resume_record(self, context: PendingFeedbackContext) -> None:
@@ -1115,23 +1254,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         completed = record.get("completed_methods")
         if isinstance(completed, list):
             self._completed_methods = {FlowMethodName(name) for name in completed}
-
-    async def _execute_trigger_joins(
-        self, reviewed: FlowMethodName, trigger: FlowMethodName, value: Any
-    ) -> None:
-        """Run listeners joining a reviewed listener with the event that triggered it.
-
-        The pause interrupted the trigger's dispatch before its plain listeners
-        were checked, so joins on both events see the trigger here, with the
-        value they would have received from it.
-        """
-        joins = self._find_triggered_methods(
-            trigger, router_only=False, involving=(reviewed, trigger)
-        )
-        if joins:
-            await asyncio.gather(
-                *[self._execute_single_listener(name, value) for name in joins]
-            )
 
     def _clear_or_listeners(self) -> None:
         """Clear fired OR listeners for cyclic flows."""
@@ -1641,30 +1763,26 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         try:
             if emit and collapsed_outcome:
-                # The reviewed method's own subscribers get the outcome, then
-                # the label's subscribers get the result.
                 reviewed = FlowMethodName(context.method_name)
-                has_record = context.resume_record is not None
-                record = context.resume_record or {}
-                trigger = record.get("trigger")
-                await self._execute_listeners(reviewed, collapsed_outcome)
-                if isinstance(trigger, str) and trigger:
-                    await self._execute_trigger_joins(
-                        reviewed, FlowMethodName(trigger), record.get("trigger_value")
+                record = context.resume_record
+                frames = _valid_frames(record)
+                if isinstance(record, dict):
+                    record.pop("frames", None)
+                if frames is not None:
+                    await self._continue_dispatches(
+                        frames, reviewed, collapsed_outcome, result
                     )
-                # A reviewed listener re-arms fired or_ listeners for its label;
-                # a reviewed start does not. Without a record, the definition
-                # tells which one it was.
-                reviewed_as_listener = (
-                    isinstance(trigger, str) and bool(trigger)
-                    if has_record
-                    else not self._definition.methods[str(reviewed)].is_start
-                )
-                await self._execute_listeners(
-                    FlowMethodName(collapsed_outcome),
-                    result,
-                    rearm_trigger=reviewed_as_listener,
-                )
+                else:
+                    # Own subscribers, then the label's; a reviewed listener
+                    # re-arms fired or_ listeners for its label, a start does not.
+                    await self._execute_listeners(reviewed, collapsed_outcome)
+                    await self._execute_listeners(
+                        FlowMethodName(collapsed_outcome),
+                        result,
+                        rearm_trigger=not self._definition.methods[
+                            str(reviewed)
+                        ].is_start,
+                    )
             else:
                 await self._execute_listeners(
                     FlowMethodName(context.method_name),
@@ -2944,7 +3062,18 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         # If start method is a router, use its result as an additional trigger
         if self._is_router(start_method_name) and result is not None:
             # Execute listeners for the start method name first
-            await self._execute_listeners(start_method_name, result, finished_event_id)
+            try:
+                await self._execute_listeners(
+                    start_method_name, result, finished_event_id
+                )
+            except HumanFeedbackPending as pending:
+                record = pending.context.resume_record
+                if record is None:
+                    record = pending.context.resume_record = {}
+                record.setdefault("frames", []).append(
+                    {"kind": "start_outcome", "result": _router_outcome(result)}
+                )
+                raise
             # Then execute listeners for the router result (e.g., "approved")
             router_result = result.value if isinstance(result, enum.Enum) else result
             router_result_trigger = FlowMethodName(str(router_result))
@@ -3249,9 +3378,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
-        This internal method manages the execution flow by:
-        1. First executing all triggered routers sequentially
-        2. Then executing all triggered listeners in parallel
+        Routers run first, one batch per trigger, each outcome becoming the next
+        trigger; then the plain listeners of every trigger seen run in parallel,
+        and starts gated on a router outcome are checked. A review pause raised
+        under this dispatch records where it stopped, so resume can continue it.
 
         Args:
             trigger_method: The name of the method that triggered these listeners.
@@ -3259,110 +3389,138 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
             rearm_trigger: Re-arm fired or_ listeners on ``trigger_method`` too, as
-                is done for router outcomes (used when it is a reviewed
-                listener's outcome).
-
-        Note:
-            - Routers are executed sequentially to maintain flow control
-            - Each router's result becomes a new trigger_method
-            - Normal listeners are executed in parallel for efficiency
-            - Listeners can receive the trigger method's result as a parameter
+                is done for router outcomes.
         """
-        # First, handle routers repeatedly until no router triggers anymore
-        router_results = []
-        router_result_payloads: dict[str, Any] = {}
-        router_result_to_feedback: dict[
-            str, Any
-        ] = {}  # Map outcome -> HumanFeedbackResult
-        current_trigger = trigger_method
-        current_result = result  # Track the result to pass to each router
+        state: dict[str, Any] = {
+            "trigger_method": str(trigger_method),
+            "result": result,
+            "current_trigger": str(trigger_method),
+            "router_results": [],
+            "payloads": {},
+            "feedback": {},
+            "ran": {},
+            "batch": None,
+            "rearmable": None,
+            "trigger_index": 0,
+            "stage": "listeners",
+            "rearm_first": rearm_trigger,
+        }
+        await self._run_dispatch(state, triggering_event_id)
+
+    async def _run_dispatch(
+        self, st: dict[str, Any], triggering_event_id: str | None = None
+    ) -> None:
+        """Run a dispatch from the position held in ``st``.
+
+        When a review pause unwinds through it, the position is appended to
+        the pending context's record as a dispatch frame.
+        """
+        try:
+            await self._run_dispatch_steps(st, triggering_event_id)
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            returned = record.pop("returned", None)
+            if (
+                st["batch"]
+                and isinstance(returned, dict)
+                and returned.get("name") == st["batch"][0]
+            ):
+                st["inflight_result"] = returned.get("result")
+            record.setdefault("frames", []).append(_dispatch_frame(st))
+            raise
+
+    async def _run_dispatch_steps(
+        self, st: dict[str, Any], triggering_event_id: str | None
+    ) -> None:
+        """Advance a dispatch, keeping its position in ``st`` up to date.
+
+        ``batch`` holds the routers of the current trigger not yet finished,
+        ``trigger_index`` the trigger whose listeners run next, and ``stage``
+        whether that trigger's listeners or only its gated starts remain.
+        ``ran`` holds the methods already run per trigger, so a conditional
+        start that also listens to the same event is not run a second time.
+        """
         current_triggering_event_id = triggering_event_id
-        # Methods already run per trigger, so a conditional start that also
-        # listens to the same event is not run a second time below.
-        ran_for_trigger: dict[str, set[FlowMethodName]] = {}
-
+        ran: dict[str, set[str]] = {k: set(v) for k, v in st["ran"].items()}
+        st["ran"] = ran
         while True:
-            routers_triggered = self._find_triggered_methods(
-                current_trigger, router_only=True
-            )
-            if not routers_triggered:
-                break
-            ran_for_trigger.setdefault(str(current_trigger), set()).update(
-                routers_triggered
-            )
-
-            batch_trigger = current_trigger
-            for router_name in routers_triggered:
-                # For routers triggered by a router outcome, pass the HumanFeedbackResult
-                router_input = router_result_to_feedback.get(
-                    str(current_trigger), current_result
+            if st["batch"] is None:
+                current = FlowMethodName(st["current_trigger"])
+                routers_triggered = self._find_triggered_methods(
+                    current, router_only=True
                 )
-                try:
+                if not routers_triggered:
+                    break
+                ran.setdefault(str(current), set()).update(routers_triggered)
+                st["batch"] = [str(name) for name in routers_triggered]
+            while st["batch"]:
+                router_name = FlowMethodName(st["batch"][0])
+                if "inflight_result" in st:
+                    router_result = st.pop("inflight_result")
+                elif router_name not in self._methods:
+                    st["batch"].pop(0)
+                    continue
+                else:
+                    # For routers triggered by a router outcome, pass the HumanFeedbackResult
+                    router_input = st["feedback"].get(
+                        st["current_trigger"], st["result"]
+                    )
                     (
                         router_result,
                         current_triggering_event_id,
                     ) = await self._execute_single_listener(
                         router_name, router_input, current_triggering_event_id
                     )
-                except HumanFeedbackPending as pending:
-                    # The router paused for review: record the event that
-                    # triggered it, so resume can close joins on that event.
-                    record = pending.context.resume_record or {}
-                    if (
-                        pending.context.method_name == str(router_name)
-                        and "trigger" not in record
-                    ):
-                        pending.context.resume_record = {
-                            **record,
-                            "trigger": str(batch_trigger),
-                            "trigger_value": router_result_payloads.get(
-                                str(batch_trigger), result
-                            ),
-                        }
-                    raise
+                st["batch"].pop(0)
                 if router_result is None:
-                    current_trigger = FlowMethodName("")
+                    st["current_trigger"] = ""
                     continue
-
                 router_result = (
                     router_result.value
                     if isinstance(router_result, enum.Enum)
                     else router_result
                 )
                 router_result_str = str(router_result)
-                router_result_event = FlowMethodName(router_result_str)
-                router_results.append(router_result_event)
-                router_result_payloads[router_result_str] = (
+                st["router_results"].append(router_result_str)
+                st["payloads"][router_result_str] = (
                     self.last_human_feedback
                     if self.last_human_feedback is not None
                     else router_result
                 )
-
                 if self.last_human_feedback is not None:
-                    router_result_to_feedback[router_result_str] = (
-                        self.last_human_feedback
-                    )
-                current_trigger = router_result_event
+                    st["feedback"][router_result_str] = self.last_human_feedback
+                st["current_trigger"] = router_result_str
+            st["batch"] = None
+            if not st["current_trigger"]:
+                break
 
-        all_triggers = [trigger_method, *router_results]
+        if st["rearmable"] is None:
+            with self._or_listeners_lock:
+                st["rearmable"] = set(self._fired_or_listeners)
+        else:
+            st["rearmable"] = set(st["rearmable"])
+        rearmable: set[FlowMethodName] = st["rearmable"]
+        all_triggers = [st["trigger_method"], *st["router_results"]]
+        router_results = set(st["router_results"])
 
-        with self._or_listeners_lock:
-            rearmable: set[FlowMethodName] = set(self._fired_or_listeners)
-
-        for idx, current_trigger in enumerate(all_triggers):
-            if current_trigger:
-                if (idx > 0 or rearm_trigger) and rearmable:
+        while st["trigger_index"] < len(all_triggers):
+            idx = st["trigger_index"]
+            trigger = all_triggers[idx]
+            current_trigger = FlowMethodName(trigger)
+            if trigger and st["stage"] == "listeners":
+                if (idx > 0 or st["rearm_first"]) and rearmable:
                     self._rearm_or_listeners_for_trigger(current_trigger, rearmable)
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
                 )
-                ran_for_trigger.setdefault(str(current_trigger), set()).update(
-                    listeners_triggered
-                )
+                ran.setdefault(trigger, set()).update(listeners_triggered)
+                # From here the trigger's listeners are running: a pause under
+                # them leaves only the start check of this trigger to do.
+                st["stage"] = "starts"
                 if listeners_triggered:
-                    listener_result = router_result_payloads.get(
-                        str(current_trigger), result
-                    )
+                    listener_result = st["payloads"].get(trigger, st["result"])
                     racing_group = self._get_racing_group_for_listeners(
                         listeners_triggered
                     )
@@ -3380,31 +3538,85 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                             current_triggering_event_id,
                         )
                     else:
-                        tasks = [
-                            self._execute_single_listener(
-                                listener_name,
-                                listener_result,
-                                current_triggering_event_id,
-                            )
-                            for listener_name in listeners_triggered
-                        ]
-                        await asyncio.gather(*tasks)
+                        await asyncio.gather(
+                            *[
+                                self._execute_single_listener(
+                                    name, listener_result, current_triggering_event_id
+                                )
+                                for name in listeners_triggered
+                            ]
+                        )
+            if trigger and trigger in router_results:
+                for method_name in self._start_method_names():
+                    if method_name in ran.get(trigger, set()):
+                        continue
+                    if not self._start_condition_triggered_by(
+                        method_name, current_trigger
+                    ):
+                        continue
+                    ran.setdefault(trigger, set()).add(method_name)
+                    if method_name in self._completed_methods:
+                        # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
+                        was_resuming = self._is_execution_resuming
+                        self._is_execution_resuming = False
+                        await self._execute_start_method(method_name)
+                        self._is_execution_resuming = was_resuming
+                    else:
+                        await self._execute_start_method(method_name)
+            st["trigger_index"] = idx + 1
+            st["stage"] = "listeners"
 
-                if current_trigger in router_results:
-                    for method_name in self._start_method_names():
-                        if self._start_condition_triggered_by(
-                            method_name, current_trigger
-                        ) and method_name not in ran_for_trigger.get(
-                            str(current_trigger), set()
-                        ):
-                            if method_name in self._completed_methods:
-                                # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
-                                was_resuming = self._is_execution_resuming
-                                self._is_execution_resuming = False
-                                await self._execute_start_method(method_name)
-                                self._is_execution_resuming = was_resuming
-                            else:
-                                await self._execute_start_method(method_name)
+    async def _continue_dispatches(
+        self,
+        frames: list[dict[str, Any]],
+        reviewed: FlowMethodName,
+        outcome: str,
+        result: Any,
+    ) -> None:
+        """Continue the dispatches a review pause interrupted, innermost first.
+
+        If a review pauses again, the frames not yet continued are appended
+        after the ones recorded by that pause.
+        """
+        index = 0
+        try:
+            first = frames[0] if frames else None
+            if (
+                first is not None
+                and first.get("kind") == "dispatch"
+                and first.get("batch")
+                and first["batch"][0] == str(reviewed)
+                and "inflight_result" not in first
+            ):
+                # The reviewed method ran as a router listener: its own
+                # subscribers get the outcome, then its dispatch continues with
+                # the outcome as the router's result.
+                first["inflight_result"] = outcome
+                await self._execute_listeners(reviewed, outcome)
+            else:
+                # The reviewed method ran as a start: its own subscribers, then
+                # its outcome's.
+                await self._execute_listeners(reviewed, outcome)
+                await self._execute_listeners(FlowMethodName(outcome), result)
+            while index < len(frames):
+                frame = frames[index]
+                index += 1
+                if frame.get("kind") == "dispatch":
+                    await self._run_dispatch(_dispatch_state(frame))
+                elif frame.get("kind") == "start_outcome":
+                    out = frame.get("result")
+                    payload = (
+                        self.last_human_feedback
+                        if self.last_human_feedback is not None
+                        else out
+                    )
+                    await self._execute_listeners(FlowMethodName(str(out)), payload)
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            record.setdefault("frames", []).extend(frames[index:])
+            raise
 
     def _condition_met(
         self,
@@ -3423,19 +3635,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self,
         trigger_method: FlowMethodName,
         router_only: bool,
-        involving: tuple[FlowMethodName, ...] = (),
     ) -> list[FlowMethodName]:
-        # ``involving`` limits the check to listeners whose condition names
-        # every one of these events; the others do not see the trigger.
         triggered: list[FlowMethodName] = []
 
         for listener_name, method_definition, condition in self._listener_methods():
             is_router = method_definition.router
             if router_only != is_router:
-                continue
-            if involving and not set(map(str, involving)) <= set(
-                _iter_condition_events(condition)
-            ):
                 continue
 
             should_check_fired = _is_multi_event_or(condition) and not is_router
@@ -3543,9 +3748,20 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         listener_name, method
                     )
 
-            await self._execute_listeners(
-                listener_name, listener_result, finished_event_id
-            )
+            try:
+                await self._execute_listeners(
+                    listener_name, listener_result, finished_event_id
+                )
+            except HumanFeedbackPending as pending:
+                if self._is_router(listener_name):
+                    record = pending.context.resume_record
+                    if record is None:
+                        record = pending.context.resume_record = {}
+                    record["returned"] = {
+                        "name": str(listener_name),
+                        "result": _router_outcome(listener_result),
+                    }
+                raise
 
             return (listener_result, finished_event_id)
 

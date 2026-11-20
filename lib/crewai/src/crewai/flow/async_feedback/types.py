@@ -44,9 +44,10 @@ class PendingFeedbackContext:
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
         resume_record: Run bookkeeping written by the runtime when it saves the
-            pause (completed methods, join progress, fired ``or_`` listeners,
-            and, for a reviewed listener, the event that triggered it and its
-            value). Resume uses it to close joins and keep ``or_`` listeners
+            pause: completed methods, join progress, fired ``or_`` listeners
+            and, for a review with ``emit``, where each dispatch the pause
+            interrupted stopped, with the values it passes on. Resume uses it to
+            continue those dispatches, close joins and keep ``or_`` listeners
             firing once across the pause. ``None`` when the context holds no
             record.
 
