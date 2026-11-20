@@ -1350,9 +1350,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             record["fired_or_listeners"] = sorted(self._fired_or_listeners)
         record["completed_methods"] = sorted(self._completed_methods)
         record.pop("returned", None)
-        if not context.emit:
-            # Only a review with ``emit`` continues the recorded dispatches.
-            record.pop("frames", None)
         context.resume_record = record
 
     def _restore_resume_record(self, context: PendingFeedbackContext) -> None:
@@ -1892,31 +1889,32 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             else None
         )
         queued = queued if isinstance(queued, list) else []
+        reviewed = FlowMethodName(context.method_name)
+        record = context.resume_record
+        frames = _valid_frames(record)
+        if isinstance(record, dict):
+            record.pop("frames", None)
         try:
-            if emit and collapsed_outcome:
-                reviewed = FlowMethodName(context.method_name)
-                record = context.resume_record
-                frames = _valid_frames(record)
-                if isinstance(record, dict):
-                    record.pop("frames", None)
-                if frames is not None:
-                    await self._continue_dispatches(
-                        frames, reviewed, collapsed_outcome, result
-                    )
-                else:
-                    # Own subscribers, then the label's; a reviewed listener
-                    # re-arms fired or_ listeners for its label, a start does not.
-                    await self._dispatch_router_completion(
-                        reviewed,
-                        collapsed_outcome,
-                        collapsed_outcome,
-                        rearm=not self._definition.methods[str(reviewed)].is_start,
-                    )
-            else:
-                await self._execute_listeners(
-                    FlowMethodName(context.method_name),
+            if frames is not None:
+                # The reviewed method's subscribers (and, with an outcome, the
+                # outcome's), then every interrupted dispatch, innermost first.
+                await self._continue_dispatches(
+                    frames,
+                    reviewed,
+                    collapsed_outcome if emit and collapsed_outcome else None,
                     result,
                 )
+            elif emit and collapsed_outcome:
+                # Own subscribers, then the label's; a reviewed listener
+                # re-arms fired or_ listeners for its label, a start does not.
+                await self._dispatch_router_completion(
+                    reviewed,
+                    collapsed_outcome,
+                    collapsed_outcome,
+                    rearm=not self._definition.methods[str(reviewed)].is_start,
+                )
+            else:
+                await self._execute_listeners(reviewed, result)
             self._raise_queued_pause(queued)
         except Exception as e:
             # Check if flow was paused again for human feedback (loop case)
@@ -3687,11 +3685,13 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         self,
         frames: list[_RecordFrame],
         reviewed: FlowMethodName,
-        outcome: str,
+        outcome: str | None,
         result: Any,
     ) -> None:
         """Continue the dispatches a review pause interrupted, innermost first.
 
+        With ``outcome`` ``None`` (a review without ``emit``) the reviewed
+        method's own subscribers get ``result`` and no outcome is dispatched.
         If a review pauses again, the frames not yet continued are appended
         after the ones recorded by that pause.
         """
@@ -3709,7 +3709,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 # subscribers get the outcome, then its dispatch continues with
                 # the outcome as the router's result.
                 first["inflight_result"] = outcome
-                await self._execute_listeners(reviewed, outcome)
+                await self._execute_listeners(
+                    reviewed, result if outcome is None else outcome
+                )
+            elif outcome is None:
+                await self._execute_listeners(reviewed, result)
             else:
                 # The reviewed method ran as a start: its own subscribers, then
                 # its outcome's.
