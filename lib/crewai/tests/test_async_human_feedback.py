@@ -3438,3 +3438,566 @@ def test_malformed_dispatch_record_resumes_as_a_row_without_it(how: str) -> None
                 wrong[label] = list(calls)
 
     assert wrong == {}
+
+
+# Every place a review can pause: the reviewed start re-paused in its own
+# dispatch, and work running beside the review when it pauses.
+
+
+class _SignalledReview:
+    """A review that sets ``requested`` before it answers or pauses.
+
+    A method that must still be running when the review pauses waits on
+    ``requested`` and then a little longer, so it completes after the pause.
+    """
+
+    def __init__(self, review: _Review) -> None:
+        self.review = review
+        self.requested = threading.Event()
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        self.requested.set()
+        return self.review.request_feedback(context, flow)
+
+
+def _after_the_review(signal: _SignalledReview) -> None:
+    assert signal.requested.wait(10), "no review was requested"
+    threading.Event().wait(0.3)
+
+
+async def _after_the_review_async(signal: _SignalledReview) -> None:
+    for _ in range(1000):
+        if signal.requested.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert signal.requested.is_set(), "no review was requested"
+    await asyncio.sleep(0.3)
+
+
+def _value(value: Any) -> Any:
+    """A listener's argument, with a review result compared by its fields."""
+    if isinstance(value, HumanFeedbackResult):
+        return ("review", value.method_name, value.output, value.outcome)
+    return value
+
+
+def _hf_signalled(
+    signal: _SignalledReview, emit: tuple[str, str] = ("approved", "rejected")
+) -> Any:
+    return human_feedback(
+        message="Review:",
+        emit=list(emit),
+        llm="gpt-4o-mini",
+        default_outcome=emit[0],
+        provider=signal,
+    )
+
+
+def _run_every_pause(
+    make: ShapeFactory, tmpdir: str, how: str, restore_each_time: bool
+) -> tuple[list[Any], list[Any], list[str]]:
+    """Kick off, then resume until the run ends.
+
+    Returns the calls before the first pause, the calls after it, and the
+    reviewed method of each pause in the order the pauses came. Every resume
+    after the first is on a restored flow, or on the flow first restored.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    paused_for = [out.context.method_name]
+    before = list(calls)
+    calls.clear()
+    flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    for _ in range(5):
+        out = _resume(flow, how)
+        if not isinstance(out, HumanFeedbackPending):
+            return before, calls, paused_for
+        paused_for.append(out.context.method_name)
+        if restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    raise AssertionError("the run kept pausing")
+
+
+def _calls_of(calls: list[Any], *names: str) -> list[Any]:
+    """The calls of the given methods, in a fixed order."""
+    picked = [c for c in calls if (c[0] if isinstance(c, tuple) else c) in names]
+    return sorted(picked, key=repr)
+
+
+def _f1_reviewed_start_paused_again_in_its_own_dispatch(
+    review: _Review, calls: list[Any]
+):
+    class F1(Flow):
+        @start()
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+        @listen(and_(draft, check))
+        def joined(self, value):
+            calls.append(("joined", _value(value)))
+
+    return F1
+
+
+def _gated_start_paused_again_in_its_own_dispatch(review: _Review, calls: list[Any]):
+    class GatedAgain(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @start("go")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    return GatedAgain
+
+
+def _k11_start_still_running_at_the_pause(sync: bool) -> ShapeFactory:
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class TwoStarts(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            if sync:
+
+                @start()
+                def other_start(self):
+                    _after_the_review(signal)
+                    calls.append("other_start")
+                    return "O"
+
+            else:
+
+                @start()
+                async def other_start(self):
+                    await _after_the_review_async(signal)
+                    calls.append("other_start")
+                    return "O"
+
+            @listen(other_start)
+            def after_other(self, value):
+                calls.append(("after_other", _value(value)))
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", _value(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen(and_(draft, other_start))
+            def combine(self, value):
+                calls.append(("combine", _value(value)))
+
+        return TwoStarts
+
+    return make
+
+
+def _two_reviewed_starts(slower: str) -> ShapeFactory:
+    """``draft`` and ``other`` are both reviewed; ``slower`` asks after the other."""
+
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class TwoReviews(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                if slower == "draft":
+                    _after_the_review(signal)
+                calls.append("draft")
+                return "D"
+
+            @start()
+            @_hf_signalled(signal, ("ok", "no"))
+            def other(self):
+                if slower == "other":
+                    _after_the_review(signal)
+                calls.append("other")
+                return "O"
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+            @listen(and_(draft, other))
+            def combine(self, value):
+                calls.append(("combine", _value(value)))
+
+        return TwoReviews
+
+    return make
+
+
+def _plain_sibling_beside_the_paused_listener(review: _Review, calls: list[Any]):
+    signal = _SignalledReview(review)
+
+    class PassSibling(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(seed)
+        def b(self):
+            _after_the_review(signal)
+            calls.append("b")
+            return "B"
+
+        @listen(a)
+        @_hf_signalled(signal)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(b)
+        def after_b(self, value):
+            calls.append(("after_b", _value(value)))
+
+        @listen(and_(b, draft))
+        def combine(self, value):
+            calls.append(("combine", _value(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+    return PassSibling
+
+
+def _two_siblings_each_lead_to_a_review(review: _Review, calls: list[Any]):
+    signal = _SignalledReview(review)
+
+    class PassTwoReviews(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(seed)
+        def b(self):
+            _after_the_review(signal)
+            calls.append("b")
+            return "B"
+
+        @listen(a)
+        @_hf_signalled(signal)
+        def d1(self):
+            calls.append("d1")
+            return "1"
+
+        @listen(b)
+        @_hf_signalled(signal, ("ok", "no"))
+        def d2(self):
+            calls.append("d2")
+            return "2"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+        @listen(and_(d1, d2))
+        def combine(self, value):
+            calls.append(("combine", _value(value)))
+
+    return PassTwoReviews
+
+
+def _expected(listeners: dict[str, list[Any]]) -> list[Any]:
+    return sorted(
+        ((name, value) for name, values in listeners.items() for value in values),
+        key=repr,
+    )
+
+
+SECONDS = pytest.mark.parametrize("second", ["restored", "same_instance"])
+
+
+@HOWS
+@SECONDS
+class TestResumeAtEveryPauseSite:
+    """Each run resumes until it ends and gives what the run answered at once gives."""
+
+    def _check(
+        self,
+        make: ShapeFactory,
+        how: str,
+        second: str,
+        listeners: dict[str, list[Any]],
+        each_once: tuple[str, ...],
+        pauses: list[str],
+        settled: tuple[str, ...] = (),
+        paused_values: dict[str, list[Any]] | None = None,
+    ) -> None:
+        """``listeners`` gives each listener's arguments over the whole run.
+
+        ``paused_values`` replaces some of them for the paused run. Each
+        method in ``each_once`` runs once over the whole run; ``pauses`` are
+        the reviews in the order the run pauses for them; each method in
+        ``settled`` completes before the first pause and not after it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after, paused_for = _run_every_pause(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        names = tuple(listeners)
+        assert _calls_of(now, *names) == _expected(listeners)
+        assert _calls_of(before + after, *names) == _expected(
+            {**listeners, **(paused_values or {})}
+        )
+        assert paused_for == pauses
+        for name in each_once:
+            assert now.count(name) == 1
+            assert (before + after).count(name) == 1
+        for name in settled:
+            assert _calls_of(before, name) != []
+            assert _calls_of(after, name) == []
+
+    def test_reviewed_start_paused_again_in_its_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        # The outcome listener gets the latest review's result, as at once.
+        check = ("review", "check", "C", "ok")
+        self._check(
+            _f1_reviewed_start_paused_again_in_its_own_dispatch,
+            how,
+            second,
+            listeners={"publish": [check], "fin": [check], "joined": ["approved"]},
+            each_once=("draft", "check"),
+            pauses=["draft", "check"],
+        )
+
+    def test_gated_start_paused_again_in_its_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        check = ("review", "check", "C", "ok")
+        self._check(
+            _gated_start_paused_again_in_its_own_dispatch,
+            how,
+            second,
+            listeners={"publish": [check], "fin": [check]},
+            each_once=("seed", "classify", "draft", "check"),
+            pauses=["draft", "check"],
+        )
+
+    # A join gets the value of the completion that fires it. At once that is
+    # the member completing last; paused, the members that settled before the
+    # pause complete first, so the review answered last fires the join.
+
+    @pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+    def test_start_still_running_at_the_pause(
+        self, how: str, second: str, sync: bool
+    ) -> None:
+        self._check(
+            _k11_start_still_running_at_the_pause(sync),
+            how,
+            second,
+            listeners={
+                "after_other": ["O"],
+                "audit": ["approved"],
+                "publish": [("review", "draft", "D", "approved")],
+                "combine": ["O"],
+            },
+            each_once=("draft", "other_start"),
+            pauses=["draft"],
+            settled=("other_start", "after_other"),
+            paused_values={"combine": ["approved"]},
+        )
+
+    @pytest.mark.parametrize("slower", ["other", "draft"])
+    def test_sibling_start_paused_for_its_own_review(
+        self, how: str, second: str, slower: str
+    ) -> None:
+        # The reviews are asked for in definition order, whichever is slower.
+        self._check(
+            _two_reviewed_starts(slower),
+            how,
+            second,
+            listeners={
+                "publish": [("review", "draft", "D", "approved")],
+                "fin": [("review", "other", "O", "ok")],
+                "combine": ["ok" if slower == "other" else "approved"],
+            },
+            each_once=("draft", "other"),
+            pauses=["draft", "other"],
+            settled=("draft", "other"),
+            paused_values={"combine": ["ok"]},
+        )
+
+    def test_plain_sibling_still_running_beside_the_paused_listener(
+        self, how: str, second: str
+    ) -> None:
+        self._check(
+            _plain_sibling_beside_the_paused_listener,
+            how,
+            second,
+            listeners={
+                "after_b": ["B"],
+                "publish": [("review", "draft", "D", "approved")],
+                "combine": ["B"],
+            },
+            each_once=("seed", "a", "b", "draft"),
+            pauses=["draft"],
+            settled=("b", "after_b"),
+            paused_values={"combine": ["approved"]},
+        )
+
+    def test_two_siblings_each_lead_to_a_review(self, how: str, second: str) -> None:
+        self._check(
+            _two_siblings_each_lead_to_a_review,
+            how,
+            second,
+            listeners={
+                "publish": [("review", "d1", "1", "approved")],
+                "fin": [("review", "d2", "2", "ok")],
+                "combine": ["ok"],
+            },
+            each_once=("seed", "a", "b", "d1", "d2"),
+            pauses=["d1", "d2"],
+            settled=("b", "d2"),
+        )
+
+
+def _review_with_another_review_later(review: _Review, calls: list[Any]):
+    class Later(Flow):
+        @start()
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen("never")
+        @_hf(review, ("ok", "no"))
+        def other(self):
+            calls.append("other")
+            return "O"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    return Later
+
+
+@HOWS
+def test_queued_review_of_another_flow_is_skipped(how: str) -> None:
+    """A queued review whose ``flow_id`` is another flow's is not paused for."""
+    calls: list[Any] = []
+    flow_cls = _review_with_another_review_later(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        foreign = flow_cls(persistence=persistence).kickoff()
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(foreign, HumanFeedbackPending)
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        assert foreign.context.flow_id != flow_id
+
+        # The row as the runtime stores a review of ``other`` queued behind
+        # ``draft``'s, with another flow's review queued before it.
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        other = {
+            **ctx.to_dict(),
+            "method_name": "other",
+            "method_output": "O",
+            "emit": ["ok", "no"],
+            "default_outcome": "ok",
+            "resume_record": None,
+        }
+        stranger = {**other, "flow_id": foreign.context.flow_id}
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "queued": [
+                {"context": stranger, "callback_info": None},
+                {"context": other, "callback_info": None},
+            ],
+        }
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        assert isinstance(out, HumanFeedbackPending)
+        assert (out.context.flow_id, out.context.method_name) == (flow_id, "other")
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+    assert "draft" not in calls
+    assert "other" not in calls
