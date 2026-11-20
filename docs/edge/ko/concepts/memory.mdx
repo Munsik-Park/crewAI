@@ -876,3 +876,4 @@ memory.reset(scope="/project/old")  # 해당 하위 트리만
 | `complex_query_threshold` | `0.7` | 복잡한 쿼리의 경우 이 신뢰도 미만에서 더 깊이 탐색. |
 | `exploration_budget` | `1` | 딥 recall 중 LLM 기반 탐색 라운드 수. |
 | `query_analysis_threshold` | `200` | 이 길이(문자 수)보다 짧은 쿼리는 딥 recall 중 LLM 분석을 건너뜀. |
+| `recall_oversample_factor` | `2` | 딥 recall은 점수 계산과 필터링 전에 스토리지에 `limit`의 이 배수만큼 후보를 요청함. `MemorySlice`도 스코프마다 이 값을 적용하므로, 슬라이스 딥 recall은 스코프마다 스토리지에 `limit` × 배수 × 배수를 요청함. |
