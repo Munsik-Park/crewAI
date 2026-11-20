@@ -50,8 +50,10 @@ When a call is blocked, the tool does not run and the agent receives
 `"Tool execution blocked by hook. Tool: <name>"` as the result — the run
 continues. `POST_TOOL_CALL` hooks still fire on calls a `PRE_TOOL_CALL` hook
 blocked, so monitoring hooks see those attempts. A call refused because its run
-exceeded the agent's `max_execution_time` gets the same message but runs no
-hook, before or after.
+exceeded the agent's `max_execution_time` before its hooks started gets the
+same message but runs no hook, before or after. A call whose `PRE_TOOL_CALL`
+hooks were already running at that limit is treated as blocked when they
+finish, whatever they decided, so its `POST_TOOL_CALL` hooks run.
 
 ## Tool Hook Context
 
@@ -333,7 +335,7 @@ there is no behavioral penalty.
 ### Tool Blocked Unexpectedly
 - Check all pre hooks for `HookAborted` / `return False` conditions
 - The abort reason and source appear on the `HookDispatchedEvent` telemetry
-- A run that exceeded the agent's `max_execution_time` is refused its next tool calls with the same `"Tool execution blocked by hook"` message, without running any hook
+- A run that exceeded the agent's `max_execution_time` is refused its next tool calls with the same `"Tool execution blocked by hook"` message, without running any hook. A call whose pre hooks were already running at the limit is treated as blocked when they finish, and its post hooks run
 
 ## Related Documentation
 
