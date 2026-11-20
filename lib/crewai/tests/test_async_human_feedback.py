@@ -2186,6 +2186,72 @@ class TestResumeClosesJoinsOnTheReviewedListenersTrigger:
 
 
 @HOWS
+@pytest.mark.parametrize("earlier_router_returns", ["x", None])
+def test_join_closes_when_an_earlier_router_shares_the_reviewed_listeners_trigger(
+    how: str, earlier_router_returns: str | None
+) -> None:
+    """``classify`` runs on ``seed`` before ``draft`` in the same router batch."""
+
+    def make(review: _Review, calls: list[Any]) -> type[Flow]:
+        class SharedTriggerFlow(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def classify(self):
+                calls.append("classify")
+                return earlier_router_returns
+
+            @listen(seed)
+            @human_feedback(**_routed(review))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(and_(seed, draft))
+            def join_seed_draft(self, value):
+                calls.append(("join_seed_draft", value))
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", value))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return SharedTriggerFlow
+
+    def joins(calls: list[Any]) -> list[Any]:
+        return [c for c in calls if isinstance(c, tuple) and c[0] == "join_seed_draft"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now: list[Any] = []
+        make(_Review(pause=False), now)(
+            persistence=SQLiteFlowPersistence(os.path.join(tmpdir, "now.db"))
+        ).kickoff()
+
+        calls: list[Any] = []
+        flow_cls = make(_Review(pause=True), calls)
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls.index("classify") < calls.index("draft")
+        assert joins(calls) == []
+        calls.clear()
+
+        _resume(flow_cls.from_pending(pending.context.flow_id, persistence), how)
+
+    assert joins(now) == [("join_seed_draft", "S")]
+    assert joins(calls) == [("join_seed_draft", "S")]
+    assert "draft" not in calls
+    assert ("audit", "approved") in calls
+    assert ("publish", "HumanFeedbackResult") in calls
+
+
+@HOWS
 @pytest.mark.parametrize("second", ["same_instance", "restored"])
 def test_review_paused_again_in_a_loop_closes_its_join_once(
     how: str, second: str
