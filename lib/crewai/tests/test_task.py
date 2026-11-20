@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import threading
 import time
 from functools import partial
 from hashlib import md5
@@ -1732,7 +1733,7 @@ def test_task_with_max_execution_time_exceeded():
     @tool("what amazing tool", result_as_answer=True)
     def my_tool() -> str:
         "My tool"
-        time.sleep(10)
+        time.sleep(3)
         return "okay"
 
     researcher = Agent(
@@ -1753,8 +1754,23 @@ def test_task_with_max_execution_time_exceeded():
         agent=researcher,
     )
 
-    with pytest.raises(TimeoutError):
-        task.execute_sync(agent=researcher)
+    # The work in progress at the deadline is not interrupted; record when the
+    # abandoned run ends so the test does not leave it running.
+    run_done = threading.Event()
+    execute_without_timeout = researcher._execute_without_timeout
+
+    def tracked(*args, **kwargs):
+        try:
+            return execute_without_timeout(*args, **kwargs)
+        finally:
+            run_done.set()
+
+    try:
+        with patch.object(researcher, "_execute_without_timeout", tracked):
+            with pytest.raises(TimeoutError):
+                task.execute_sync(agent=researcher)
+    finally:
+        assert run_done.wait(15)
 
 
 @pytest.mark.vcr()

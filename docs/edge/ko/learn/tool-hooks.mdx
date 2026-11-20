@@ -491,6 +491,7 @@ register_after_tool_call_hook(my_after_hook)
 - 차단 조건에 대한 모든 전(before) 훅 확인
 - 훅 실행 순서 확인
 - 어떤 훅이 차단하는지 식별하기 위해 디버그 로깅 추가
+- 에이전트의 `max_execution_time`을 넘긴 실행은 hook을 실행하지 않고 같은 `"Tool execution blocked by hook"` 메시지로 다음 도구 호출이 거부됩니다. 제한 시간에 pre hook이 이미 실행 중이던 호출은 hook이 끝날 때 차단된 것으로 처리되며, post hook이 실행됩니다
 
 ## 결론
 

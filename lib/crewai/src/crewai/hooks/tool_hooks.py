@@ -17,6 +17,7 @@ from crewai.hooks.types import (
     BeforeToolCallHookCallable,
     BeforeToolCallHookType,
 )
+from crewai.utilities.execution_stop import execution_stopped
 
 
 if TYPE_CHECKING:
@@ -81,6 +82,7 @@ class ToolCallHookContext:
         self.task = task
         self.crew = crew
         self.tool_result = tool_result
+        self._refused_by_stop = False
         self.raw_tool_result = raw_tool_result
 
     def request_human_input(
@@ -176,8 +178,13 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
     Returns:
         True if a hook blocked execution (returned False or raised
         :class:`HookAborted`), False otherwise. Tool input mutations on the
-        context persist regardless.
+        context persist regardless. A run stopped by ``max_execution_time``
+        is reported as blocked without running any hook; a run stopped while
+        the hooks were running is reported as blocked when they finish.
     """
+    if execution_stopped():
+        context._refused_by_stop = True
+        return True
     try:
         dispatch(
             InterceptionPoint.PRE_TOOL_CALL,
@@ -185,9 +192,15 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
             reducer=before_tool_call_reducer,
             verbose=_hook_verbose(context),
         )
-        return False
+        return execution_stopped()
     except HookAborted:
         return True
+
+
+def refused_by_stop(context: ToolCallHookContext) -> bool:
+    """Whether the stop itself, not a hook, refused this tool call before
+    its before-hooks ran."""
+    return context._refused_by_stop
 
 
 def run_after_tool_call_hooks(context: ToolCallHookContext) -> str | None:

@@ -66,6 +66,7 @@ from crewai.hooks.llm_hooks import (
 )
 from crewai.hooks.tool_hooks import (
     ToolCallHookContext,
+    refused_by_stop,
     run_after_tool_call_hooks,
     run_before_tool_call_hooks,
 )
@@ -117,6 +118,7 @@ from crewai.utilities.agent_utils import (
     track_delegation_if_needed,
 )
 from crewai.utilities.constants import TRAINING_DATA_FILE
+from crewai.utilities.execution_stop import execution_stopped
 from crewai.utilities.file_store import aget_all_files, get_all_files
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.message_utils import format_message_for_llm
@@ -256,6 +258,8 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
     _finalize_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
     _finalize_called: bool = PrivateAttr(default=False)
     _is_executing: bool = PrivateAttr(default=False)
+    _call_hold: object | None = PrivateAttr(default=None)
+    _run_stop_marks: tuple[threading.Event, ...] = PrivateAttr(default=())
     _has_been_invoked: bool = PrivateAttr(default=False)
     _instance_id: str = PrivateAttr(default_factory=lambda: str(uuid4())[:8])
     _step_executor: Any = PrivateAttr(default=None)
@@ -2418,7 +2422,11 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             tool_result=result,
             raw_tool_result=raw_tool_result,
         )
-        modified_result = run_after_tool_call_hooks(after_hook_context)
+        modified_result = (
+            None
+            if refused_by_stop(before_hook_context)
+            else run_after_tool_call_hooks(after_hook_context)
+        )
         if modified_result is not None:
             result = modified_result
 
@@ -3149,7 +3157,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             return self.invoke_async(inputs)
 
         with self._execution_lock:
-            if self._is_executing:
+            if self._call_hold is not None:
+                self._call_hold = None
+            elif self._is_executing:
                 raise RuntimeError(
                     "Executor is already running. "
                     "Cannot invoke the same executor instance concurrently."
@@ -3203,10 +3213,11 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not execution_stopped():
                     formatted_answer = self._handle_human_feedback(formatted_answer)
 
-            self._save_to_memory(formatted_answer)
+            if not execution_stopped():
+                self._save_to_memory(formatted_answer)
 
             return {"output": formatted_answer.output}
 
@@ -3240,7 +3251,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             Dictionary with agent output.
         """
         with self._execution_lock:
-            if self._is_executing:
+            if self._call_hold is not None:
+                self._call_hold = None
+            elif self._is_executing:
                 raise RuntimeError(
                     "Executor is already running. "
                     "Cannot invoke the same executor instance concurrently."
@@ -3294,12 +3307,13 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not execution_stopped():
                     formatted_answer = await self._ahandle_human_feedback(
                         formatted_answer
                     )
 
-            self._save_to_memory(formatted_answer)
+            if not execution_stopped():
+                self._save_to_memory(formatted_answer)
 
             return {"output": formatted_answer.output}
 
@@ -3318,6 +3332,45 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         finally:
             self._cleanup_deferred_tool_results()
             self._is_executing = False
+
+    def hold_for_call(self, stop_marks: tuple[threading.Event, ...]) -> object:
+        """Take the executor for the call that invokes it next.
+
+        Args:
+            stop_marks: The stop marks of the run the call executes in.
+
+        Returns:
+            The hold, for ``release_call_hold``. The next ``invoke`` or
+            ``invoke_async`` takes it over.
+
+        Raises:
+            RuntimeError: Another call is executing on this executor.
+        """
+        with self._execution_lock:
+            if self._is_executing:
+                raise RuntimeError(
+                    "Executor is already running. "
+                    "Cannot invoke the same executor instance concurrently."
+                )
+            hold = object()
+            self._is_executing = True
+            self._call_hold = hold
+            self._run_stop_marks = stop_marks
+            return hold
+
+    def release_call_hold(self, hold: object) -> None:
+        """Release ``hold`` if no invocation took it over."""
+        with self._execution_lock:
+            if self._call_hold is hold:
+                self._call_hold = None
+                self._is_executing = False
+
+    def ran_in_stopped_run(self) -> bool:
+        """Whether a run this executor was taken for has been stopped.
+
+        Work of a stopped run may still use it, so it is not taken again.
+        """
+        return any(mark.is_set() for mark in self._run_stop_marks)
 
     async def ainvoke(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Async version of invoke. Alias for invoke_async."""

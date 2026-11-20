@@ -11,6 +11,10 @@ from pydantic import BaseModel, ValidationError
 from typing_extensions import Unpack
 
 from crewai.agents.agent_builder.utilities.base_output_converter import OutputConverter
+from crewai.utilities.execution_stop import (
+    EXECUTION_STOPPED_MESSAGE,
+    execution_stopped,
+)
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.internal_instructor import InternalInstructor
 from crewai.utilities.pydantic_schema_utils import generate_model_description
@@ -201,8 +205,15 @@ class Converter(OutputConverter):
             return ConverterError(f"Failed to convert text into JSON, error: {e}.")
 
     def _create_instructor(self) -> InternalInstructor[Any]:
-        """Create an instructor."""
+        """Create an instructor.
 
+        Raises:
+            LLMCallBlockedError: The run was stopped by ``max_execution_time``.
+        """
+        if execution_stopped():
+            from crewai.llms.base_llm import LLMCallBlockedError
+
+            raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
         return InternalInstructor(
             llm=self.llm,
             model=self.model,

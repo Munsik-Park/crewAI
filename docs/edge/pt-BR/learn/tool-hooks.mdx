@@ -491,6 +491,7 @@ register_after_tool_call_hook(my_after_hook)
 - Verifique todos os hooks antes por condições de bloqueio
 - Verifique ordem de execução do hook
 - Adicione logging de debug para identificar qual hook está bloqueando
+- Uma execução que excedeu o `max_execution_time` do agente tem suas próximas chamadas de ferramenta recusadas com a mesma mensagem `"Tool execution blocked by hook"`, sem rodar nenhum hook. Uma chamada cujos pre hooks já estavam rodando no limite é tratada como bloqueada quando eles terminam, e seus post hooks rodam
 
 ## Conclusão
 

@@ -6,6 +6,7 @@ from crewai.agents.parser import AgentAction
 from crewai.agents.tools_handler import ToolsHandler
 from crewai.hooks.tool_hooks import (
     ToolCallHookContext,
+    refused_by_stop,
     run_after_tool_call_hooks,
     run_before_tool_call_hooks,
 )
@@ -136,7 +137,11 @@ async def aexecute_tool_and_check_finality(
                 tool_result=blocked_message,
                 raw_tool_result=blocked_message,
             )
-            modified_result = run_after_tool_call_hooks(blocked_hook_context)
+            modified_result = (
+                None
+                if refused_by_stop(hook_context)
+                else run_after_tool_call_hooks(blocked_hook_context)
+            )
             return ToolResult(
                 modified_result if modified_result is not None else blocked_message,
                 False,
@@ -300,7 +305,11 @@ def execute_tool_and_check_finality(
                 tool_result=blocked_message,
                 raw_tool_result=blocked_message,
             )
-            modified_result = run_after_tool_call_hooks(blocked_hook_context)
+            modified_result = (
+                None
+                if refused_by_stop(hook_context)
+                else run_after_tool_call_hooks(blocked_hook_context)
+            )
             return ToolResult(
                 modified_result if modified_result is not None else blocked_message,
                 False,
