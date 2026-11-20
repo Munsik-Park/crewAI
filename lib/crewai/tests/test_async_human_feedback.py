@@ -4001,3 +4001,110 @@ def test_queued_review_of_another_flow_is_skipped(how: str) -> None:
     ]
     assert "draft" not in calls
     assert "other" not in calls
+
+
+_FIELDS_OF_ANOTHER_TYPE = [
+    ("requested_at", 7),
+    ("requested_at", ["2026-01-01T00:00:00"]),
+    ("message", 7),
+    ("message", None),
+    ("emit", "ok"),
+    ("emit", 7),
+    ("emit", [1, 2]),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(
+    ("field", "value"),
+    _FIELDS_OF_ANOTHER_TYPE,
+    ids=[f"{f}={v!r}" for f, v in _FIELDS_OF_ANOTHER_TYPE],
+)
+def test_queued_review_with_a_field_of_another_type_is_skipped(
+    how: str, field: str, value: Any
+) -> None:
+    """Resume skips the broken entry and pauses for the valid one behind it."""
+    calls: list[Any] = []
+    flow_cls = _review_with_another_review_later(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        other = {
+            **ctx.to_dict(),
+            "method_name": "other",
+            "method_output": "O",
+            "emit": ["ok", "no"],
+            "default_outcome": "ok",
+            "resume_record": None,
+        }
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "queued": [
+                {"context": {**other, field: value}, "callback_info": None},
+                {"context": other, "callback_info": None},
+            ],
+        }
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "other"
+        assert persistence.load_pending_feedback(flow_id) is not None
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+
+
+class _TicketReview:
+    """Pause for review, giving the reviewed method's ticket as callback info."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": f"T-{context.method_name}"}
+        )
+
+
+@HOWS
+def test_queued_review_pauses_with_the_callback_info_its_provider_gave(
+    how: str,
+) -> None:
+    signal = _SignalledReview(_TicketReview())
+
+    class Tickets(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = Tickets(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        second = _resume(Tickets.from_pending(first.context.flow_id, persistence), how)
+
+    assert (first.context.method_name, first.callback_info) == (
+        "draft",
+        {"ticket": "T-draft"},
+    )
+    assert isinstance(second, HumanFeedbackPending)
+    assert (second.context.method_name, second.callback_info) == (
+        "other",
+        {"ticket": "T-other"},
+    )
