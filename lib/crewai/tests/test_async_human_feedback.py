@@ -4996,3 +4996,229 @@ def test_earlier_review_result_keeps_its_output_across_a_later_pause(
     assert paused_for == ["zero", "draft"]
     assert before == []
     assert repr(after) == repr(now)
+
+
+# A method that is both a start gated on ``and_("x", "y")`` and a listener on
+# ``"x"``: it runs on ``x`` as a listener and again as a start when ``y`` comes.
+
+
+def test_start_gated_on_and_that_also_listens_runs_for_each_without_a_pause() -> None:
+    calls: list[Any] = []
+
+    class GatedAndListening(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "x"
+
+        @router("x")
+        def r2(self):
+            calls.append("r2")
+            return "y"
+
+        @start(and_("x", "y"))
+        @listen("x")
+        def m(self):
+            calls.append("m")
+
+    GatedAndListening().kickoff()
+
+    assert calls == ["seed", "r1", "r2", "m", "m"]
+
+
+def _gated_start_that_listens_beside_a_review(at: str) -> ShapeFactory:
+    """``m`` starts on ``and_("x", "y")`` and listens on ``"x"``; ``y`` is ``draft``'s outcome.
+
+    ``draft`` is reviewed on ``x``, so ``m`` runs on ``x`` before the pause and
+    as a start when the review gives ``y``. With ``at="resume"``, ``seed`` runs
+    after a first review is resumed.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        class AtKickoff(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @router(seed)
+            def r1(self):
+                return "x"
+
+            @listen("x")
+            @_hf(review, emit=("y", "n"))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @start(and_("x", "y"))
+            @listen("x")
+            def m(self):
+                calls.append("m")
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review)
+            def first(self):
+                return "F"
+
+            @listen("approved")
+            def seed(self):
+                calls.append("seed")
+
+            @router(seed)
+            def r1(self):
+                return "x"
+
+            @listen("x")
+            @_hf(review, emit=("y", "n"))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @start(and_("x", "y"))
+            @listen("x")
+            def m(self):
+                calls.append("m")
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+def test_start_gated_on_and_that_also_listens_resumes_as_answered_at_once(
+    at: str, second: str, how: str
+) -> None:
+    make = _gated_start_that_listens_beside_a_review(at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert sorted(now) == ["draft", "m", "m", "seed"]
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert sorted(before + after) == sorted(now)
+
+
+# An empty outcome label: ``emit=[""]`` with ``default_outcome=""``.
+
+
+def _reviewed_with_an_empty_outcome(role: str) -> ShapeFactory:
+    """``draft`` is reviewed with the single outcome ``""``; ``use`` listens on it."""
+
+    def make(review: _Review, calls: list[Any]):
+        empty_review = human_feedback(
+            message="Review:",
+            emit=[""],
+            llm="gpt-4o-mini",
+            default_outcome="",
+            provider=review,
+        )
+
+        class ReviewedStart(Flow):
+            @start()
+            @empty_review
+            def draft(self):
+                return "D"
+
+            @listen(draft)
+            def use(self, got):
+                calls.append(("use", _value(got)))
+
+        class ReviewedListener(Flow):
+            @start()
+            def seed(self):
+                return "S"
+
+            @listen(seed)
+            @empty_review
+            def draft(self):
+                return "D"
+
+            @listen(draft)
+            def use(self, got):
+                calls.append(("use", _value(got)))
+
+        return ReviewedStart if role == "start" else ReviewedListener
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize("role", ["start", "listener"])
+def test_empty_outcome_reaches_the_reviewed_methods_listeners_after_resume(
+    role: str, how: str
+) -> None:
+    make = _reviewed_with_an_empty_outcome(role)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=True
+        )
+
+    assert now == [("use", "")]
+    assert paused_for == ["draft"]
+    assert before + after == now
+
+
+# Python 3.10 and 3.11 raise RecursionError from json.dumps and str() of deeply
+# nested values, where 3.12+ does not. The pure-Python JSON encoder recurses
+# with the interpreter's limit, as the C encoder does on 3.10 and 3.11; with it
+# and the default limit of 1000, saving a pause meets the same RecursionError.
+
+
+@pytest.fixture
+def _json_encoding_as_on_python_3_10(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import json.encoder
+    import sys
+
+    monkeypatch.setattr(json.encoder, "c_make_encoder", None)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+# ``int_keys_350`` builds a stored form within the limit (about one frame per
+# level), and that form's JSON (three levels per level) nests past it.
+_DEEP_STEP_VALUES = {
+    "int_keys_350": (_nested(350, 1, lambda v: {1: v}), None),
+    "deep_dicts": _UNBUILDABLE_STEP_VALUES["deep_dicts"],
+    "deep_repr": _UNBUILDABLE_STEP_VALUES["deep_repr"],
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_DEEP_STEP_VALUES))
+@pytest.mark.usefixtures("_json_encoding_as_on_python_3_10")
+def test_deep_step_value_pauses_when_its_json_nests_past_the_limit(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """The pause saves; after a restore ``use`` gets the value's stored string form."""
+    value, stored = _DEEP_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if kind == "emit" and second == "restored":
+        assert got[0][1] == (str(value) if stored is None else stored)
+    else:
+        assert got[0][1] is value
