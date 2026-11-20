@@ -4529,3 +4529,199 @@ def test_reviews_without_emit_resume_as_answered_at_once(
     make: ShapeFactory, pauses: list[str], second: str, how: str
 ) -> None:
     _assert_resumes_as_answered_at_once(make, how, second, pauses)
+
+
+# Step values the record stores that JSON does not keep as they are: dicts with
+# keys other than strings, and values with no JSON form.
+
+
+class _Opaque:
+    """A value with no JSON form; its string form is ``opaque``."""
+
+    def __repr__(self) -> str:
+        return "_Opaque()"
+
+    def __str__(self) -> str:
+        return "opaque"
+
+
+_OPAQUE = _Opaque()
+_STEP_VALUES = {
+    "tuple_keys": {("a", "b"): 1, ("c", 2): "x"},
+    "int_keys": {1: "v", 2: "w"},
+    "nested": {
+        "rows": [
+            {1: "int", 2.5: "float", None: "none"},
+            {False: {("a", 2): "tuple", ("b", None, 3.5): [1, "x"]}},
+        ],
+        7: {"inner": [1, "x", {True: "bool"}]},
+    },
+    "opaque": _OPAQUE,
+    "opaque_key": {_OPAQUE: 1},
+}
+# The pause the value is stored with: the first one (from kickoff), or one
+# reached while resuming, which is then resumed restored or on the same instance.
+_STEP_VALUE_PAUSES = [
+    ("kickoff", "restored"),
+    ("resume", "restored"),
+    ("resume", "same_instance"),
+]
+
+
+def _step_value_beside_a_review(value: Any, kind: str, at: str) -> ShapeFactory:
+    """``seed`` returns ``value``; its router leads to ``draft``, reviewed by ``kind``.
+
+    ``use`` listens on ``seed``. With ``emit``, ``draft`` pauses in ``seed``'s
+    router loop, so ``use`` gets the value from the record after resume; without
+    ``emit``, ``use`` runs beside ``draft`` before the pause is saved. With
+    ``at="resume"``, ``seed`` runs after a first review is resumed.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        draft_review = (
+            _hf(review, emit=("ok", "no")) if kind == "emit" else _plain_review(review)
+        )
+
+        class AtKickoff(Flow):
+            @start()
+            def seed(self):
+                return value
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @draft_review
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, got):
+                calls.append(("use", got))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review)
+            def first(self):
+                return "F"
+
+            @listen("approved")
+            def seed(self):
+                return value
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @draft_review
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, got):
+                calls.append(("use", got))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_STEP_VALUES))
+def test_step_value_without_a_faithful_json_form_resumes_as_documented(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """The pause saves, and ``use`` gets the value it gets when answered at once.
+
+    Dicts keyed by JSON scalars or tuples of them come back equal, with the same
+    key types. A value with no JSON form comes back as its string form when it
+    crossed a restore, and as the live value on the same instance.
+    """
+    value = _STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert now == [("use", value)]
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    restored = kind == "emit" and second == "restored"
+    if name == "opaque" and restored:
+        assert got == [("use", "opaque")]
+    elif name == "opaque_key" and restored:
+        assert isinstance(got[0][1], (str, dict))
+    else:
+        assert repr(got) == repr(now)
+
+
+class _Model(BaseModel):
+    field: str
+
+
+def _two_queued_reviews_of_models(review: _Review, calls: list[Any]):
+    """``draft`` and ``other`` are reviewed beside each other after ``first``'s resume.
+
+    ``other`` completes after ``draft``'s review is requested, so it is queued
+    behind ``draft``. Their listeners record the type of the reviewed output.
+    """
+    signal = _SignalledReview(review)
+    plain = human_feedback(message="Review:", provider=signal)
+
+    class Queued(Flow):
+        @start()
+        @_hf(review)
+        def first(self):
+            return "F"
+
+        @listen("approved")
+        @plain
+        def draft(self):
+            return _Model(field="d")
+
+        @listen("approved")
+        @plain
+        def other(self):
+            _after_the_review(signal)
+            return _Model(field="o")
+
+        @listen(draft)
+        def took_draft(self, result):
+            calls.append(("took_draft", type(result.output).__name__))
+
+        @listen(other)
+        def took_other(self, result):
+            calls.append(("took_other", type(result.output).__name__))
+
+    return Queued
+
+
+@HOWS
+@SECONDS
+def test_queued_review_on_the_same_instance_keeps_its_live_output(
+    second: str, how: str
+) -> None:
+    """On the same instance, a queued review's listener gets the live model.
+
+    A restored flow gets the stored form, a dict, for both reviews.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(_two_queued_reviews_of_models, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            _two_queued_reviews_of_models,
+            tmpdir,
+            how,
+            restore_each_time=second == "restored",
+        )
+
+    assert sorted(now) == [("took_draft", "_Model"), ("took_other", "_Model")]
+    assert paused_for == ["first", "draft", "other"]
+    stored = "dict" if second == "restored" else "_Model"
+    assert sorted(before + after) == [("took_draft", stored), ("took_other", stored)]
