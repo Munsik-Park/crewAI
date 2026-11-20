@@ -5585,3 +5585,108 @@ def test_record_with_unhashable_bookkeeping_resumes_as_a_row_without_it(
     assert "draft" not in calls
     assert calls.count(("audit", "approved")) == 1
     assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# Queued reviews' callback info with keys JSON has no form for, and a queued
+# review raised again from the live queue on the same instance.
+_KEYED_CALLBACK_INFO: dict[str, tuple[dict[Any, Any], dict[str, Any]]] = {
+    "tuple_keyed_entry": (
+        {"ticket": "T", "extra": {(1,): "x"}},
+        {"ticket": "T", "extra": "{(1,): 'x'}"},
+    ),
+    "tuple_key": ({"ticket": "T", ("k",): "v"}, {"ticket": "T", "('k',)": "v"}),
+}
+
+
+@HOWS
+@pytest.mark.parametrize("kind", list(_KEYED_CALLBACK_INFO))
+def test_queued_review_with_callback_info_keys_without_a_json_form_still_pauses(
+    kind: str, how: str
+) -> None:
+    """The pause saves; the queued review pauses with those keys' string forms."""
+    given, stored = _KEYED_CALLBACK_INFO[kind]
+    signal = _SignalledReview(_InfoReview(given))  # type: ignore[arg-type]
+
+    class Queued(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = Queued(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        assert first.context.method_name == "draft"
+        second = _resume(Queued.from_pending(first.context.flow_id, persistence), how)
+
+    assert isinstance(second, HumanFeedbackPending)
+    assert second.context.method_name == "other"
+    assert second.callback_info == stored
+
+
+class _TicketsReview:
+    """Pause for review, giving ``T-<method>`` as the callback info's ticket."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": f"T-{context.method_name}"}
+        )
+
+
+@HOWS
+def test_queued_review_raised_again_on_the_same_instance_keeps_its_callback_info(
+    how: str,
+) -> None:
+    """``x`` and ``y`` pause together during a resume; the one queued keeps its ticket."""
+    calls: list[Any] = []
+    review = _TicketsReview()
+
+    class TwoLater(Flow):
+        @start()
+        @human_feedback(message="Review:", provider=review)
+        def draft(self):
+            return "D"
+
+        @listen("draft")
+        @human_feedback(message="Review:", provider=review)
+        def x(self):
+            return "X"
+
+        @listen("draft")
+        @human_feedback(message="Review:", provider=review)
+        def y(self):
+            return "Y"
+
+        @listen("x")
+        def after_x(self):
+            calls.append("after_x")
+
+        @listen("y")
+        def after_y(self):
+            calls.append("after_y")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = TwoLater(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        assert first.context.method_name == "draft"
+        flow = TwoLater.from_pending(first.context.flow_id, persistence)
+        second = _resume(flow, how)
+        assert isinstance(second, HumanFeedbackPending)
+        third = _resume(flow, how)
+        assert isinstance(third, HumanFeedbackPending)
+        out = _resume(flow, how)
+
+    pauses = sorted(
+        (pause.context.method_name, pause.callback_info) for pause in (second, third)
+    )
+    assert pauses == [("x", {"ticket": "T-x"}), ("y", {"ticket": "T-y"})]
+    assert not isinstance(out, HumanFeedbackPending)
+    assert sorted(calls) == ["after_x", "after_y"]
