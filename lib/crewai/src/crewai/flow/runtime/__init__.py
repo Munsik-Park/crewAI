@@ -1081,6 +1081,58 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         result: list[str] = self.memory.extract_memories(content)
         return result
 
+    def _attach_resume_record(self, context: PendingFeedbackContext) -> None:
+        """Store the run bookkeeping on a pending context before it is saved."""
+        record = dict(context.resume_record or {})
+        record["pending_events"] = {
+            str(key): sorted(seen) for key, seen in self._pending_events.items()
+        }
+        with self._or_listeners_lock:
+            record["fired_or_listeners"] = sorted(self._fired_or_listeners)
+        record["completed_methods"] = sorted(self._completed_methods)
+        context.resume_record = record
+
+    def _restore_resume_record(self, context: PendingFeedbackContext) -> None:
+        """Restore the run bookkeeping saved with a pending context, if any."""
+        record = context.resume_record
+        if not isinstance(record, dict):
+            return
+        pending = record.get("pending_events")
+        if isinstance(pending, dict):
+            self._pending_events = {
+                PendingListenerKey(key): set(seen)
+                for key, seen in pending.items()
+                if isinstance(seen, list)
+            }
+        fired = record.get("fired_or_listeners")
+        if isinstance(fired, list):
+            # Only fired names are looked up in the definition (re-arm), so drop
+            # listeners the flow no longer defines.
+            listeners = {name for name, _, _ in self._listener_methods()}
+            self._fired_or_listeners = {
+                FlowMethodName(name) for name in fired if name in listeners
+            }
+        completed = record.get("completed_methods")
+        if isinstance(completed, list):
+            self._completed_methods = {FlowMethodName(name) for name in completed}
+
+    async def _execute_trigger_joins(
+        self, reviewed: FlowMethodName, trigger: FlowMethodName, value: Any
+    ) -> None:
+        """Run listeners joining a reviewed listener with the event that triggered it.
+
+        The pause interrupted the trigger's dispatch before its plain listeners
+        were checked, so joins on both events see the trigger here, with the
+        value they would have received from it.
+        """
+        joins = self._find_triggered_methods(
+            trigger, router_only=False, involving=(reviewed, trigger)
+        )
+        if joins:
+            await asyncio.gather(
+                *[self._execute_single_listener(name, value) for name in joins]
+            )
+
     def _clear_or_listeners(self) -> None:
         """Clear fired OR listeners for cyclic flows."""
         with self._or_listeners_lock:
@@ -1318,6 +1370,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         )
         instance._initialize_state(state_data)
         instance._pending_feedback_context = pending_context
+        instance._restore_resume_record(pending_context)
         instance._is_execution_resuming = True
         # Seed the match id so the resume-phase listener filters its own
         # LLM events (which run with `current_flow_id == instance.flow_id`)
@@ -1588,9 +1641,29 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         try:
             if emit and collapsed_outcome:
+                # Dispatch as the immediate path does: the reviewed method's own
+                # subscribers get the outcome, then the label's get the result.
+                reviewed = FlowMethodName(context.method_name)
+                has_record = context.resume_record is not None
+                record = context.resume_record or {}
+                trigger = record.get("trigger")
+                await self._execute_listeners(reviewed, collapsed_outcome)
+                if isinstance(trigger, str) and trigger:
+                    await self._execute_trigger_joins(
+                        reviewed, FlowMethodName(trigger), record.get("trigger_value")
+                    )
+                # A reviewed listener re-arms fired or_ listeners for its label;
+                # a reviewed start does not. Without a record, the definition
+                # tells which one it was.
+                reviewed_as_listener = (
+                    isinstance(trigger, str) and bool(trigger)
+                    if has_record
+                    else not self._definition.methods[str(reviewed)].is_start
+                )
                 await self._execute_listeners(
                     FlowMethodName(collapsed_outcome),
                     result,
+                    rearm_trigger=reviewed_as_listener,
                 )
             else:
                 await self._execute_listeners(
@@ -1628,6 +1701,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     await asyncio.wrap_future(future)
                 if session := get_trace_session():
                     e.context.trace_context = session.context.otel_resume_context
+                self._attach_resume_record(e.context)
                 self.persistence.save_pending_feedback(
                     flow_uuid=e.context.flow_id,
                     context=e.context,
@@ -2492,6 +2566,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
                     if session := get_trace_session():
                         e.context.trace_context = session.context.otel_resume_context
+                    self._attach_resume_record(e.context)
                     self.persistence.save_pending_feedback(
                         flow_uuid=e.context.flow_id,
                         context=e.context,
@@ -3170,6 +3245,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         trigger_method: FlowMethodName,
         result: Any,
         triggering_event_id: str | None = None,
+        rearm_trigger: bool = False,
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
@@ -3182,6 +3258,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             result: The result from the triggering method, passed to listeners that accept parameters.
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
+            rearm_trigger: Re-arm fired or_ listeners on ``trigger_method`` too, as
+                is done for router outcomes (used when it is a reviewed
+                listener's outcome).
 
         Note:
             - Routers are executed sequentially to maintain flow control
@@ -3217,12 +3296,29 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 router_input = router_result_to_feedback.get(
                     str(current_trigger), current_result
                 )
-                (
-                    router_result,
-                    current_triggering_event_id,
-                ) = await self._execute_single_listener(
-                    router_name, router_input, current_triggering_event_id
-                )
+                try:
+                    (
+                        router_result,
+                        current_triggering_event_id,
+                    ) = await self._execute_single_listener(
+                        router_name, router_input, current_triggering_event_id
+                    )
+                except HumanFeedbackPending as pending:
+                    # The router paused for review: record the event that
+                    # triggered it, so resume can close joins on that event.
+                    record = pending.context.resume_record or {}
+                    if (
+                        pending.context.method_name == str(router_name)
+                        and "trigger" not in record
+                    ):
+                        pending.context.resume_record = {
+                            **record,
+                            "trigger": str(current_trigger),
+                            "trigger_value": router_result_payloads.get(
+                                str(current_trigger), result
+                            ),
+                        }
+                    raise
                 if router_result is None:
                     current_trigger = FlowMethodName("")
                     continue
@@ -3254,7 +3350,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         for idx, current_trigger in enumerate(all_triggers):
             if current_trigger:
-                if idx > 0 and rearmable:
+                if (idx > 0 or rearm_trigger) and rearmable:
                     self._rearm_or_listeners_for_trigger(current_trigger, rearmable)
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
@@ -3323,13 +3419,22 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         return True
 
     def _find_triggered_methods(
-        self, trigger_method: FlowMethodName, router_only: bool
+        self,
+        trigger_method: FlowMethodName,
+        router_only: bool,
+        involving: tuple[FlowMethodName, ...] = (),
     ) -> list[FlowMethodName]:
+        # ``involving`` limits the check to listeners whose condition names
+        # every one of these events; the others do not see the trigger.
         triggered: list[FlowMethodName] = []
 
         for listener_name, method_definition, condition in self._listener_methods():
             is_router = method_definition.router
             if router_only != is_router:
+                continue
+            if involving and not set(map(str, involving)) <= set(
+                _iter_condition_events(condition)
+            ):
                 continue
 
             should_check_fired = _is_multi_event_or(condition) and not is_router

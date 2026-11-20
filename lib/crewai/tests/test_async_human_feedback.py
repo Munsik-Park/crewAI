@@ -2239,6 +2239,57 @@ def test_review_paused_again_in_a_loop_closes_its_join_once(
     assert calls.count("combine") == 1
 
 
+
+@HOWS
+def test_cycle_after_a_restore_reruns_or_listeners_completed_before_the_pause(
+    how: str,
+) -> None:
+    # ``after_step`` = or_(step, "never") fired before the pause. When "again"
+    # brings the flow back to ``step``, that is a new cycle, so ``after_step``
+    # and the review after it run again, as on a run answered at once.
+    calls: list[str] = []
+
+    class LoopFlow(Flow):
+        @start()
+        def begin(self):
+            calls.append("begin")
+            return "B"
+
+        @listen(or_(begin, "again"))
+        def step(self):
+            calls.append("step")
+            return "S"
+
+        @listen(or_(step, "never"))
+        def after_step(self):
+            calls.append("after_step")
+
+        @listen(after_step)
+        @human_feedback(
+            message="Review:",
+            emit=["again", "done"],
+            llm="gpt-4o-mini",
+            default_outcome="again",
+            provider=_Review(pause=True),
+        )
+        def review(self):
+            calls.append("review")
+            return "R"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = LoopFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls == ["begin", "step", "after_step", "review"]
+        calls.clear()
+
+        flow = LoopFlow.from_pending(pending.context.flow_id, persistence)
+        again = _resume(flow, how)  # empty reply -> "again" -> a second cycle
+
+    assert isinstance(again, HumanFeedbackPending)
+    assert calls == ["step", "after_step", "review"]
+
+
 # The keys a PendingFeedbackContext row had before the run record was added.
 _OLD_ROW_KEYS = {
     "flow_id",

@@ -43,6 +43,12 @@ class PendingFeedbackContext:
             new uuid. New pauses always store a value.
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
+        resume_record: Run bookkeeping written by the runtime when it saves the
+            pause (completed methods, join progress, fired ``or_`` listeners,
+            and, for a reviewed listener, the event that triggered it and its
+            value). Resume uses it to close joins and keep ``or_`` listeners
+            firing once across the pause. ``None`` for contexts built outside
+            the runtime or stored by earlier versions.
 
     Example:
         ```python
@@ -70,6 +76,7 @@ class PendingFeedbackContext:
     requested_at: datetime = field(default_factory=datetime.now)
     execution_uuid: str | None = None
     trace_context: tuple[int, int] | None = None
+    resume_record: dict[str, Any] | None = None
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
@@ -116,6 +123,7 @@ class PendingFeedbackContext:
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
             "trace_context": list(self.trace_context) if self.trace_context else None,
+            "resume_record": self._make_json_safe(self.resume_record),
         }
 
     @classmethod
@@ -142,6 +150,10 @@ class PendingFeedbackContext:
         ):
             trace_context = None
 
+        resume_record = data.get("resume_record")
+        if not isinstance(resume_record, dict):
+            resume_record = None
+
         return cls(
             flow_id=data["flow_id"],
             flow_class=data["flow_class"],
@@ -157,6 +169,7 @@ class PendingFeedbackContext:
             trace_context=(trace_context[0], trace_context[1])
             if trace_context
             else None,
+            resume_record=resume_record,
         )
 
 
