@@ -3141,6 +3141,40 @@ class TestResumeWhenTheContinuedDispatchPausesAgain:
             assert (before + after).count(name) == 1
 
 
+def test_start_gated_on_an_outcome_two_routers_return_runs_for_each() -> None:
+    """Without a review, a repeated router outcome reaches its gated start each time."""
+    calls: list[str] = []
+
+    class RepeatedOutcome(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "go"
+
+        @router(seed)
+        def r2(self):
+            calls.append("r2")
+            return "go"
+
+        @start("go")
+        def gated(self):
+            calls.append("gated")
+
+        @listen("go")
+        def on_go(self):
+            calls.append("on_go")
+
+    RepeatedOutcome().kickoff()
+
+    assert calls.count("on_go") == 2
+    assert calls.count("gated") == 2
+
+
 @HOWS
 def test_restored_batch_naming_a_removed_router(how: str) -> None:
     """``post`` follows the reviewed listener on ``seed`` and is gone on restore."""
