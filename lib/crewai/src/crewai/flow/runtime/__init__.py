@@ -3291,6 +3291,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 routers_triggered
             )
 
+            batch_trigger = current_trigger
             for router_name in routers_triggered:
                 # For routers triggered by a router outcome, pass the HumanFeedbackResult
                 router_input = router_result_to_feedback.get(
@@ -3313,9 +3314,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     ):
                         pending.context.resume_record = {
                             **record,
-                            "trigger": str(current_trigger),
+                            "trigger": str(batch_trigger),
                             "trigger_value": router_result_payloads.get(
-                                str(current_trigger), result
+                                str(batch_trigger), result
                             ),
                         }
                     raise
