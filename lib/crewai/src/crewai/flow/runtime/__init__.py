@@ -384,7 +384,8 @@ class _DispatchState(_DispatchStateKeys, total=False):
     ``trigger_index`` the trigger whose listeners run next, and ``stage``
     whether that trigger's listeners or only its gated starts remain.
     ``started`` holds the starts whose condition was already checked for that
-    trigger. ``ran`` holds the methods already run per trigger, so a
+    trigger. ``rearmable`` is ``None`` until the router phase has ended.
+    ``ran`` holds the methods already run per trigger, so a
     conditional start that also listens to the same event is not run a second
     time. ``inflight_result`` is the result of the first router in ``batch``
     when it has already returned.
@@ -3690,7 +3691,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         """Advance a dispatch, keeping its position in ``st`` up to date."""
         current_triggering_event_id = triggering_event_id
         ran = st["ran"]
-        while True:
+        # ``rearmable`` is taken when the router phase ends, so a dispatch
+        # continued after that phase does not search for routers again.
+        while st["rearmable"] is None:
             if st["batch"] is None:
                 current = FlowMethodName(st["current_trigger"])
                 routers_triggered = self._find_triggered_methods(
