@@ -345,6 +345,7 @@ def _serialize_input_provider(value: Any) -> str | None:
 
 
 _FEEDBACK_RESULT_TAG = "__crewai_human_feedback_result__"
+_RECORD_LITERAL_TAG = "__crewai_record_literal__"
 
 
 class _DispatchPosition(TypedDict):
@@ -415,8 +416,20 @@ def _router_outcome(value: Any) -> str | None:
     return str(value.value if isinstance(value, enum.Enum) else value)
 
 
+def _is_tagged(value: Any, tag: str) -> bool:
+    return isinstance(value, dict) and set(value) == {tag}
+
+
 def _encode_record_value(value: Any) -> Any:
-    """Tag a ``HumanFeedbackResult`` so a restored record rebuilds it."""
+    """Tag a ``HumanFeedbackResult`` so a restored record rebuilds it.
+
+    A dict whose only key is one of the tags is wrapped under the literal tag,
+    so it is restored as the same dict.
+    """
+    if _is_tagged(value, _FEEDBACK_RESULT_TAG) or _is_tagged(
+        value, _RECORD_LITERAL_TAG
+    ):
+        return {_RECORD_LITERAL_TAG: value}
     if isinstance(value, HumanFeedbackResult):
         return {
             _FEEDBACK_RESULT_TAG: {
@@ -433,7 +446,9 @@ def _encode_record_value(value: Any) -> Any:
 
 def _decode_record_value(value: Any) -> Any:
     """Rebuild a value tagged by ``_encode_record_value``; return others as is."""
-    if not (isinstance(value, dict) and set(value) == {_FEEDBACK_RESULT_TAG}):
+    if _is_tagged(value, _RECORD_LITERAL_TAG):
+        return value[_RECORD_LITERAL_TAG]
+    if not _is_tagged(value, _FEEDBACK_RESULT_TAG):
         return value
     fields = value[_FEEDBACK_RESULT_TAG]
     if not isinstance(fields, dict):
