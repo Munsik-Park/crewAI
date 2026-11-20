@@ -3206,6 +3206,86 @@ def test_restored_batch_naming_a_removed_router(how: str) -> None:
     assert calls.count(("publish", "HumanFeedbackResult")) == 1
 
 
+@HOWS
+def test_restored_batch_naming_a_router_now_a_plain_listener(how: str) -> None:
+    """``post`` is a router on ``seed`` at the pause and a plain listener on restore."""
+    calls: list[Any] = []
+    review = _Review(pause=True)
+
+    class Paused(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @router(seed)
+        def post(self):
+            calls.append("post")
+            return "y"
+
+        @listen("y")
+        def on_y(self):
+            calls.append("on_y")
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    class Deployed(Flow):  # Paused with ``post`` a plain listener
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(seed)
+        def post(self, value):
+            calls.append(("post", _payload(value)))
+            return "y"
+
+        @listen("y")
+        def on_y(self):
+            calls.append("on_y")
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = Paused(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert "post" not in calls
+        calls.clear()
+
+        _resume(Deployed.from_pending(pending.context.flow_id, persistence), how)
+
+    assert "draft" not in calls
+    assert _named(calls, "post") == [("post", "S")]
+    assert "on_y" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
 # Record entries a row keeps for joins and ``or_`` conditions; every other
 # entry describes where the paused run stopped.
 _JOIN_AND_OR_RECORD_KEYS = {"pending_events", "fired_or_listeners", "completed_methods"}
