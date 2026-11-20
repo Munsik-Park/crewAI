@@ -8,6 +8,7 @@ import contextvars
 from datetime import datetime
 import inspect
 import json
+import logging
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
@@ -129,6 +130,11 @@ from crewai.utilities.planning_types import (
 from crewai.utilities.prompts import StandardPromptResult, SystemPromptResult
 from crewai.utilities.step_execution_context import StepExecutionContext, StepResult
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import (
+    RunAbandonedError,
+    join_run_scope,
+    leave_run_scope,
+)
 from crewai.utilities.tool_result_artifacts import (
     TOOL_RESULT_PREVIEW_LINE_COUNT,
     TOOL_RESULT_READ_CONTEXT_WINDOW_RATIO,
@@ -144,6 +150,8 @@ if TYPE_CHECKING:
     from crewai.agents.tools_handler import ToolsHandler
     from crewai.llms.base_llm import BaseLLM
     from crewai.tools.tool_types import ToolResult
+
+logger = logging.getLogger(__name__)
 
 _RouteT = TypeVar("_RouteT", bound=str)
 
@@ -1711,6 +1719,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             )
             return "parser_error"
 
+        except RunAbandonedError:
+            raise
+
         except Exception as e:
             if is_context_length_exceeded(e):
                 self._last_context_error = e
@@ -1813,6 +1824,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
 
             return self._route_finish_with_todos("native_finished")
 
+        except RunAbandonedError:
+            raise
+
         except Exception as e:
             if is_native_tool_calling_unsupported_error(e):
                 self._downgrade_to_text_tool_calling()
@@ -1869,6 +1883,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         ):
             return answer
 
+        # A second request; the answer may have arrived after the timeout.
+        if self._run_abandoned():
+            raise RunAbandonedError()
         enforce_rpm_limit(self.request_within_rpm_limit)
         try:
             structured = get_llm_response(
@@ -1950,7 +1967,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             # policy abort back to the LLM as a recoverable observation.
             raise
 
-        except ToolExecutionFailedError:
+        except (ToolExecutionFailedError, RunAbandonedError):
             # A deliberate stop: the generic handler below would feed it back
             # to the LLM as a recoverable observation.
             raise
@@ -2084,7 +2101,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                     idx = future_to_idx[future]
                     try:
                         ordered_results[idx] = future.result()
-                    except (HookAborted, ToolExecutionFailedError):
+                    except (HookAborted, ToolExecutionFailedError, RunAbandonedError):
                         # A deliberate stop: folding it into a tool result would
                         # let the remaining parallel calls carry on. Cancel the
                         # siblings that have not started so they never run.
@@ -2230,6 +2247,10 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
 
     def _execute_single_native_tool_call(self, tool_call: Any) -> dict[str, Any]:
         """Execute a single native tool call and return metadata/result."""
+        # Calls run one after another, or wait for a free worker, so this one
+        # may start only after the run was abandoned at its timeout.
+        if self._run_abandoned():
+            raise RunAbandonedError()
         info = extract_tool_call_info(tool_call)
         if not info:
             call_id = (
@@ -3129,6 +3150,38 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
 
         return "initialized"
 
+    async def _execute_method(
+        self,
+        method_name: FlowMethodName,
+        method: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Any, str | None]:
+        """Run one step, unless the run was abandoned at its timeout.
+
+        Every step passes through here, so an abandoned run stops before its
+        next step. Work the step in progress has already started may still
+        complete.
+        """
+        if self._run_abandoned():
+            raise RunAbandonedError()
+        try:
+            return await super()._execute_method(method_name, method, *args, **kwargs)
+        except RunAbandonedError:
+            raise
+        except Exception as e:
+            # Nobody receives the errors of a step that ends after its run was
+            # abandoned, such as scheduling failing at interpreter exit; they
+            # are kept at debug level only.
+            if self._run_abandoned():
+                logger.debug(
+                    "Step %s of an abandoned run ended with an error",
+                    method_name,
+                    exc_info=True,
+                )
+                raise RunAbandonedError() from e
+            raise
+
     def invoke(
         self, inputs: dict[str, Any]
     ) -> dict[str, Any] | Coroutine[Any, Any, dict[str, Any]]:
@@ -3148,14 +3201,20 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         if is_inside_event_loop():
             return self.invoke_async(inputs)
 
-        with self._execution_lock:
-            if self._is_executing:
-                raise RuntimeError(
-                    "Executor is already running. "
-                    "Cannot invoke the same executor instance concurrently."
-                )
-            self._is_executing = True
-            self._has_been_invoked = True
+        # An abandoned run refuses here, before it can take the guard.
+        run_scope = join_run_scope(self)
+        try:
+            with self._execution_lock:
+                if self._is_executing:
+                    raise RuntimeError(
+                        "Executor is already running. "
+                        "Cannot invoke the same executor instance concurrently."
+                    )
+                self._is_executing = True
+                self._has_been_invoked = True
+        except BaseException:
+            leave_run_scope(run_scope, self)
+            raise
 
         try:
             # Reset state for fresh execution
@@ -3203,7 +3262,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not self._run_abandoned():
                     formatted_answer = self._handle_human_feedback(formatted_answer)
 
             self._save_to_memory(formatted_answer)
@@ -3220,11 +3279,14 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             self._console.print(fail_text)
             raise
         except Exception as e:
-            handle_unknown_error(PRINTER, e, verbose=self.agent.verbose)
+            # The caller of an abandoned run already has its TimeoutError.
+            if not isinstance(e, RunAbandonedError):
+                handle_unknown_error(PRINTER, e, verbose=self.agent.verbose)
             raise
         finally:
             self._cleanup_deferred_tool_results()
             self._is_executing = False
+            leave_run_scope(run_scope, self)
 
     async def invoke_async(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute agent asynchronously with given inputs.
@@ -3239,14 +3301,20 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         Returns:
             Dictionary with agent output.
         """
-        with self._execution_lock:
-            if self._is_executing:
-                raise RuntimeError(
-                    "Executor is already running. "
-                    "Cannot invoke the same executor instance concurrently."
-                )
-            self._is_executing = True
-            self._has_been_invoked = True
+        # An abandoned run refuses here, before it can take the guard.
+        run_scope = join_run_scope(self)
+        try:
+            with self._execution_lock:
+                if self._is_executing:
+                    raise RuntimeError(
+                        "Executor is already running. "
+                        "Cannot invoke the same executor instance concurrently."
+                    )
+                self._is_executing = True
+                self._has_been_invoked = True
+        except BaseException:
+            leave_run_scope(run_scope, self)
+            raise
 
         try:
             # Reset state for fresh execution
@@ -3294,7 +3362,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
                         "Agent execution ended without reaching a final answer."
                     )
 
-                if self.state.ask_for_human_input:
+                if self.state.ask_for_human_input and not self._run_abandoned():
                     formatted_answer = await self._ahandle_human_feedback(
                         formatted_answer
                     )
@@ -3313,11 +3381,14 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             self._console.print(fail_text)
             raise
         except Exception as e:
-            handle_unknown_error(PRINTER, e, verbose=self.agent.verbose)
+            # The caller of an abandoned run already has its TimeoutError.
+            if not isinstance(e, RunAbandonedError):
+                handle_unknown_error(PRINTER, e, verbose=self.agent.verbose)
             raise
         finally:
             self._cleanup_deferred_tool_results()
             self._is_executing = False
+            leave_run_scope(run_scope, self)
 
     async def ainvoke(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Async version of invoke. Alias for invoke_async."""
@@ -3441,6 +3512,8 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             result: Agent's final output.
             human_feedback: Optional feedback from human.
         """
+        if self._run_abandoned():
+            raise RunAbandonedError()
         # Early return if no crew (standalone mode)
         if self.crew is None:
             return

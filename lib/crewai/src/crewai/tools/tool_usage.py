@@ -31,6 +31,7 @@ from crewai.tools.tool_failure import (
     failure_from_exception,
     reportable_failure,
 )
+from crewai.tools.tool_results import record_tool_result
 from crewai.utilities.agent_utils import (
     get_tool_names,
     render_text_description_and_args,
@@ -38,6 +39,11 @@ from crewai.utilities.agent_utils import (
 from crewai.utilities.converter import Converter
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import (
+    RunAbandonedError,
+    refuse_abandoned_run,
+    run_scope_abandoned,
+)
 
 
 if TYPE_CHECKING:
@@ -174,6 +180,8 @@ class ToolUsage:
             try:
                 return self._use(tool_string=tool_string, tool=tool, calling=calling)
 
+            except RunAbandonedError:
+                raise
             except Exception as e:
                 error = getattr(e, "message", str(e))
                 if self.task:
@@ -223,6 +231,8 @@ class ToolUsage:
                 return await self._ause(
                     tool_string=tool_string, tool=tool, calling=calling
                 )
+            except RunAbandonedError:
+                raise
             except Exception as e:
                 error = getattr(e, "message", str(e))
                 if self.task:
@@ -251,6 +261,9 @@ class ToolUsage:
         Returns:
             The result of the tool execution as a string.
         """
+        # Each attempt, retries included, is a new call: a run abandoned at its
+        # timeout makes none after the one in flight.
+        refuse_abandoned_run()
         if self._check_tool_repeated_usage(calling=calling):
             try:
                 result = I18N_DEFAULT.errors("task_repeated_usage").format(
@@ -366,6 +379,8 @@ class ToolUsage:
                                 input=arguments, config=fingerprint_config
                             )
                         except Exception:
+                            if run_scope_abandoned():
+                                raise
                             arguments = calling.arguments
                             result = await tool.ainvoke(
                                 input=arguments, config=fingerprint_config
@@ -417,7 +432,7 @@ class ToolUsage:
                         data["result_as_answer"] = result_as_answer
 
                     if self.agent and hasattr(self.agent, "tools_results"):
-                        self.agent.tools_results.append(data)
+                        record_tool_result(self.agent, data)
 
                     if available_tool and hasattr(
                         available_tool, "_increment_usage_count"
@@ -506,6 +521,9 @@ class ToolUsage:
         tool: CrewStructuredTool,
         calling: ToolCalling | InstructorToolCalling,
     ) -> str:
+        # Each attempt, retries included, is a new call: a run abandoned at its
+        # timeout makes none after the one in flight.
+        refuse_abandoned_run()
         # Repeated usage check happens before event emission - safe to return early
         if self._check_tool_repeated_usage(calling=calling):
             try:
@@ -623,6 +641,8 @@ class ToolUsage:
                                 input=arguments, config=fingerprint_config
                             )
                         except Exception:
+                            if run_scope_abandoned():
+                                raise
                             arguments = calling.arguments
                             result = tool.invoke(
                                 input=arguments, config=fingerprint_config
@@ -674,7 +694,7 @@ class ToolUsage:
                         data["result_as_answer"] = result_as_answer
 
                     if self.agent and hasattr(self.agent, "tools_results"):
-                        self.agent.tools_results.append(data)
+                        record_tool_result(self.agent, data)
 
                     if available_tool and hasattr(
                         available_tool, "_increment_usage_count"
@@ -919,6 +939,8 @@ class ToolUsage:
                 if self.function_calling_llm:
                     return self._function_calling(tool_string)
                 return self._original_tool_calling(tool_string)
+        except RunAbandonedError:
+            raise
         except Exception as e:
             self._run_attempts += 1
             if self._run_attempts > self._max_parsing_attempts:

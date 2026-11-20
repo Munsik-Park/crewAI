@@ -14,6 +14,7 @@ from crewai.agents.agent_builder.utilities.base_output_converter import OutputCo
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.internal_instructor import InternalInstructor
 from crewai.utilities.pydantic_schema_utils import generate_model_description
+from crewai.utilities.timed_run import refuse_abandoned_run
 
 
 if TYPE_CHECKING:
@@ -98,6 +99,9 @@ class Converter(OutputConverter):
         """
         from crewai.hooks.dispatch import HookAborted
 
+        # Every attempt is a new LLM call, which a run abandoned at its
+        # timeout does not make.
+        refuse_abandoned_run()
         try:
             if self.llm.supports_function_calling():
                 response = self.llm.call(
@@ -126,6 +130,9 @@ class Converter(OutputConverter):
         """Async equivalent of ``to_pydantic`` — uses ``acall`` so the event loop is not blocked."""
         from crewai.hooks.dispatch import HookAborted
 
+        # Every attempt is a new LLM call, which a run abandoned at its
+        # timeout does not make.
+        refuse_abandoned_run()
         try:
             if self.llm.supports_function_calling():
                 response = await self.llm.acall(
@@ -165,6 +172,9 @@ class Converter(OutputConverter):
         """
         from crewai.hooks.dispatch import HookAborted
 
+        # Every attempt is a new LLM call, which a run abandoned at its
+        # timeout does not make.
+        refuse_abandoned_run()
         try:
             if self.llm.supports_function_calling():
                 return self._create_instructor().to_json()
@@ -187,6 +197,9 @@ class Converter(OutputConverter):
         """
         from crewai.hooks.dispatch import HookAborted
 
+        # Every attempt is a new LLM call, which a run abandoned at its
+        # timeout does not make.
+        refuse_abandoned_run()
         try:
             if self.llm.supports_function_calling():
                 return await asyncio.to_thread(self._create_instructor().to_json)

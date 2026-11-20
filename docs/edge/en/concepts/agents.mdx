@@ -291,6 +291,26 @@ multimodal_agent = Agent(
 - `max_rpm`: Rate limiting for API calls
 - `max_retry_limit`: Retries on error
 
+<Note>
+**When `max_execution_time` runs out**, the call raises `TimeoutError` at the limit, without waiting for the work in progress. Python cannot stop a running thread, so the run left behind stops at its next step. Before that, it stops before the further work it would start: another tool call, a repeated or follow-up LLM request, a human-input prompt, a memory save, a knowledge query, or a task on another agent (a coworker or a remote A2A agent). Work its step in progress has already started is not stopped and may still complete, with its side effects: for example an LLM call, a tool call, or a memory save already under way. Known cases:
+
+- A step waiting for the `max_rpm` limit when the time runs out may still send its LLM request after the wait.
+- In planning mode, plan steps in progress finish, and each is then still reviewed with an LLM call. With `verbose`, a plan step ended by the stop can be printed as a failed step.
+
+Also:
+
+- A coworker the agent was delegating to stops the same way.
+- In planning mode, a step is a whole plan step, which can make several LLM and tool calls, and several plan steps can be in progress at once.
+- The result is discarded. The tokens used still count toward the agent's usage, so the agent's usage totals, and a later call's usage read from them, can include them.
+- A human-input prompt already showing when the time ran out stays until it is answered.
+- A later call on the same agent, or on a coworker it was delegating to, starts at once and returns its own result. The run left behind does not change that result.
+- Each timed-out call can leave work in progress, so several can run at the same time. When `max_rpm` is set, it caps their combined request rate; it is off by default, and then nothing caps it.
+- **Synchronous runs** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): the work in progress finishes in a background thread. It does not delay the end of `asyncio.run`. At program exit, Python waits until it ends.
+- **Asynchronous runs** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): the run is cancelled. Work already running in a worker thread (for example a synchronous tool or LLM call) finishes. The end of `asyncio.run` and program exit wait until it ends.
+
+A tool with side effects can therefore still be finishing after the `TimeoutError`, possibly at the same time as a retry of the same task.
+</Note>
+
 #### Code Execution
 
 <Warning>

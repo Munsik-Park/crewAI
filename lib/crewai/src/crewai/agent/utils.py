@@ -17,7 +17,13 @@ from crewai.events.types.knowledge_events import (
 )
 from crewai.hooks.dispatch import HookAborted
 from crewai.knowledge.utils.knowledge_utils import extract_knowledge_context
+from crewai.tools.tool_results import collected_tool_results
 from crewai.utilities.pydantic_schema_utils import generate_model_description
+from crewai.utilities.timed_run import (
+    RunAbandonedError,
+    refuse_abandoned_run,
+    run_scope_write_guard,
+)
 from crewai.utilities.types import LLMMessage
 
 
@@ -149,6 +155,9 @@ def handle_knowledge_retrieval(
     if not (agent.knowledge or (_crew and _crew.knowledge)):
         return task_prompt
 
+    # Each query can outlast the timeout; a run abandoned at it makes no
+    # further query and writes nothing to the agent.
+    refuse_abandoned_run()
     crewai_event_bus.emit(
         agent,
         event=KnowledgeRetrievalStartedEvent(
@@ -157,28 +166,31 @@ def handle_knowledge_retrieval(
         ),
     )
     try:
-        agent.knowledge_search_query = agent._get_knowledge_search_query(
-            task_prompt, task
-        )
+        search_query = agent._get_knowledge_search_query(task_prompt, task)
+        with run_scope_write_guard():
+            agent.knowledge_search_query = search_query
         if agent.knowledge_search_query:
             if agent.knowledge:
                 agent_knowledge_snippets = query_func(
                     [agent.knowledge_search_query], **knowledge_config
                 )
                 if agent_knowledge_snippets:
-                    agent.agent_knowledge_context = extract_knowledge_context(
-                        agent_knowledge_snippets
-                    )
+                    with run_scope_write_guard():
+                        agent.agent_knowledge_context = extract_knowledge_context(
+                            agent_knowledge_snippets
+                        )
                     if agent.agent_knowledge_context:
                         task_prompt += agent.agent_knowledge_context
 
+            refuse_abandoned_run()
             knowledge_snippets = crew_query_func(
                 [agent.knowledge_search_query], **knowledge_config
             )
             if knowledge_snippets:
-                agent.crew_knowledge_context = extract_knowledge_context(
-                    knowledge_snippets
-                )
+                with run_scope_write_guard():
+                    agent.crew_knowledge_context = extract_knowledge_context(
+                        knowledge_snippets
+                    )
                 if agent.crew_knowledge_context:
                     task_prompt += agent.crew_knowledge_context
 
@@ -201,8 +213,9 @@ def handle_knowledge_retrieval(
                 from_agent=agent,
             ),
         )
-        # a deny aborts the task; any other failure degrades to no knowledge
-        if isinstance(e, HookAborted):
+        # a deny aborts the task, and so does the run's abandonment; any other
+        # failure degrades to no knowledge
+        if isinstance(e, (HookAborted, RunAbandonedError)):
             raise
     return task_prompt
 
@@ -240,6 +253,9 @@ def apply_training_data(agent: Agent, task_prompt: str) -> str:
 def process_tool_results(agent: Agent, result: Any) -> Any:
     """Process tool results, returning result_as_answer if applicable.
 
+    Reads the results of the agent's execution in progress, so an earlier
+    or concurrent execution's tool output never becomes this one's answer.
+
     Args:
         agent: The agent with tool results.
         result: The current result.
@@ -247,7 +263,10 @@ def process_tool_results(agent: Agent, result: Any) -> Any:
     Returns:
         The final result, potentially overridden by tool result_as_answer.
     """
-    for tool_result in agent.tools_results:
+    tool_results = collected_tool_results(agent)
+    if tool_results is None:
+        tool_results = agent.tools_results
+    for tool_result in tool_results:
         if tool_result.get("result_as_answer", False):
             result = tool_result["result"]
     return result
@@ -347,6 +366,9 @@ async def ahandle_knowledge_retrieval(
     if not (agent.knowledge or (_crew and _crew.knowledge)):
         return task_prompt
 
+    # Each query can outlast the timeout; a run abandoned at it makes no
+    # further query and writes nothing to the agent.
+    refuse_abandoned_run()
     crewai_event_bus.emit(
         agent,
         event=KnowledgeRetrievalStartedEvent(
@@ -355,29 +377,32 @@ async def ahandle_knowledge_retrieval(
         ),
     )
     try:
-        agent.knowledge_search_query = agent._get_knowledge_search_query(
-            task_prompt, task
-        )
+        search_query = agent._get_knowledge_search_query(task_prompt, task)
+        with run_scope_write_guard():
+            agent.knowledge_search_query = search_query
         if agent.knowledge_search_query:
             if agent.knowledge:
                 agent_knowledge_snippets = await agent.knowledge.aquery(
                     [agent.knowledge_search_query], **knowledge_config
                 )
                 if agent_knowledge_snippets:
-                    agent.agent_knowledge_context = extract_knowledge_context(
-                        agent_knowledge_snippets
-                    )
+                    with run_scope_write_guard():
+                        agent.agent_knowledge_context = extract_knowledge_context(
+                            agent_knowledge_snippets
+                        )
                     if agent.agent_knowledge_context:
                         task_prompt += agent.agent_knowledge_context
 
             if _crew:
+                refuse_abandoned_run()
                 knowledge_snippets = await _crew.aquery_knowledge(
                     [agent.knowledge_search_query], **knowledge_config
                 )
                 if knowledge_snippets:
-                    agent.crew_knowledge_context = extract_knowledge_context(
-                        knowledge_snippets
-                    )
+                    with run_scope_write_guard():
+                        agent.crew_knowledge_context = extract_knowledge_context(
+                            knowledge_snippets
+                        )
                     if agent.crew_knowledge_context:
                         task_prompt += agent.crew_knowledge_context
 
@@ -400,7 +425,8 @@ async def ahandle_knowledge_retrieval(
                 from_agent=agent,
             ),
         )
-        # a deny aborts the task; any other failure degrades to no knowledge
-        if isinstance(e, HookAborted):
+        # a deny aborts the task, and so does the run's abandonment; any other
+        # failure degrades to no knowledge
+        if isinstance(e, (HookAborted, RunAbandonedError)):
             raise
     return task_prompt

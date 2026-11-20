@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from crewai.agents.parser import AgentFinish
 from crewai.memory.utils import sanitize_scope_name
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import run_scope_abandoned
 from crewai.utilities.types import LLMMessage
 
 
@@ -27,12 +28,26 @@ class BaseAgentExecutor(BaseModel):
     max_iter: int = Field(default=25)
     messages: list[LLMMessage] = Field(default_factory=list)
     _resuming: bool = PrivateAttr(default=False)
+    _abandoned: bool = PrivateAttr(default=False)
+
+    def abandon(self) -> None:
+        """Mark this executor's run as abandoned by its caller.
+
+        A timed-out run may still be finishing its step in progress; it stops
+        after that step, and its result is discarded, so it is not saved to
+        memory.
+        """
+        self._abandoned = True
+
+    def _run_abandoned(self) -> bool:
+        """Whether this executor's run, or the timed run it is part of, was abandoned."""
+        return self._abandoned or run_scope_abandoned()
 
     def _save_to_memory(self, output: AgentFinish) -> None:
         """Save task result to unified memory (memory or crew._memory)."""
         from crewai.hooks.dispatch import HookAborted
 
-        if self.agent is None:
+        if self.agent is None or self._run_abandoned():
             return
         memory = getattr(self.agent, "memory", None) or (
             getattr(self.crew, "_memory", None) if self.crew else None

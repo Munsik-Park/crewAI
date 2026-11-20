@@ -69,6 +69,7 @@ from crewai.agents.agent_builder.base_agent import (
 from crewai.agents.agent_executor import AgentExecutor
 from crewai.agents.cache.cache_handler import CacheHandler
 from crewai.events.event_bus import crewai_event_bus
+from crewai.events.event_context import _event_id_stack
 from crewai.events.types.agent_events import (
     AgentExecutionCompletedEvent,
     AgentExecutionErrorEvent,
@@ -109,14 +110,16 @@ from crewai.tools.tool_failure import (
     merge_tool_failures,
     tool_failure_collector,
 )
+from crewai.tools.tool_results import tool_result_collector
 from crewai.types.callback import SerializableCallable
 from crewai.types.usage_metrics import UsageMetrics
 from crewai.utilities.agent_utils import (
+    convert_tools,
     get_tool_names,
     is_inside_event_loop,
     load_agent_from_repository,
-    parse_tools,
     render_text_description_and_args,
+    reset_original_tool_usage,
 )
 from crewai.utilities.config import process_config
 from crewai.utilities.constants import (
@@ -134,6 +137,16 @@ from crewai.utilities.message_utils import message_content_text
 from crewai.utilities.prompts import Prompts, StandardPromptResult, SystemPromptResult
 from crewai.utilities.pydantic_schema_utils import generate_model_description
 from crewai.utilities.string_utils import sanitize_tool_name
+from crewai.utilities.timed_run import (
+    RunAbandonedError,
+    TimedRunScope,
+    current_run_scope,
+    detach_abandoned_executor,
+    refuse_abandoned_run,
+    reset_run_scope,
+    run_scope_write_guard,
+    set_run_scope,
+)
 from crewai.utilities.token_counter_callback import TokenCalcHandler
 from crewai.utilities.training_handler import CrewTrainingHandler
 
@@ -162,7 +175,12 @@ if TYPE_CHECKING:
 _passthrough_exceptions: tuple[type[Exception], ...] = (
     ToolExecutionFailedError,
     HookAborted,
+    RunAbandonedError,
 )
+
+# Names the worker threads of runs under max_execution_time, which can
+# outlive the call that timed out.
+_TIMED_RUN_THREAD_PREFIX = "CrewAITimedRun"
 
 _EXECUTOR_CLASS_MAP: dict[str, type] = {
     "AgentExecutor": AgentExecutor,
@@ -723,10 +741,10 @@ class Agent(BaseAgent):
         """
         get_env_context()
 
-        self.reset_tool_failures()
-
-        if self.tools_handler:
-            self.tools_handler.last_used_tool = None
+        with run_scope_write_guard():
+            self.reset_tool_failures()
+            if self.tools_handler:
+                self.tools_handler.last_used_tool = None
 
         task_prompt = task.prompt()
         task_prompt = build_task_prompt_with_schema(task, task_prompt)
@@ -813,6 +831,7 @@ class Agent(BaseAgent):
         if not self._is_any_available_memory():
             return task_prompt
 
+        refuse_abandoned_run()
         crewai_event_bus.emit(
             self,
             event=MemoryRetrievalStartedEvent(
@@ -915,6 +934,14 @@ class Agent(BaseAgent):
         Raises:
             Exception: If the error is from litellm, a passthrough, or retries are exhausted.
         """
+        if isinstance(e, RunAbandonedError):
+            # The run was abandoned at its timeout: close the scope this attempt
+            # opened, but neither retry it nor count it against the budget.
+            crewai_event_bus.emit(
+                self,
+                event=AgentExecutionErrorEvent(agent=self, task=task, error=str(e)),
+            )
+            raise
         if isinstance(e, _passthrough_exceptions):
             raise
         # A retry re-enters execute_task, which opens a new agent_execution_started
@@ -1021,10 +1048,13 @@ class Agent(BaseAgent):
             ValueError: If the max execution time is not a positive integer.
             RuntimeError: If the agent execution fails for other reasons.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         spreadsheets = read_spreadsheet_inputs(task_input_text(task))
         scope = enter_spreadsheet_scope(spreadsheets)
         try:
-            return self._execute_task(task, context, tools, spreadsheets)
+            with tool_result_collector(self):
+                return self._execute_task(task, context, tools, spreadsheets)
         finally:
             exit_spreadsheet_scope(scope)
 
@@ -1070,6 +1100,9 @@ class Agent(BaseAgent):
                 )
             else:
                 result = self._execute_without_timeout(task_prompt, task)
+            # The end-of-task cleanup writes to this agent, which a later call
+            # may be using.
+            refuse_abandoned_run()
 
         except TimeoutError as e:
             crewai_event_bus.emit(
@@ -1102,49 +1135,77 @@ class Agent(BaseAgent):
             TimeoutError: If execution exceeds the timeout.
             RuntimeError: If execution fails for other reasons.
         """
+        executor = self.agent_executor
+        run_scope = TimedRunScope(parent=current_run_scope())
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
+        ctx.run(set_run_scope, run_scope)
+        # Owned explicitly rather than via `with`: leaving a `with` block joins
+        # the worker, which would hold the TimeoutError until the run ends.
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=_TIMED_RUN_THREAD_PREFIX
+        )
+        try:
+            future = pool.submit(
                 ctx.run,
                 self._execute_without_timeout,
                 task_prompt=task_prompt,
                 task=task,
+                executor=executor,
             )
 
             try:
                 return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError as e:
-                future.cancel()
+                run_scope.abandon()
+                self._detach_timed_out_run(executor)
                 raise TimeoutError(
                     f"Task '{task.description}' execution timed out after {timeout} seconds. Consider increasing max_execution_time or optimizing the task."
                 ) from e
             except _passthrough_exceptions:
                 # Wrapping a deliberate stop in RuntimeError would hide it from
                 # _check_execution_error and trigger the retry loop instead.
-                future.cancel()
                 raise
             except Exception as e:
-                future.cancel()
                 raise RuntimeError(f"Task execution failed: {e!s}") from e
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+            run_scope.close()
 
-    def _execute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    def _detach_timed_out_run(self, executor: AgentExecutor | None) -> None:
+        """Leave a timed-out run its own executor and tools handler.
+
+        The run scope detaches the executors registered with it; this also
+        covers a run that timed out before its executor was registered.
+        """
+        if executor is not None:
+            detach_abandoned_executor(executor)
+
+    def _execute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            executor: The executor to run; defaults to the agent's current one.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        if executor is None:
+            executor = self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        invoke_result = self.agent_executor.invoke(
+        invoke_result = executor.invoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1178,13 +1239,16 @@ class Agent(BaseAgent):
             ValueError: If the max execution time is not a positive integer.
             RuntimeError: If the agent execution fails for other reasons.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         # Downloading and parsing block, so they stay off the event loop.
         spreadsheets = await asyncio.to_thread(
             read_spreadsheet_inputs, task_input_text(task)
         )
         scope = enter_spreadsheet_scope(spreadsheets)
         try:
-            return await self._aexecute_task(task, context, tools, spreadsheets)
+            with tool_result_collector(self):
+                return await self._aexecute_task(task, context, tools, spreadsheets)
         finally:
             exit_spreadsheet_scope(scope)
 
@@ -1223,6 +1287,9 @@ class Agent(BaseAgent):
                 )
             else:
                 result = await self._aexecute_without_timeout(task_prompt, task)
+            # The end-of-task cleanup writes to this agent, which a later call
+            # may be using.
+            refuse_abandoned_run()
 
         except TimeoutError as e:
             crewai_event_bus.emit(
@@ -1257,35 +1324,55 @@ class Agent(BaseAgent):
             TimeoutError: If execution exceeds the timeout.
             RuntimeError: If execution fails for other reasons.
         """
+        executor = self.agent_executor
+        # A cancelled run never emits the events that close the scopes it
+        # opened; on Python 3.12+ wait_for runs it in this task's context.
+        event_scope_token = _event_id_stack.set(_event_id_stack.get())
+        run_scope = TimedRunScope(parent=current_run_scope())
+        run_scope_token = set_run_scope(run_scope)
         try:
             return await asyncio.wait_for(
-                self._aexecute_without_timeout(task_prompt, task),
+                self._aexecute_without_timeout(task_prompt, task, executor=executor),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as e:
+            run_scope.abandon()
+            self._detach_timed_out_run(executor)
             raise TimeoutError(
                 f"Task '{task.description}' execution timed out after {timeout} seconds. "
                 "Consider increasing max_execution_time or optimizing the task."
             ) from e
+        finally:
+            reset_run_scope(run_scope_token)
+            run_scope.close()
+            _event_id_stack.reset(event_scope_token)
 
-    async def _aexecute_without_timeout(self, task_prompt: str, task: Task) -> Any:
+    async def _aexecute_without_timeout(
+        self,
+        task_prompt: str,
+        task: Task,
+        executor: AgentExecutor | None = None,
+    ) -> Any:
         """Execute a task without a timeout asynchronously.
 
         Args:
             task_prompt: The prompt to send to the agent.
             task: The task being executed.
+            executor: The executor to run; defaults to the agent's current one.
 
         Returns:
             The output of the agent.
         """
-        if not self.agent_executor:
+        if executor is None:
+            executor = self.agent_executor
+        if not executor:
             raise RuntimeError("Agent executor is not initialized.")
 
-        result = await self.agent_executor.ainvoke(
+        result = await executor.ainvoke(
             {
                 "input": task_prompt,
-                "tool_names": self.agent_executor.tools_names,
-                "tools": self.agent_executor.tools_description,
+                "tool_names": executor.tools_names,
+                "tools": executor.tools_description,
                 "ask_for_human_input": task.human_input,
             }
         )
@@ -1340,50 +1427,92 @@ class Agent(BaseAgent):
         """Create the AgentExecutor for the agent."""
         configured_tools = tools if tools is not None else self.tools or []
         raw_tools = self._add_skill_loader_tool(list(configured_tools), task=task)
-        parsed_tools = parse_tools(raw_tools)
-
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        if self.agent_executor is not None:
-            self._update_executor_parameters(
-                task=task,
-                tools=parsed_tools,
-                raw_tools=raw_tools,
-                prompt=prompt,
-                stop_words=stop_words,
-                rpm_limit_fn=rpm_limit_fn,
-            )
-        else:
-            if not isinstance(self.llm, BaseLLM):
-                raise RuntimeError(
-                    "LLM must be resolved before creating agent executor."
+        # Converting the tools and building an executor run user code and can be
+        # slow, so they stay outside the run-scope lock: the caller's
+        # TimeoutError waits for that lock.
+        parsed_tools = convert_tools(raw_tools)
+        tools_names = get_tool_names(parsed_tools)
+        tools_description = render_text_description_and_args(parsed_tools)
+
+        while True:
+            built = None
+            if self.agent_executor is None:
+                built = self._build_agent_executor(
+                    task=task,
+                    tools=parsed_tools,
+                    raw_tools=raw_tools,
+                    prompt=prompt,
+                    stop_words=stop_words,
+                    rpm_limit_fn=rpm_limit_fn,
+                    tools_names=tools_names,
+                    tools_description=tools_description,
                 )
-            self.agent_executor = self.executor_class(
-                llm=self.llm,
-                task=task,
-                agent=self,
-                crew=self.crew,
-                tools=parsed_tools,
-                prompt=prompt,
-                original_tools=raw_tools,
-                stop_words=stop_words,
-                max_iter=self.max_iter,
-                tools_handler=self.tools_handler,
-                tools_names=get_tool_names(parsed_tools),
-                tools_description=render_text_description_and_args(parsed_tools),
-                step_callback=self.step_callback,
-                function_calling_llm=self.function_calling_llm,
-                respect_context_window=self.respect_context_window,
-                request_within_rpm_limit=rpm_limit_fn,
-                callbacks=[TokenCalcHandler(self._token_process)],
-                response_model=(
-                    task.response_model or task.output_pydantic or task.output_json
-                )
-                if task
-                else None,
+            # A run abandoned at its timeout must not touch the executor or the
+            # tool usage counts a later call may be using.
+            with run_scope_write_guard():
+                reset_original_tool_usage(parsed_tools)
+                if self.agent_executor is not None:
+                    self._update_executor_parameters(
+                        task=task,
+                        tools=parsed_tools,
+                        raw_tools=raw_tools,
+                        prompt=prompt,
+                        stop_words=stop_words,
+                        rpm_limit_fn=rpm_limit_fn,
+                        tools_names=tools_names,
+                        tools_description=tools_description,
+                    )
+                    return
+                if built is not None:
+                    # The handler may have been replaced since the build.
+                    built.tools_handler = self.tools_handler
+                    self.agent_executor = built
+                    return
+            # The executor seen before the lock was detached meanwhile.
+
+    def _build_agent_executor(
+        self,
+        task: Task | None,
+        tools: list[CrewStructuredTool],
+        raw_tools: list[BaseTool],
+        prompt: SystemPromptResult | StandardPromptResult,
+        stop_words: list[str],
+        rpm_limit_fn: Callable | None,  # type: ignore[type-arg]
+        tools_names: str,
+        tools_description: str,
+    ) -> AgentExecutor:
+        """Build a new executor for the agent, without assigning it."""
+        if not isinstance(self.llm, BaseLLM):
+            raise RuntimeError("LLM must be resolved before creating agent executor.")
+        executor = self.executor_class(
+            llm=self.llm,
+            task=task,
+            agent=self,
+            crew=self.crew,
+            tools=tools,
+            prompt=prompt,
+            original_tools=raw_tools,
+            stop_words=stop_words,
+            max_iter=self.max_iter,
+            tools_handler=self.tools_handler,
+            tools_names=tools_names,
+            tools_description=tools_description,
+            step_callback=self.step_callback,
+            function_calling_llm=self.function_calling_llm,
+            respect_context_window=self.respect_context_window,
+            request_within_rpm_limit=rpm_limit_fn,
+            callbacks=[TokenCalcHandler(self._token_process)],
+            response_model=(
+                task.response_model or task.output_pydantic or task.output_json
             )
-            if isinstance(self.agent_executor, AgentExecutor):
-                self.agent_executor.use_better_compaction = self.use_better_compaction
+            if task
+            else None,
+        )
+        if isinstance(executor, AgentExecutor):
+            executor.use_better_compaction = self.use_better_compaction
+        return executor
 
     def _update_executor_parameters(
         self,
@@ -1393,6 +1522,8 @@ class Agent(BaseAgent):
         prompt: SystemPromptResult | StandardPromptResult,
         stop_words: list[str],
         rpm_limit_fn: Callable | None,  # type: ignore[type-arg]
+        tools_names: str,
+        tools_description: str,
     ) -> None:
         """Update executor parameters without recreating instance.
 
@@ -1403,6 +1534,8 @@ class Agent(BaseAgent):
             prompt: Generated prompt.
             stop_words: Stop words list.
             rpm_limit_fn: RPM limit callback function.
+            tools_names: Names of the parsed tools.
+            tools_description: Description of the parsed tools.
         """
         if self.agent_executor is None:
             raise RuntimeError("Agent executor is not initialized.")
@@ -1418,8 +1551,8 @@ class Agent(BaseAgent):
         self.agent_executor.original_tools = raw_tools
         self.agent_executor.prompt = prompt
         self.agent_executor.stop_words = stop_words
-        self.agent_executor.tools_names = get_tool_names(tools)
-        self.agent_executor.tools_description = render_text_description_and_args(tools)
+        self.agent_executor.tools_names = tools_names
+        self.agent_executor.tools_description = tools_description
         self.agent_executor.response_model = (
             (task.response_model or task.output_pydantic or task.output_json)
             if task
@@ -1707,23 +1840,28 @@ class Agent(BaseAgent):
         """
         if spreadsheets is None:
             spreadsheets = read_spreadsheet_inputs(kickoff_input_text(messages))
-        self.reset_tool_failures()
+        with run_scope_write_guard():
+            self.reset_tool_failures()
+            if self.tools_handler:
+                self.tools_handler.last_used_tool = None
 
-        if self.tools_handler:
-            self.tools_handler.last_used_tool = None
-
+        # Loading tools can outlast the timeout, so each load and each write of
+        # the agent's tools is checked against it.
         if self.apps:
             platform_tools = self.get_platform_tools(self.apps)
             if platform_tools:
-                if self.tools is None:
-                    self.tools = []
-                self.tools.extend(platform_tools)
+                with run_scope_write_guard():
+                    if self.tools is None:
+                        self.tools = []
+                    self.tools.extend(platform_tools)
         if self.mcps:
+            refuse_abandoned_run()
             mcps = self.get_mcp_tools(self.mcps)
             if mcps:
-                if self.tools is None:
-                    self.tools = []
-                self.tools.extend(mcps)
+                with run_scope_write_guard():
+                    if self.tools is None:
+                        self.tools = []
+                    self.tools.extend(mcps)
 
         raw_tools = with_spreadsheet_tools(list(self.tools or []), spreadsheets)
 
@@ -1739,7 +1877,9 @@ class Agent(BaseAgent):
             )
 
         raw_tools = self._add_skill_loader_tool(raw_tools)
-        parsed_tools = parse_tools(raw_tools)
+        parsed_tools = convert_tools(raw_tools)
+        with run_scope_write_guard():
+            reset_original_tool_usage(parsed_tools)
 
         agent_info = {
             "id": self.id,
@@ -1837,6 +1977,7 @@ class Agent(BaseAgent):
             formatted_messages += "\n\n" + spreadsheets.overview
 
         if agent_memory is not None:
+            refuse_abandoned_run()
             try:
                 crewai_event_bus.emit(
                     self,
@@ -1990,6 +2131,8 @@ class Agent(BaseAgent):
         Note:
             For explicit async usage outside of Flow, use kickoff_async() directly.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         restored = apply_checkpoint(self, from_checkpoint)
         if restored is not None:
             return restored.kickoff(  # type: ignore[no-any-return]
@@ -2067,6 +2210,9 @@ class Agent(BaseAgent):
         Returns:
             The finalized output.
         """
+        # The run's last step, its conversion or its guardrail can each end
+        # after the timeout; what follows them is then not started.
+        refuse_abandoned_run()
         if self.guardrail is not None:
             output = self._process_kickoff_guardrail(
                 output=output,
@@ -2076,6 +2222,7 @@ class Agent(BaseAgent):
                 usage_baseline=usage_baseline,
             )
 
+        refuse_abandoned_run()
         self._save_kickoff_to_memory(messages, output.raw)
 
         crewai_event_bus.emit(
@@ -2374,6 +2521,8 @@ class Agent(BaseAgent):
         Returns:
             LiteAgentOutput: The result of the agent execution.
         """
+        # Before anything is written to this agent: a later call may be using it.
+        refuse_abandoned_run()
         restored = apply_checkpoint(self, from_checkpoint)
         if restored is not None:
             return await restored.kickoff_async(  # type: ignore[no-any-return]
