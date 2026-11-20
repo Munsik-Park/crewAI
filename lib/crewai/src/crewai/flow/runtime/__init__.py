@@ -28,6 +28,7 @@ from typing import (
     Literal,
     ParamSpec,
     TypeVar,
+    TypedDict,
     cast,
 )
 from uuid import uuid4
@@ -344,23 +345,65 @@ def _serialize_input_provider(value: Any) -> str | None:
 
 _FEEDBACK_RESULT_TAG = "__crewai_human_feedback_result__"
 
-_DISPATCH_FRAME_KEYS = frozenset(
-    {
-        "kind",
-        "trigger_method",
-        "result",
-        "current_trigger",
-        "router_results",
-        "payloads",
-        "feedback",
-        "ran",
-        "batch",
-        "rearmable",
-        "trigger_index",
-        "stage",
-        "rearm_first",
-    }
-)
+
+class _DispatchPosition(TypedDict):
+    """The part of a dispatch position kept the same in its saved form."""
+
+    trigger_method: str
+    result: Any
+    current_trigger: str
+    router_results: list[str]
+    payloads: dict[str, Any]
+    feedback: dict[str, Any]
+    batch: list[str] | None
+    trigger_index: int
+    stage: Literal["listeners", "starts"]
+    started: list[str]
+    rearm_first: bool
+
+
+class _DispatchStateKeys(_DispatchPosition):
+    ran: dict[str, set[str]]
+    rearmable: set[FlowMethodName] | None
+
+
+class _DispatchState(_DispatchStateKeys, total=False):
+    """A running dispatch's position.
+
+    ``batch`` holds the routers of the current trigger not yet finished,
+    ``trigger_index`` the trigger whose listeners run next, and ``stage``
+    whether that trigger's listeners or only its gated starts remain.
+    ``started`` holds the gated starts already run for that trigger. ``ran``
+    holds the methods already run per trigger, so a conditional start that also
+    listens to the same event is not run a second time. ``inflight_result`` is
+    the result of the first router in ``batch`` when it has already returned.
+    """
+
+    inflight_result: str | None
+
+
+class _DispatchFrameKeys(_DispatchPosition):
+    kind: Literal["dispatch"]
+    ran: dict[str, list[str]]
+    rearmable: list[str] | None
+
+
+class _DispatchFrame(_DispatchFrameKeys, total=False):
+    """A dispatch position as saved in a pending context's record."""
+
+    inflight_result: str | None
+
+
+class _StartOutcomeFrame(TypedDict):
+    """A router start's outcome still to be dispatched, as saved in a record."""
+
+    kind: Literal["start_outcome"]
+    result: str | None
+
+
+_RecordFrame = _DispatchFrame | _StartOutcomeFrame
+
+_DISPATCH_FRAME_KEYS = _DispatchFrame.__required_keys__
 
 
 def _router_outcome(value: Any) -> str | None:
@@ -435,45 +478,67 @@ def _is_valid_frame(frame: Any) -> bool:
         and not isinstance(trigger_index, bool)
         and 0 <= trigger_index <= len(frame["router_results"]) + 1
         and frame["stage"] in ("listeners", "starts")
+        and _is_str_list(frame["started"])
         and isinstance(frame["rearm_first"], bool)
         and (inflight is None or isinstance(inflight, str))
     )
 
 
-def _valid_frames(record: Any) -> list[dict[str, Any]] | None:
+def _valid_frames(record: Any) -> list[_RecordFrame] | None:
     """The recorded dispatch frames, or ``None`` when absent or malformed."""
     frames = record.get("frames") if isinstance(record, dict) else None
     if isinstance(frames, list) and frames and all(map(_is_valid_frame, frames)):
-        return frames
+        return cast(list[_RecordFrame], frames)
     return None
 
 
-def _dispatch_frame(st: dict[str, Any]) -> dict[str, Any]:
+def _dispatch_frame(st: _DispatchState) -> _DispatchFrame:
     """A dispatch position as a record frame of plain values."""
-    frame = dict(st)
-    frame.update(
-        kind="dispatch",
-        result=_encode_record_value(st["result"]),
-        router_results=list(st["router_results"]),
-        payloads={k: _encode_record_value(v) for k, v in st["payloads"].items()},
-        feedback={k: _encode_record_value(v) for k, v in st["feedback"].items()},
-        ran={k: sorted(v) for k, v in st["ran"].items()},
-        batch=list(st["batch"]) if st["batch"] is not None else None,
-        rearmable=sorted(st["rearmable"]) if st["rearmable"] is not None else None,
-    )
+    frame: _DispatchFrame = {
+        "kind": "dispatch",
+        "trigger_method": st["trigger_method"],
+        "result": _encode_record_value(st["result"]),
+        "current_trigger": st["current_trigger"],
+        "router_results": list(st["router_results"]),
+        "payloads": {k: _encode_record_value(v) for k, v in st["payloads"].items()},
+        "feedback": {k: _encode_record_value(v) for k, v in st["feedback"].items()},
+        "ran": {k: sorted(v) for k, v in st["ran"].items()},
+        "batch": list(st["batch"]) if st["batch"] is not None else None,
+        "rearmable": sorted(st["rearmable"]) if st["rearmable"] is not None else None,
+        "trigger_index": st["trigger_index"],
+        "stage": st["stage"],
+        "started": list(st["started"]),
+        "rearm_first": st["rearm_first"],
+    }
+    if "inflight_result" in st:
+        frame["inflight_result"] = st["inflight_result"]
     return frame
 
 
-def _dispatch_state(frame: dict[str, Any]) -> dict[str, Any]:
+def _dispatch_state(frame: _DispatchFrame) -> _DispatchState:
     """The dispatch position a record frame holds, with its values rebuilt."""
-    st = dict(frame)
-    st.update(
-        result=_decode_record_value(frame["result"]),
-        router_results=list(frame["router_results"]),
-        payloads={k: _decode_record_value(v) for k, v in frame["payloads"].items()},
-        feedback={k: _decode_record_value(v) for k, v in frame["feedback"].items()},
-        batch=list(frame["batch"]) if frame["batch"] is not None else None,
-    )
+    rearmable = frame["rearmable"]
+    st: _DispatchState = {
+        "trigger_method": frame["trigger_method"],
+        "result": _decode_record_value(frame["result"]),
+        "current_trigger": frame["current_trigger"],
+        "router_results": list(frame["router_results"]),
+        "payloads": {k: _decode_record_value(v) for k, v in frame["payloads"].items()},
+        "feedback": {k: _decode_record_value(v) for k, v in frame["feedback"].items()},
+        "ran": {k: set(v) for k, v in frame["ran"].items()},
+        "batch": list(frame["batch"]) if frame["batch"] is not None else None,
+        "rearmable": (
+            {FlowMethodName(name) for name in rearmable}
+            if rearmable is not None
+            else None
+        ),
+        "trigger_index": frame["trigger_index"],
+        "stage": frame["stage"],
+        "started": list(frame["started"]),
+        "rearm_first": frame["rearm_first"],
+    }
+    if "inflight_result" in frame:
+        st["inflight_result"] = frame["inflight_result"]
     return st
 
 
@@ -3391,7 +3456,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             rearm_trigger: Re-arm fired or_ listeners on ``trigger_method`` too, as
                 is done for router outcomes.
         """
-        state: dict[str, Any] = {
+        state: _DispatchState = {
             "trigger_method": str(trigger_method),
             "result": result,
             "current_trigger": str(trigger_method),
@@ -3403,12 +3468,13 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             "rearmable": None,
             "trigger_index": 0,
             "stage": "listeners",
+            "started": [],
             "rearm_first": rearm_trigger,
         }
         await self._run_dispatch(state, triggering_event_id)
 
     async def _run_dispatch(
-        self, st: dict[str, Any], triggering_event_id: str | None = None
+        self, st: _DispatchState, triggering_event_id: str | None = None
     ) -> None:
         """Run a dispatch from the position held in ``st``.
 
@@ -3432,19 +3498,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             raise
 
     async def _run_dispatch_steps(
-        self, st: dict[str, Any], triggering_event_id: str | None
+        self, st: _DispatchState, triggering_event_id: str | None
     ) -> None:
-        """Advance a dispatch, keeping its position in ``st`` up to date.
-
-        ``batch`` holds the routers of the current trigger not yet finished,
-        ``trigger_index`` the trigger whose listeners run next, and ``stage``
-        whether that trigger's listeners or only its gated starts remain.
-        ``ran`` holds the methods already run per trigger, so a conditional
-        start that also listens to the same event is not run a second time.
-        """
+        """Advance a dispatch, keeping its position in ``st`` up to date."""
         current_triggering_event_id = triggering_event_id
-        ran: dict[str, set[str]] = {k: set(v) for k, v in st["ran"].items()}
-        st["ran"] = ran
+        ran = st["ran"]
         while True:
             if st["batch"] is None:
                 current = FlowMethodName(st["current_trigger"])
@@ -3502,12 +3560,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             if not st["current_trigger"]:
                 break
 
-        if st["rearmable"] is None:
+        rearmable = st["rearmable"]
+        if rearmable is None:
             with self._or_listeners_lock:
-                st["rearmable"] = set(self._fired_or_listeners)
-        else:
-            st["rearmable"] = set(st["rearmable"])
-        rearmable: set[FlowMethodName] = st["rearmable"]
+                rearmable = st["rearmable"] = set(self._fired_or_listeners)
         all_triggers = [st["trigger_method"], *st["router_results"]]
         router_results = set(st["router_results"])
 
@@ -3554,13 +3610,16 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         )
             if trigger and trigger in router_results:
                 for method_name in self._start_method_names():
-                    if method_name in ran.get(trigger, set()):
+                    if (
+                        method_name in ran.get(trigger, set())
+                        or method_name in st["started"]
+                    ):
                         continue
                     if not self._start_condition_triggered_by(
                         method_name, current_trigger
                     ):
                         continue
-                    ran.setdefault(trigger, set()).add(method_name)
+                    st["started"].append(str(method_name))
                     if method_name in self._completed_methods:
                         # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
                         was_resuming = self._is_execution_resuming
@@ -3571,10 +3630,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         await self._execute_start_method(method_name)
             st["trigger_index"] = idx + 1
             st["stage"] = "listeners"
+            st["started"] = []
 
     async def _continue_dispatches(
         self,
-        frames: list[dict[str, Any]],
+        frames: list[_RecordFrame],
         reviewed: FlowMethodName,
         outcome: str,
         result: Any,
@@ -3589,8 +3649,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             first = frames[0] if frames else None
             if (
                 first is not None
-                and first.get("kind") == "dispatch"
-                and first.get("batch")
+                and first["kind"] == "dispatch"
+                and first["batch"]
                 and first["batch"][0] == str(reviewed)
                 and "inflight_result" not in first
             ):
@@ -3607,10 +3667,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             while index < len(frames):
                 frame = frames[index]
                 index += 1
-                if frame.get("kind") == "dispatch":
+                if frame["kind"] == "dispatch":
                     await self._run_dispatch(_dispatch_state(frame))
-                elif frame.get("kind") == "start_outcome":
-                    out = frame.get("result")
+                else:
+                    out = frame["result"]
                     payload = (
                         self.last_human_feedback
                         if self.last_human_feedback is not None
