@@ -22,9 +22,11 @@ from typing import Any
 import pytest
 from crewai import Agent, Task
 from crewai.hooks import (
+    register_after_llm_call_hook,
     register_after_tool_call_hook,
     register_before_llm_call_hook,
     register_before_tool_call_hook,
+    unregister_after_llm_call_hook,
     unregister_after_tool_call_hook,
     unregister_before_llm_call_hook,
     unregister_before_tool_call_hook,
@@ -763,3 +765,228 @@ def test_v6h_async_refused_model_call_in_flight_step_runs_no_hooks(
     assert after.count("prompt") == 0, after
     assert [lb for lb in after if lb.startswith("llm:")] == [], after
     assert isinstance(outcome.get("co"), Exception), outcome
+
+
+# --- I7: the hook boundary around the stop, case by case -----------------------
+#
+# The rule: a call the stop refuses runs no hook, before or after. A call that
+# was already in progress at the deadline, including one held in its own
+# before-hook, keeps the hooks it would have had without a deadline: allowed,
+# it runs and gets its after-hooks; blocked by its before-hook, it gets what a
+# blocked call always gets (after-tool hooks for a tool; nothing for a model).
+
+TARGET = "Target"
+HOLD = 2.0  # how long a held before-hook waits, past the 1 s limit
+
+# Events counted after the TimeoutError, per kind of call.
+_BOUNDARY_EXPECTED = {
+    ("tool", "refused"): {
+        "before-tool:start": 0,
+        "before-tool:end": 0,
+        "tool-ran": 0,
+        "after-tool": 0,
+    },
+    ("tool", "allowed"): {
+        "before-tool:start": 0,
+        "before-tool:end": 1,
+        "tool-ran": 1,
+        "after-tool": 1,
+    },
+    ("tool", "blocked"): {
+        "before-tool:start": 0,
+        "before-tool:end": 1,
+        "tool-ran": 0,
+        "after-tool": 1,
+    },
+    ("model", "refused"): {
+        "before-llm:start": 0,
+        "before-llm:end": 0,
+        "llm:target": 0,
+        "after-llm": 0,
+    },
+    ("model", "allowed"): {
+        "before-llm:start": 0,
+        "before-llm:end": 1,
+        "llm:target": 1,
+        "after-llm": 1,
+    },
+    ("model", "blocked"): {
+        "before-llm:start": 0,
+        "before-llm:end": 1,
+        "llm:target": 0,
+        "after-llm": 0,
+    },
+}
+
+
+def _is_target(context: Any) -> bool:
+    return getattr(getattr(context, "agent", None), "role", None) == TARGET
+
+
+@pytest.fixture
+def boundary_hooks(
+    recorder: _Recorder, request: pytest.FixtureRequest
+) -> Iterator[None]:
+    """Global hooks around the target agent's calls, removed on teardown.
+
+    For a held case the matching before-hook waits past the deadline on its
+    first call, then allows or blocks that call.
+    """
+    kind, case = request.param
+    held = case in ("allowed", "blocked")
+    held_tool = [kind == "tool" and held]
+    held_model = [kind == "model" and held]
+
+    def before_tool(context: Any) -> bool | None:
+        if not _is_target(context) or context.tool_name != "probe_tool":
+            return None
+        recorder.add("before-tool:start")
+        hold, held_tool[0] = held_tool[0], False
+        if hold:
+            time.sleep(HOLD)
+        recorder.add("before-tool:end")
+        return False if hold and case == "blocked" else None
+
+    def after_tool(context: Any) -> str | None:
+        if _is_target(context) and context.tool_name == "probe_tool":
+            recorder.add("after-tool")
+        return None
+
+    def before_llm(context: Any) -> bool | None:
+        if not _is_target(context):
+            return None
+        recorder.add("before-llm:start")
+        hold, held_model[0] = held_model[0], False
+        if hold:
+            time.sleep(HOLD)
+        recorder.add("before-llm:end")
+        return False if hold and case == "blocked" else None
+
+    def after_llm(context: Any) -> str | None:
+        if _is_target(context):
+            recorder.add("after-llm")
+        return None
+
+    register_before_tool_call_hook(before_tool)
+    register_after_tool_call_hook(after_tool)
+    register_before_llm_call_hook(before_llm)
+    register_after_llm_call_hook(after_llm)
+    try:
+        yield
+    finally:
+        unregister_before_tool_call_hook(before_tool)
+        unregister_after_tool_call_hook(after_tool)
+        unregister_before_llm_call_hook(before_llm)
+        unregister_after_llm_call_hook(after_llm)
+
+
+def _boundary_target(kind: str, case: str, recorder: _Recorder, **kwargs: Any) -> Agent:
+    """The agent whose calls the hooks watch, scripted for one case."""
+
+    @tool("probe_tool")
+    def probe_tool(x: str) -> str:
+        """The tool call under test."""
+        recorder.add("tool-ran")
+        return "probed"
+
+    @tool("slow_tool")
+    def slow_tool(x: str) -> str:
+        """Runs past the deadline, so the next model call starts after it."""
+        time.sleep(HOLD)
+        return "slow"
+
+    if kind == "tool":
+        first = (HOLD if case == "refused" else 0, _act("probe_tool", '{"x": "a"}'))
+        script = [first, (0, _final("DONE"))]
+    elif case == "refused":
+        script = [(0, _act("slow_tool", '{"x": "a"}')), (0, _final("DONE"))]
+    else:
+        script = [(0, _final("DONE"))]
+    return Agent(
+        role=TARGET,
+        goal="Answer the task",
+        backstory="You answer tasks.",
+        llm=ScriptedLLM(script, "target", recorder),
+        tools=[probe_tool, slow_tool],
+        allow_delegation=False,
+        max_retry_limit=0,
+        **kwargs,
+    )
+
+
+_BOUNDARY_CASES = [
+    pytest.param((kind, case), path, id=f"{kind}-{case}-{path}")
+    for kind in ("tool", "model")
+    for case in ("refused", "allowed", "blocked")
+    for path in ("sync", "async")
+]
+
+
+@pytest.mark.parametrize(
+    ("boundary_hooks", "path"), _BOUNDARY_CASES, indirect=["boundary_hooks"]
+)
+def test_v6i_hooks_around_the_stop_follow_the_rule(
+    recorder: _Recorder,
+    prompts: list[str],
+    boundary_hooks: None,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    path: str,
+) -> None:
+    """Which before- and after-hooks run for a call refused, allowed or blocked.
+
+    Sync: the target agent itself has the limit. Async: the target is a
+    co-worker run by the outer agent's tool, the step in flight at the deadline.
+    """
+    kind, case = request.node.callspec.params["boundary_hooks"]
+
+    if path == "sync":
+        target = _boundary_target(kind, case, recorder, max_execution_time=LIMIT)
+        run_ended = _run_end(target, monkeypatch)
+        _, raised_at = _raise_time(lambda: target.execute_task(_task(target)))
+        assert run_ended.wait(DRAIN_BOUND)
+    else:
+        coworker = _boundary_target(kind, case, recorder)
+        delegated = threading.Event()
+
+        @tool("delegate")
+        def delegate(q: str) -> str:
+            """Run the co-worker."""
+            try:
+                if kind == "model" and case == "refused":
+                    time.sleep(HOLD)  # the co-worker's first model call is after it
+                try:
+                    return str(coworker.execute_task(_task(coworker, "Sub")))
+                except Exception as e:  # noqa: BLE001 - a refused run may raise
+                    return f"failed: {type(e).__name__}"
+            finally:
+                delegated.set()
+
+        outer = Agent(
+            role="Outer",
+            goal="Delegate",
+            backstory="You delegate.",
+            llm=ScriptedLLM([(0, _act("delegate", '{"q": "x"}'))], "outer", recorder),
+            tools=[delegate],
+            allow_delegation=False,
+            max_retry_limit=0,
+            max_execution_time=LIMIT,
+        )
+
+        async def scenario() -> float:
+            try:
+                await outer.aexecute_task(_task(outer))
+            except TimeoutError:
+                return time.monotonic()
+            pytest.fail("aexecute_task did not raise TimeoutError")
+
+        try:
+            raised_at = asyncio.run(scenario())
+        finally:
+            assert delegated.wait(DRAIN_BOUND)
+
+    after = recorder.after(raised_at)
+    expected = _BOUNDARY_EXPECTED[(kind, case)]
+    observed = {label: after.count(label) for label in expected}
+    assert observed == expected, after
+    assert after.count("prompt") == 0, after
