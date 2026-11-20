@@ -330,16 +330,21 @@ multimodal_agent = Agent(
 - `max_retry_limit`: Tentativas de correção em erros
 
 <Note>
-**Quando `max_execution_time` se esgota**, a chamada lança `TimeoutError` no limite, sem esperar o trabalho em andamento. O Python não consegue parar uma thread em execução, então a etapa em andamento quando o tempo acabou ainda termina: uma chamada de LLM, ou uma chamada de ferramenta com seus efeitos colaterais. Nada roda depois dela: nenhuma outra chamada de LLM ou de ferramenta, nenhum pedido de entrada humana e nenhum salvamento na memória (a menos que o salvamento já tivesse começado).
+**Quando `max_execution_time` se esgota**, a chamada lança `TimeoutError` no limite, sem esperar o trabalho em andamento. O Python não consegue parar uma thread em execução, então a execução deixada para trás para na sua próxima etapa. Antes disso, ela para antes do trabalho adicional que iniciaria: outra chamada de ferramenta, uma requisição de LLM repetida ou seguinte, um pedido de entrada humana, um salvamento na memória, uma consulta de conhecimento ou uma tarefa em outro agente (um colega ou um agente A2A remoto). O trabalho que a etapa em andamento já iniciou não é interrompido e ainda pode terminar, com seus efeitos colaterais: por exemplo, uma chamada de LLM, uma chamada de ferramenta ou um salvamento na memória já em curso. Casos conhecidos:
 
-- Um colega (coworker) para o qual o agente estava delegando para da mesma forma, depois da sua própria etapa em andamento.
+- Uma etapa que estava esperando o limite de `max_rpm` quando o tempo acabou ainda pode enviar sua requisição de LLM depois da espera.
+- No modo de planejamento, as etapas do plano em andamento terminam, e cada uma ainda é revisada com uma chamada de LLM. Com `verbose`, uma etapa do plano encerrada pela parada pode ser exibida como uma etapa que falhou.
+
+Além disso:
+
+- Um colega (coworker) para o qual o agente estava delegando para da mesma forma.
 - No modo de planejamento, uma etapa é uma etapa inteira do plano, que pode fazer várias chamadas de LLM e de ferramentas, e várias etapas do plano podem estar em andamento ao mesmo tempo.
-- O resultado é descartado. Os tokens que a etapa usa continuam contando no uso do agente, então os totais de uso do agente, e o uso de uma chamada posterior lido deles, podem incluí-los.
+- O resultado é descartado. Os tokens usados continuam contando no uso do agente, então os totais de uso do agente, e o uso de uma chamada posterior lido deles, podem incluí-los.
 - Um pedido de entrada humana já exibido quando o tempo acabou permanece até ser respondido.
-- Uma chamada posterior no mesmo agente, ou em um colega para o qual ele estava delegando, começa imediatamente. O resultado dela não é afetado.
-- Cada chamada que expirou pode deixar uma etapa em andamento, então várias podem rodar ao mesmo tempo. Quando `max_rpm` está definido, ele limita a taxa combinada de requisições delas; por padrão está desativado e, nesse caso, nada a limita.
-- **Execuções síncronas** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): a etapa em andamento termina em uma thread em segundo plano. Ela não atrasa o fim de `asyncio.run`. Na saída do programa, o Python espera até ela terminar.
-- **Execuções assíncronas** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): a execução é cancelada. Uma etapa que já está rodando em uma thread de trabalho (por exemplo, uma chamada síncrona de ferramenta ou de LLM) termina. O fim de `asyncio.run` e a saída do programa esperam até ela terminar.
+- Uma chamada posterior no mesmo agente, ou em um colega para o qual ele estava delegando, começa imediatamente e retorna o próprio resultado. A execução deixada para trás não altera esse resultado.
+- Cada chamada que expirou pode deixar trabalho em andamento, então vários podem rodar ao mesmo tempo. Quando `max_rpm` está definido, ele limita a taxa combinada de requisições deles; por padrão está desativado e, nesse caso, nada a limita.
+- **Execuções síncronas** (`execute_task`, `Task.execute_sync`, `Task.execute_async`, `Crew.kickoff`, `Crew.kickoff_async`): o trabalho em andamento termina em uma thread em segundo plano. Ele não atrasa o fim de `asyncio.run`. Na saída do programa, o Python espera até ele terminar.
+- **Execuções assíncronas** (`aexecute_task`, `Task.aexecute_sync`, `Crew.akickoff`): a execução é cancelada. O trabalho que já está rodando em uma thread de trabalho (por exemplo, uma chamada síncrona de ferramenta ou de LLM) termina. O fim de `asyncio.run` e a saída do programa esperam até ele terminar.
 
 Assim, uma ferramenta com efeitos colaterais ainda pode estar terminando depois do `TimeoutError`, possivelmente ao mesmo tempo que uma nova tentativa da mesma tarefa.
 </Note>
