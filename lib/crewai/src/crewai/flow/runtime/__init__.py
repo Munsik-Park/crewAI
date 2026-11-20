@@ -2030,10 +2030,10 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 await self._continue_dispatches(
                     frames,
                     reviewed,
-                    collapsed_outcome if emit and collapsed_outcome else None,
+                    collapsed_outcome if emit else None,
                     result,
                 )
-            elif emit and collapsed_outcome:
+            elif emit and collapsed_outcome is not None:
                 # Own subscribers, then the label's; a reviewed listener
                 # re-arms fired or_ listeners for its label, a start does not.
                 await self._dispatch_router_completion(
