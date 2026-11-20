@@ -2410,7 +2410,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
             tool_failure = self._unknown_tool_failure(func_name, result)
 
         # Execute after_tool_call hooks (even if blocked, to allow logging/monitoring),
-        # except for a call refused because the run was stopped.
+        # except for a call the stop refused.
         after_hook_context = ToolCallHookContext(
             tool_name=func_name,
             tool_input=args_dict,
@@ -2423,7 +2423,7 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
         )
         modified_result = (
             None
-            if refused_by_stop(hook_blocked)
+            if refused_by_stop(before_hook_context)
             else run_after_tool_call_hooks(after_hook_context)
         )
         if modified_result is not None:

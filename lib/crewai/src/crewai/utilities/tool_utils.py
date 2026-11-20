@@ -139,7 +139,7 @@ async def aexecute_tool_and_check_finality(
             )
             modified_result = (
                 None
-                if refused_by_stop(True)
+                if refused_by_stop(hook_context)
                 else run_after_tool_call_hooks(blocked_hook_context)
             )
             return ToolResult(
@@ -307,7 +307,7 @@ def execute_tool_and_check_finality(
             )
             modified_result = (
                 None
-                if refused_by_stop(True)
+                if refused_by_stop(hook_context)
                 else run_after_tool_call_hooks(blocked_hook_context)
             )
             return ToolResult(

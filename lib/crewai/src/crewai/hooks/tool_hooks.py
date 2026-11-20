@@ -82,6 +82,7 @@ class ToolCallHookContext:
         self.task = task
         self.crew = crew
         self.tool_result = tool_result
+        self._refused_by_stop = False
         self.raw_tool_result = raw_tool_result
 
     def request_human_input(
@@ -181,6 +182,7 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
         is reported as blocked without running any hook.
     """
     if execution_stopped():
+        context._refused_by_stop = True
         return True
     try:
         dispatch(
@@ -194,13 +196,14 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
         return True
 
 
-def refused_by_stop(blocked: bool) -> bool:
-    """Whether a blocked tool call was refused because its run was stopped.
+def refused_by_stop(context: ToolCallHookContext) -> bool:
+    """Whether the stop itself refused this tool call at its before-hooks.
 
-    Such a call runs no ``post_tool_call`` hook either, since the run that
-    asked for it is over.
+    Such a call runs no ``post_tool_call`` hook either. A call its own
+    before-hook blocked keeps its after-hooks, even when the deadline passed
+    while that hook was running.
     """
-    return blocked and execution_stopped()
+    return context._refused_by_stop
 
 
 def run_after_tool_call_hooks(context: ToolCallHookContext) -> str | None:

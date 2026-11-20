@@ -13,6 +13,8 @@ This module imports nothing from crewAI so any layer can check the mark.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import contextvars
 import threading
 from typing import Final
@@ -20,6 +22,10 @@ from typing import Final
 
 _stop_events: contextvars.ContextVar[tuple[threading.Event, ...]] = (
     contextvars.ContextVar("crewai_execution_stop_events", default=())
+)
+
+_admitted_call: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "crewai_execution_stop_admitted_call", default=False
 )
 
 EXECUTION_STOPPED_MESSAGE: Final[str] = (
@@ -40,3 +46,23 @@ def enter_timed_run(stop: threading.Event) -> None:
 def execution_stopped() -> bool:
     """Whether the run executing in the current context has been stopped."""
     return any(event.is_set() for event in _stop_events.get())
+
+
+@contextmanager
+def admitted_call() -> Iterator[None]:
+    """Mark a model call that passed the stop check before its hooks ran.
+
+    A call already in progress at the deadline, even one still held in its
+    own before-hook, runs to its end; only calls started after the stop are
+    refused.
+    """
+    token = _admitted_call.set(True)
+    try:
+        yield
+    finally:
+        _admitted_call.reset(token)
+
+
+def model_call_refused() -> bool:
+    """Whether a model call starting now must be refused because its run stopped."""
+    return execution_stopped() and not _admitted_call.get()
