@@ -331,6 +331,7 @@ there is no behavioral penalty.
 ### Tool Blocked Unexpectedly
 - Check all pre hooks for `HookAborted` / `return False` conditions
 - The abort reason and source appear on the `HookDispatchedEvent` telemetry
+- A run that exceeded the agent's `max_execution_time` is refused its next tool calls with the same `"Tool execution blocked by hook"` message, without running any hook
 
 ## Related Documentation
 
