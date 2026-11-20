@@ -521,6 +521,14 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+With `emit`, resuming does not run the reviewed method again. Its own listeners, routers, `or_` conditions and `and_` joins run as they would if the review had been answered at once: they receive the outcome string, and a join fires when its other steps completed before the pause. The listeners on the chosen outcome then run with the `HumanFeedbackResult`, as before. `resume()` and `resume_async()` return the output of the last method that ran, which can be one of the reviewed method's own listeners, as on a run where the review is answered at once.
+
+Joins and once-only `or_` conditions across a restore rely on a record the runtime saves with the pending context. Rows saved by earlier versions, and rows written directly with `save_pending_feedback` (for example by a backend that builds its own context), resume without it: their listeners still run, but joins and `or_` conditions that depend on steps completed before the pause are not satisfied. A backend that stores the context with `to_dict` / `from_dict` keeps the record.
+
+The record holds the names of completed and waiting steps. When the reviewed method is a listener, it also holds the value of the step that triggered it, stored like the reviewed output: in JSON form, or as its string form when it has none.
+
+A parallel start whose completion has not been processed when the pause is saved is not part of the record, even if its method has already returned. A join on that start does not fire after a restore.
+
 ### Key Types
 
 | Type | Description |

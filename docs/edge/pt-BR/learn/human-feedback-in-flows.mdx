@@ -511,6 +511,14 @@ async def handle_feedback_webhook(flow_id: str, feedback: str):
     return result
 ```
 
+Com `emit`, a retomada não executa novamente o método revisado. Seus próprios listeners, routers, condições `or_` e joins `and_` são executados como se a revisão tivesse sido respondida imediatamente: recebem a string do outcome, e um join dispara quando suas outras etapas foram concluídas antes da pausa. Em seguida, os listeners do outcome escolhido são executados com o `HumanFeedbackResult`, como antes. `resume()` e `resume_async()` retornam a saída do último método executado, que pode ser um dos listeners do próprio método revisado, como em uma execução em que a revisão é respondida imediatamente.
+
+Joins e condições `or_` que disparam uma única vez após uma restauração dependem de um registro que o runtime salva com o contexto pendente. Linhas salvas por versões anteriores, e linhas gravadas diretamente com `save_pending_feedback` (por exemplo, por um backend que monta seu próprio contexto), são retomadas sem ele: seus listeners ainda são executados, mas joins e condições `or_` que dependem de etapas concluídas antes da pausa não são satisfeitos. Um backend que armazena o contexto com `to_dict` / `from_dict` mantém o registro.
+
+O registro guarda os nomes das etapas concluídas e em espera. Quando o método revisado é um listener, ele também guarda o valor da etapa que o disparou, armazenado como a saída revisada: em formato JSON, ou como sua forma em string quando não há uma.
+
+Um start paralelo cuja conclusão ainda não foi processada quando a pausa é salva não faz parte do registro, mesmo que seu método já tenha retornado. Um join sobre esse start não dispara após uma restauração.
+
 ### Tipos Principais
 
 | Tipo | Descrição |
