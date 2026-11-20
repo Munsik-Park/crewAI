@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
 import copy
+import dataclasses
 from datetime import datetime, timezone
 import enum
 import inspect
@@ -89,6 +90,7 @@ from crewai.execution import (
 from crewai.flow.async_feedback.types import (
     HumanFeedbackPending,
     HumanFeedbackProvider,
+    LiveRecordValue,
     PendingFeedbackContext,
 )
 from crewai.flow.dsl._utils import build_flow_definition
@@ -346,6 +348,11 @@ def _serialize_input_provider(value: Any) -> str | None:
 
 _FEEDBACK_RESULT_TAG = "__crewai_human_feedback_result__"
 _RECORD_LITERAL_TAG = "__crewai_record_literal__"
+_RECORD_DICT_TAG = "__crewai_record_dict__"
+_RECORD_TUPLE_TAG = "__crewai_record_tuple__"
+_RECORD_TAGS = frozenset(
+    {_FEEDBACK_RESULT_TAG, _RECORD_LITERAL_TAG, _RECORD_DICT_TAG, _RECORD_TUPLE_TAG}
+)
 
 
 class _DispatchPosition(TypedDict):
@@ -420,50 +427,129 @@ def _is_tagged(value: Any, tag: str) -> bool:
     return isinstance(value, dict) and set(value) == {tag}
 
 
-def _encode_record_value(value: Any) -> Any:
-    """Tag a ``HumanFeedbackResult`` so a restored record rebuilds it.
+class _NoStoredForm(Exception):  # noqa: N818 - control flow inside the encoder
+    """A dict key that neither JSON nor the record's tagged forms can hold."""
 
-    A dict whose only key is one of the tags is wrapped under the literal tag,
-    so it is restored as the same dict.
+
+def _stored_key(key: Any) -> Any:
+    """A dict key as a JSON value: a scalar as is, a tuple under its tag."""
+    if key is None or isinstance(key, (str, int, float, bool)):
+        return key
+    if isinstance(key, tuple):
+        return {_RECORD_TUPLE_TAG: [_stored_key(item) for item in key]}
+    raise _NoStoredForm
+
+
+def _stored_form(value: Any) -> Any:
+    """``value`` as JSON values, with tags for what plain JSON would change.
+
+    A ``HumanFeedbackResult``, a dict with keys other than strings and a dict
+    whose only key is one of the tags each go under a tag. Lists and tuples
+    become lists; other values take their JSON-safe form.
     """
-    if _is_tagged(value, _FEEDBACK_RESULT_TAG) or _is_tagged(
-        value, _RECORD_LITERAL_TAG
-    ):
-        return {_RECORD_LITERAL_TAG: value}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, HumanFeedbackResult):
         return {
             _FEEDBACK_RESULT_TAG: {
-                "output": value.output,
+                "output": _stored_form(value.output),
                 "feedback": value.feedback,
                 "outcome": value.outcome,
                 "timestamp": value.timestamp.isoformat(),
                 "method_name": value.method_name,
-                "metadata": value.metadata,
+                "metadata": _stored_form(value.metadata),
             }
         }
-    return value
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            items = {key: _stored_form(item) for key, item in value.items()}
+            if len(items) == 1 and next(iter(items)) in _RECORD_TAGS:
+                return {_RECORD_LITERAL_TAG: items}
+            return items
+        return {
+            _RECORD_DICT_TAG: [
+                [_stored_key(key), _stored_form(item)] for key, item in value.items()
+            ]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stored_form(item) for item in value]
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _stored_form(dataclasses.asdict(value))
+    return str(value)
 
 
-def _decode_record_value(value: Any) -> Any:
-    """Rebuild a value tagged by ``_encode_record_value``; return others as is."""
-    if _is_tagged(value, _RECORD_LITERAL_TAG):
-        return value[_RECORD_LITERAL_TAG]
-    if not _is_tagged(value, _FEEDBACK_RESULT_TAG):
-        return value
-    fields = value[_FEEDBACK_RESULT_TAG]
+def _stored_record_value(value: Any) -> Any:
+    """The form a record value is saved in; its string form when it has none."""
+    try:
+        return _stored_form(value)
+    except (_NoStoredForm, TypeError, ValueError):
+        return str(value)
+
+
+def _encode_record_value(value: Any) -> LiveRecordValue:
+    """Hold a value in a record as it is; the saved row gets its stored form."""
+    return LiveRecordValue(value, _stored_record_value)
+
+
+def _restored_key(key: Any) -> Any:
+    if _is_tagged(key, _RECORD_TUPLE_TAG) and isinstance(key[_RECORD_TUPLE_TAG], list):
+        return tuple(_restored_key(item) for item in key[_RECORD_TUPLE_TAG])
+    return key
+
+
+def _restored_feedback_result(fields: Any) -> HumanFeedbackResult | None:
     if not isinstance(fields, dict):
-        return value
+        return None
     try:
         return HumanFeedbackResult(
-            output=fields.get("output"),
+            output=_decode_record_value(fields.get("output")),
             feedback=str(fields.get("feedback", "")),
             outcome=fields.get("outcome"),
             timestamp=datetime.fromisoformat(str(fields.get("timestamp"))),
             method_name=str(fields.get("method_name", "")),
-            metadata=dict(fields.get("metadata") or {}),
+            metadata=dict(_decode_record_value(fields.get("metadata")) or {}),
         )
     except (TypeError, ValueError):
+        return None
+
+
+def _decode_record_value(value: Any) -> Any:
+    """A record value as it was: held as is, or rebuilt from its stored form.
+
+    A tagged form that is malformed is returned as stored.
+    """
+    if isinstance(value, LiveRecordValue):
+        return value.value
+    if isinstance(value, list):
+        return [_decode_record_value(item) for item in value]
+    if not isinstance(value, dict):
         return value
+    if _is_tagged(value, _RECORD_LITERAL_TAG) and isinstance(
+        value[_RECORD_LITERAL_TAG], dict
+    ):
+        return {
+            key: _decode_record_value(item)
+            for key, item in value[_RECORD_LITERAL_TAG].items()
+        }
+    if _is_tagged(value, _FEEDBACK_RESULT_TAG):
+        result = _restored_feedback_result(value[_FEEDBACK_RESULT_TAG])
+        return value if result is None else result
+    if _is_tagged(value, _RECORD_DICT_TAG):
+        pairs = value[_RECORD_DICT_TAG]
+        if not (
+            isinstance(pairs, list)
+            and all(isinstance(pair, list) and len(pair) == 2 for pair in pairs)
+        ):
+            return value
+        try:
+            return {
+                _restored_key(key): _decode_record_value(item) for key, item in pairs
+            }
+        except TypeError:
+            return value
+    return {key: _decode_record_value(item) for key, item in value.items()}
 
 
 def _is_str_list(value: Any) -> bool:
@@ -586,7 +672,7 @@ def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
         if isinstance(other, HumanFeedbackPending):
             queue.append(
                 {
-                    "context": other.context.to_dict(),
+                    "context": other.context,
                     "callback_info": other.callback_info or None,
                 }
             )
@@ -3799,11 +3885,17 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         """Pause again for the first review queued behind the resumed one."""
         while queued:
             entry = queued.pop(0)
-            if not (isinstance(entry, dict) and isinstance(entry.get("context"), dict)):
+            if not isinstance(entry, dict):
                 continue
-            try:
-                ctx = PendingFeedbackContext.from_dict(entry["context"])
-            except (KeyError, TypeError, ValueError):
+            stored = entry.get("context")
+            if isinstance(stored, PendingFeedbackContext):
+                ctx = stored
+            elif isinstance(stored, dict):
+                try:
+                    ctx = PendingFeedbackContext.from_dict(stored)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            else:
                 continue
             # Skip an entry for another flow, for a method this flow lacks, or
             # with a field the pause event and the saved row cannot take.

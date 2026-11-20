@@ -6,6 +6,7 @@ non-blocking human-in-the-loop workflows.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -13,6 +14,17 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from crewai.flow.flow import Flow
+
+
+@dataclass(frozen=True)
+class LiveRecordValue:
+    """A value a pending context's record holds as it is while the flow runs.
+
+    ``PendingFeedbackContext.to_dict`` writes ``stored(value)`` in its place.
+    """
+
+    value: Any
+    stored: Callable[[Any], Any]
 
 
 @dataclass
@@ -44,12 +56,14 @@ class PendingFeedbackContext:
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
         resume_record: Run bookkeeping written by the runtime when it saves the
-            pause: completed methods, join progress, fired ``or_`` listeners
-            and, for a review with ``emit``, where each dispatch the pause
-            interrupted stopped, with the values it passes on. Resume uses it to
-            continue those dispatches, close joins and keep ``or_`` listeners
-            firing once across the pause. ``None`` when the context holds no
-            record.
+            pause: completed methods, join progress, fired ``or_`` listeners,
+            where each dispatch the pause interrupted stopped, with the values
+            it passes on, and the reviews queued behind this one. Resume uses
+            it to continue those dispatches, close joins, keep ``or_``
+            listeners firing once across the pause and pause for each queued
+            review in turn. While the flow runs, the record holds the values
+            and queued contexts as they are; ``to_dict`` writes their stored
+            form. ``None`` when the context holds no record.
 
     Example:
         ```python
@@ -84,10 +98,15 @@ class PendingFeedbackContext:
         """Convert a value to a JSON-serializable form.
 
         Handles Pydantic models, dataclasses, and arbitrary objects by
-        progressively falling back to string representation.
+        progressively falling back to string representation. A record's live
+        values and queued contexts are written in their stored form.
         """
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, LiveRecordValue):
+            return value.stored(value.value)
+        if isinstance(value, PendingFeedbackContext):
+            return value.to_dict()
         if isinstance(value, (list, tuple)):
             return [PendingFeedbackContext._make_json_safe(v) for v in value]
         if isinstance(value, dict):
