@@ -4370,7 +4370,8 @@ def test_review_without_emit_in_the_reviewed_methods_dispatch_keeps_its_outcome(
     assert paused_for == ["draft", "audit"]
 
 
-# A user value shaped like the record's stored review result.
+# User values shaped like the record's tagged forms: a stored review result,
+# and a value stored under the record's literal tag.
 _TAGGED_USER_VALUE = {
     "__crewai_human_feedback_result__": {
         "output": "x",
@@ -4381,17 +4382,23 @@ _TAGGED_USER_VALUE = {
         "metadata": {},
     }
 }
+_LITERAL_TAGGED_USER_VALUE = {"__crewai_record_literal__": {"k": 1}}
 
 
 @HOWS
+@pytest.mark.parametrize(
+    "user_value",
+    [_TAGGED_USER_VALUE, _LITERAL_TAGGED_USER_VALUE],
+    ids=["review_result_tag", "literal_tag"],
+)
 def test_user_dict_shaped_like_a_stored_review_result_resumes_as_that_dict(
-    how: str,
+    user_value: dict[str, Any], how: str
 ) -> None:
     def make(review: _Review, calls: list[Any]):
         class Tagged(Flow):
             @start()
             def seed(self):
-                return json.loads(json.dumps(_TAGGED_USER_VALUE))
+                return json.loads(json.dumps(user_value))
 
             @router(seed)
             def classify(self):
@@ -4412,7 +4419,7 @@ def test_user_dict_shaped_like_a_stored_review_result_resumes_as_that_dict(
         now = _run_at_once(make, tmpdir)
         before, after = _run_paused(make, tmpdir, how)
 
-    assert now == [("use", "dict", _TAGGED_USER_VALUE)]
+    assert now == [("use", "dict", user_value)]
     assert before + after == now
 
 
