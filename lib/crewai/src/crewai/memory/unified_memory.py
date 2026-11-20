@@ -149,8 +149,8 @@ class Memory(BaseModel):
     recall_oversample_factor: int = Field(
         default=_RECALL_OVERSAMPLE_FACTOR,
         description=(
-            "Recall asks storage for this many times the requested limit before "
-            "scoring and filtering; a MemorySlice also applies it per scope."
+            "Deep recall asks storage for this many times the requested limit "
+            "before scoring and filtering; a MemorySlice also applies it per scope."
         ),
     )
     read_only: bool = Field(
