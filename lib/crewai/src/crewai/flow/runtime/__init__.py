@@ -546,6 +546,19 @@ def _dispatch_state(frame: _DispatchFrame) -> _DispatchState:
     return st
 
 
+def _is_savable_pause_context(ctx: PendingFeedbackContext) -> bool:
+    """Whether ``FlowPausedEvent`` and ``to_dict`` accept the context's fields."""
+    emit = ctx.emit
+    return (
+        isinstance(ctx.requested_at, datetime)
+        and isinstance(ctx.message, str)
+        and (
+            emit is None
+            or (isinstance(emit, list) and all(isinstance(e, str) for e in emit))
+        )
+    )
+
+
 def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
     """Queue reviews behind ``first`` so resume pauses for each in turn."""
     if not others:
@@ -3773,11 +3786,13 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 ctx = PendingFeedbackContext.from_dict(entry["context"])
             except (KeyError, TypeError, ValueError):
                 continue
-            # Skip an entry for another flow, or for a method this flow lacks.
+            # Skip an entry for another flow, for a method this flow lacks, or
+            # with a field the pause event and the saved row cannot take.
             if (
                 ctx.flow_id != self.flow_id
                 or not isinstance(ctx.method_name, str)
                 or ctx.method_name not in self._definition.methods
+                or not _is_savable_pause_context(ctx)
             ):
                 continue
             info = entry.get("callback_info")
