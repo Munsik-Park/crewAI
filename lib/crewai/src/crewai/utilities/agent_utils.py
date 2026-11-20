@@ -193,19 +193,48 @@ def parse_tools(tools: list[BaseTool]) -> list[CrewStructuredTool]:
     Raises:
         ValueError: If a tool is not a CrewStructuredTool or BaseTool.
     """
+    tools_list = convert_tools(tools)
+    reset_original_tool_usage(tools_list)
+    return tools_list
+
+
+def convert_tools(tools: list[BaseTool]) -> list[CrewStructuredTool]:
+    """Convert tools to new structured tools, each with a usage count of 0.
+
+    The tools themselves are not changed; ``reset_original_tool_usage`` resets
+    their counts.
+
+    Args:
+        tools: List of tools to convert.
+
+    Returns:
+        List of structured tools.
+
+    Raises:
+        ValueError: If a tool is not a CrewStructuredTool or BaseTool.
+    """
     tools_list: list[CrewStructuredTool] = []
 
     for tool in tools:
         if isinstance(tool, CrewAITool):
             structured_tool = tool.to_structured_tool()
             structured_tool.current_usage_count = 0
-            if structured_tool._original_tool:
-                structured_tool._original_tool.current_usage_count = 0
             tools_list.append(structured_tool)
         else:
             raise ValueError("Tool is not a CrewStructuredTool or BaseTool")
 
     return tools_list
+
+
+def reset_original_tool_usage(tools: list[CrewStructuredTool]) -> None:
+    """Reset the usage count of the tool each structured tool was converted from.
+
+    Args:
+        tools: Structured tools returned by ``convert_tools``.
+    """
+    for structured_tool in tools:
+        if structured_tool._original_tool:
+            structured_tool._original_tool.current_usage_count = 0
 
 
 def get_tool_names(tools: Sequence[CrewStructuredTool | BaseTool]) -> str:

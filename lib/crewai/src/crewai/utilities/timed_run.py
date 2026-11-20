@@ -23,7 +23,10 @@ class RunAbandonedError(Exception):
     """Ends a run whose caller already received ``TimeoutError``.
 
     It is a deliberate stop, not a failure: it is not retried, not counted
-    against the retry budget, and not reported.
+    against the retry budget, and nothing is printed or logged as an error
+    for it. The events that close what the run opened are still emitted:
+    ``AgentExecutionErrorEvent`` for an attempt that emitted its start event,
+    and ``FlowFailedEvent`` for the executor's flow.
     """
 
     def __init__(

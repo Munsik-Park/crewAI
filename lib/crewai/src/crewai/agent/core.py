@@ -114,11 +114,12 @@ from crewai.tools.tool_results import tool_result_collector
 from crewai.types.callback import SerializableCallable
 from crewai.types.usage_metrics import UsageMetrics
 from crewai.utilities.agent_utils import (
+    convert_tools,
     get_tool_names,
     is_inside_event_loop,
     load_agent_from_repository,
-    parse_tools,
     render_text_description_and_args,
+    reset_original_tool_usage,
 )
 from crewai.utilities.config import process_config
 from crewai.utilities.constants import (
@@ -1099,6 +1100,9 @@ class Agent(BaseAgent):
                 )
             else:
                 result = self._execute_without_timeout(task_prompt, task)
+            # The end-of-task cleanup writes to this agent, which a later call
+            # may be using.
+            refuse_abandoned_run()
 
         except TimeoutError as e:
             crewai_event_bus.emit(
@@ -1283,6 +1287,9 @@ class Agent(BaseAgent):
                 )
             else:
                 result = await self._aexecute_without_timeout(task_prompt, task)
+            # The end-of-task cleanup writes to this agent, which a later call
+            # may be using.
+            refuse_abandoned_run()
 
         except TimeoutError as e:
             crewai_event_bus.emit(
@@ -1422,52 +1429,90 @@ class Agent(BaseAgent):
         raw_tools = self._add_skill_loader_tool(list(configured_tools), task=task)
         prompt, stop_words, rpm_limit_fn = self._build_execution_prompt(raw_tools)
 
-        # A run abandoned at its timeout must not touch the executor or the
-        # tool usage counts a later call may be using.
-        with run_scope_write_guard():
-            parsed_tools = parse_tools(raw_tools)
-            if self.agent_executor is not None:
-                self._update_executor_parameters(
+        # Converting the tools and building an executor run user code and can be
+        # slow, so they stay outside the run-scope lock: the caller's
+        # TimeoutError waits for that lock.
+        parsed_tools = convert_tools(raw_tools)
+        tools_names = get_tool_names(parsed_tools)
+        tools_description = render_text_description_and_args(parsed_tools)
+
+        while True:
+            built = None
+            if self.agent_executor is None:
+                built = self._build_agent_executor(
                     task=task,
                     tools=parsed_tools,
                     raw_tools=raw_tools,
                     prompt=prompt,
                     stop_words=stop_words,
                     rpm_limit_fn=rpm_limit_fn,
+                    tools_names=tools_names,
+                    tools_description=tools_description,
                 )
-            else:
-                if not isinstance(self.llm, BaseLLM):
-                    raise RuntimeError(
-                        "LLM must be resolved before creating agent executor."
+            # A run abandoned at its timeout must not touch the executor or the
+            # tool usage counts a later call may be using.
+            with run_scope_write_guard():
+                reset_original_tool_usage(parsed_tools)
+                if self.agent_executor is not None:
+                    self._update_executor_parameters(
+                        task=task,
+                        tools=parsed_tools,
+                        raw_tools=raw_tools,
+                        prompt=prompt,
+                        stop_words=stop_words,
+                        rpm_limit_fn=rpm_limit_fn,
+                        tools_names=tools_names,
+                        tools_description=tools_description,
                     )
-                self.agent_executor = self.executor_class(
-                    llm=self.llm,
-                    task=task,
-                    agent=self,
-                    crew=self.crew,
-                    tools=parsed_tools,
-                    prompt=prompt,
-                    original_tools=raw_tools,
-                    stop_words=stop_words,
-                    max_iter=self.max_iter,
-                    tools_handler=self.tools_handler,
-                    tools_names=get_tool_names(parsed_tools),
-                    tools_description=render_text_description_and_args(parsed_tools),
-                    step_callback=self.step_callback,
-                    function_calling_llm=self.function_calling_llm,
-                    respect_context_window=self.respect_context_window,
-                    request_within_rpm_limit=rpm_limit_fn,
-                    callbacks=[TokenCalcHandler(self._token_process)],
-                    response_model=(
-                        task.response_model or task.output_pydantic or task.output_json
-                    )
-                    if task
-                    else None,
-                )
-                if isinstance(self.agent_executor, AgentExecutor):
-                    self.agent_executor.use_better_compaction = (
-                        self.use_better_compaction
-                    )
+                    return
+                if built is not None:
+                    # The handler may have been replaced since the build.
+                    built.tools_handler = self.tools_handler
+                    self.agent_executor = built
+                    return
+            # The executor seen before the lock was detached meanwhile.
+
+    def _build_agent_executor(
+        self,
+        task: Task | None,
+        tools: list[CrewStructuredTool],
+        raw_tools: list[BaseTool],
+        prompt: SystemPromptResult | StandardPromptResult,
+        stop_words: list[str],
+        rpm_limit_fn: Callable | None,  # type: ignore[type-arg]
+        tools_names: str,
+        tools_description: str,
+    ) -> AgentExecutor:
+        """Build a new executor for the agent, without assigning it."""
+        if not isinstance(self.llm, BaseLLM):
+            raise RuntimeError("LLM must be resolved before creating agent executor.")
+        executor = self.executor_class(
+            llm=self.llm,
+            task=task,
+            agent=self,
+            crew=self.crew,
+            tools=tools,
+            prompt=prompt,
+            original_tools=raw_tools,
+            stop_words=stop_words,
+            max_iter=self.max_iter,
+            tools_handler=self.tools_handler,
+            tools_names=tools_names,
+            tools_description=tools_description,
+            step_callback=self.step_callback,
+            function_calling_llm=self.function_calling_llm,
+            respect_context_window=self.respect_context_window,
+            request_within_rpm_limit=rpm_limit_fn,
+            callbacks=[TokenCalcHandler(self._token_process)],
+            response_model=(
+                task.response_model or task.output_pydantic or task.output_json
+            )
+            if task
+            else None,
+        )
+        if isinstance(executor, AgentExecutor):
+            executor.use_better_compaction = self.use_better_compaction
+        return executor
 
     def _update_executor_parameters(
         self,
@@ -1477,6 +1522,8 @@ class Agent(BaseAgent):
         prompt: SystemPromptResult | StandardPromptResult,
         stop_words: list[str],
         rpm_limit_fn: Callable | None,  # type: ignore[type-arg]
+        tools_names: str,
+        tools_description: str,
     ) -> None:
         """Update executor parameters without recreating instance.
 
@@ -1487,6 +1534,8 @@ class Agent(BaseAgent):
             prompt: Generated prompt.
             stop_words: Stop words list.
             rpm_limit_fn: RPM limit callback function.
+            tools_names: Names of the parsed tools.
+            tools_description: Description of the parsed tools.
         """
         if self.agent_executor is None:
             raise RuntimeError("Agent executor is not initialized.")
@@ -1502,8 +1551,8 @@ class Agent(BaseAgent):
         self.agent_executor.original_tools = raw_tools
         self.agent_executor.prompt = prompt
         self.agent_executor.stop_words = stop_words
-        self.agent_executor.tools_names = get_tool_names(tools)
-        self.agent_executor.tools_description = render_text_description_and_args(tools)
+        self.agent_executor.tools_names = tools_names
+        self.agent_executor.tools_description = tools_description
         self.agent_executor.response_model = (
             (task.response_model or task.output_pydantic or task.output_json)
             if task
@@ -1828,8 +1877,9 @@ class Agent(BaseAgent):
             )
 
         raw_tools = self._add_skill_loader_tool(raw_tools)
+        parsed_tools = convert_tools(raw_tools)
         with run_scope_write_guard():
-            parsed_tools = parse_tools(raw_tools)
+            reset_original_tool_usage(parsed_tools)
 
         agent_info = {
             "id": self.id,

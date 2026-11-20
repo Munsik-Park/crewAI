@@ -20,8 +20,10 @@ def tool_result_collector(agent: Any) -> Generator[list[dict[str, Any]], None, N
     ``agent.tools_results`` accumulates over every execution, including runs
     still in progress after their caller timed out, so reading it lets one
     execution take another's ``result_as_answer`` output as its answer. The
-    collector is a ContextVar, which asyncio tasks and threads copy, so each
-    execution sees only its own results. It records only results of tools
+    collector is a ContextVar. asyncio tasks copy the context, and the library
+    copies it explicitly where it hands work to another thread, so each
+    execution sees only its own results. A thread a tool starts itself does
+    not see the collector. It records only results of tools
     used by the agent that opened it: a run of another agent started inside
     this execution (for example ``Agent.kickoff`` called from a tool) does
     not contribute to it.

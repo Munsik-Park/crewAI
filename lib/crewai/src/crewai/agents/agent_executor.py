@@ -3159,8 +3159,9 @@ class AgentExecutor(Flow[AgentExecutorState], BaseAgentExecutor):
     ) -> tuple[Any, str | None]:
         """Run one step, unless the run was abandoned at its timeout.
 
-        Every step passes through here, so an abandoned run ends after the
-        step in progress and makes no further LLM or tool call.
+        Every step passes through here, so an abandoned run stops before its
+        next step. Work the step in progress has already started may still
+        complete.
         """
         if self._run_abandoned():
             raise RunAbandonedError()
