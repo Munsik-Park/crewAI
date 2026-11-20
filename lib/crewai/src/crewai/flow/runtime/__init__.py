@@ -48,6 +48,7 @@ from pydantic import (
 from pydantic._internal._model_construction import ModelMetaclass
 from rich.console import Console
 from rich.panel import Panel
+from typing_extensions import NotRequired
 
 from crewai.events.base_events import reset_emission_counter
 from crewai.events.event_bus import crewai_event_bus
@@ -399,6 +400,7 @@ class _StartOutcomeFrame(TypedDict):
 
     kind: Literal["start_outcome"]
     result: str | None
+    rearm_first: NotRequired[bool]
 
 
 _RecordFrame = _DispatchFrame | _StartOutcomeFrame
@@ -458,7 +460,9 @@ def _is_valid_frame(frame: Any) -> bool:
     if not isinstance(frame, dict):
         return False
     if frame.get("kind") == "start_outcome":
-        return isinstance(frame.get("result"), str)
+        return isinstance(frame.get("result"), str) and isinstance(
+            frame.get("rearm_first", False), bool
+        )
     if frame.get("kind") != "dispatch" or not _DISPATCH_FRAME_KEYS <= frame.keys():
         return False
     ran = frame["ran"]
@@ -540,6 +544,48 @@ def _dispatch_state(frame: _DispatchFrame) -> _DispatchState:
     if "inflight_result" in frame:
         st["inflight_result"] = frame["inflight_result"]
     return st
+
+
+def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
+    """Queue reviews behind ``first`` so resume pauses for each in turn."""
+    if not others:
+        return
+    record = first.context.resume_record
+    if record is None:
+        record = first.context.resume_record = {}
+    queue = record.setdefault("queued", [])
+    for other in others:
+        if isinstance(other, HumanFeedbackPending):
+            queue.append(
+                {
+                    "context": other.context.to_dict(),
+                    "callback_info": other.callback_info or None,
+                }
+            )
+        else:
+            queue.append(other)
+    others.clear()
+
+
+async def _gather_settling(coros: list[Any]) -> list[Any]:
+    """``asyncio.gather`` that lets the others settle when one pauses for review.
+
+    Other errors propagate as with ``gather``. When any pauses, the first in
+    order is raised once all have finished; the later ones are queued on it.
+    """
+
+    async def guard(coro: Any) -> Any:
+        try:
+            return await coro
+        except HumanFeedbackPending as pending:
+            return pending
+
+    results = await asyncio.gather(*(guard(c) for c in coros))
+    pauses = [r for r in results if isinstance(r, HumanFeedbackPending)]
+    if pauses:
+        _queue_pauses(pauses[0], pauses[1:])
+        raise pauses[0]
+    return results
 
 
 _INITIAL_STATE_CLASS_MARKER = "__crewai_pydantic_class_schema__"
@@ -1826,6 +1872,13 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
+        resumed_record = context.resume_record
+        queued = (
+            resumed_record.pop("queued", None)
+            if isinstance(resumed_record, dict)
+            else None
+        )
+        queued = queued if isinstance(queued, list) else []
         try:
             if emit and collapsed_outcome:
                 reviewed = FlowMethodName(context.method_name)
@@ -1840,22 +1893,23 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                 else:
                     # Own subscribers, then the label's; a reviewed listener
                     # re-arms fired or_ listeners for its label, a start does not.
-                    await self._execute_listeners(reviewed, collapsed_outcome)
-                    await self._execute_listeners(
-                        FlowMethodName(collapsed_outcome),
-                        result,
-                        rearm_trigger=not self._definition.methods[
-                            str(reviewed)
-                        ].is_start,
+                    await self._dispatch_router_completion(
+                        reviewed,
+                        collapsed_outcome,
+                        collapsed_outcome,
+                        rearm=not self._definition.methods[str(reviewed)].is_start,
                     )
             else:
                 await self._execute_listeners(
                     FlowMethodName(context.method_name),
                     result,
                 )
+            self._raise_queued_pause(queued)
         except Exception as e:
             # Check if flow was paused again for human feedback (loop case)
             if isinstance(e, HumanFeedbackPending):
+                # A new review pauses ahead of the reviews still queued.
+                _queue_pauses(e, queued)
                 self._pending_feedback_context = e.context
 
                 if self.persistence is None:
@@ -2699,11 +2753,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     for start_method in starts_to_execute:
                         await self._execute_start_method(start_method)
                 else:
-                    tasks = [
-                        self._execute_start_method(start_method)
-                        for start_method in starts_to_execute
-                    ]
-                    await asyncio.gather(*tasks)
+                    await _gather_settling(
+                        [
+                            self._execute_start_method(start_method)
+                            for start_method in starts_to_execute
+                        ]
+                    )
             except Exception as e:
                 # Check if flow was paused for human feedback
                 if isinstance(e, HumanFeedbackPending):
@@ -3126,29 +3181,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         # If start method is a router, use its result as an additional trigger
         if self._is_router(start_method_name) and result is not None:
-            # Execute listeners for the start method name first
-            try:
-                await self._execute_listeners(
-                    start_method_name, result, finished_event_id
-                )
-            except HumanFeedbackPending as pending:
-                record = pending.context.resume_record
-                if record is None:
-                    record = pending.context.resume_record = {}
-                record.setdefault("frames", []).append(
-                    {"kind": "start_outcome", "result": _router_outcome(result)}
-                )
-                raise
-            # Then execute listeners for the router result (e.g., "approved")
-            router_result = result.value if isinstance(result, enum.Enum) else result
-            router_result_trigger = FlowMethodName(str(router_result))
-            listener_result = (
-                self.last_human_feedback
-                if self.last_human_feedback is not None
-                else result
-            )
-            await self._execute_listeners(
-                router_result_trigger, listener_result, finished_event_id
+            # Listeners of the start method name first, then of its outcome
+            await self._dispatch_router_completion(
+                start_method_name,
+                result,
+                cast(str, _router_outcome(result)),
+                finished_event_id,
             )
         else:
             await self._execute_listeners(start_method_name, result, finished_event_id)
@@ -3600,8 +3638,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                             current_triggering_event_id,
                         )
                     else:
-                        await asyncio.gather(
-                            *[
+                        await _gather_settling(
+                            [
                                 self._execute_single_listener(
                                     name, listener_result, current_triggering_event_id
                                 )
@@ -3662,27 +3700,93 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             else:
                 # The reviewed method ran as a start: its own subscribers, then
                 # its outcome's.
-                await self._execute_listeners(reviewed, outcome)
-                await self._execute_listeners(FlowMethodName(outcome), result)
+                await self._dispatch_router_completion(reviewed, outcome, outcome)
             while index < len(frames):
                 frame = frames[index]
                 index += 1
                 if frame["kind"] == "dispatch":
                     await self._run_dispatch(_dispatch_state(frame))
                 else:
-                    out = frame["result"]
-                    payload = (
-                        self.last_human_feedback
-                        if self.last_human_feedback is not None
-                        else out
+                    await self._dispatch_router_outcome(
+                        str(frame["result"]),
+                        frame["result"],
+                        rearm=frame.get("rearm_first", False),
                     )
-                    await self._execute_listeners(FlowMethodName(str(out)), payload)
         except HumanFeedbackPending as pending:
             record = pending.context.resume_record
             if record is None:
                 record = pending.context.resume_record = {}
             record.setdefault("frames", []).extend(frames[index:])
             raise
+
+    async def _dispatch_router_completion(
+        self,
+        name: FlowMethodName,
+        result: Any,
+        outcome: str,
+        triggering_event_id: str | None = None,
+        rearm: bool = False,
+    ) -> None:
+        """Dispatch a router start's (or reviewed method's) completion.
+
+        Its own subscribers run first with ``result``, then its outcome's. A
+        review pause under the first dispatch records the outcome dispatch as
+        still to do, so resume continues it.
+        """
+        try:
+            await self._execute_listeners(name, result, triggering_event_id)
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            frame: _StartOutcomeFrame = {"kind": "start_outcome", "result": outcome}
+            if rearm:
+                frame["rearm_first"] = True
+            record.setdefault("frames", []).append(frame)
+            raise
+        await self._dispatch_router_outcome(outcome, result, triggering_event_id, rearm)
+
+    async def _dispatch_router_outcome(
+        self,
+        outcome: str,
+        fallback: Any,
+        triggering_event_id: str | None = None,
+        rearm: bool = False,
+    ) -> None:
+        """Dispatch a router outcome with the payload the immediate path gives."""
+        payload = (
+            self.last_human_feedback
+            if self.last_human_feedback is not None
+            else fallback
+        )
+        await self._execute_listeners(
+            FlowMethodName(outcome), payload, triggering_event_id, rearm_trigger=rearm
+        )
+
+    def _raise_queued_pause(self, queued: list[Any]) -> None:
+        """Pause again for the first review queued behind the resumed one."""
+        while queued:
+            entry = queued.pop(0)
+            if not (isinstance(entry, dict) and isinstance(entry.get("context"), dict)):
+                continue
+            try:
+                ctx = PendingFeedbackContext.from_dict(entry["context"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Skip an entry for another flow, or for a method this flow lacks.
+            if (
+                ctx.flow_id != self.flow_id
+                or not isinstance(ctx.method_name, str)
+                or ctx.method_name not in self._definition.methods
+            ):
+                continue
+            info = entry.get("callback_info")
+            pause = HumanFeedbackPending(
+                context=ctx, callback_info=info if isinstance(info, dict) else None
+            )
+            # The rest of the queue moves onto this pause and ``queued`` empties.
+            _queue_pauses(pause, queued)
+            raise pause
 
     def _condition_met(
         self,
