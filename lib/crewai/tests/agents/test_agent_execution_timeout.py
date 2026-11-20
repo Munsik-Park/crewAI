@@ -43,7 +43,10 @@ from crewai.events.event_context import (
     MismatchBehavior,
     _event_context_config,
 )
-from crewai.events.types.agent_events import AgentExecutionStartedEvent
+from crewai.events.types.agent_events import (
+    AgentExecutionCompletedEvent,
+    AgentExecutionStartedEvent,
+)
 from crewai.knowledge.knowledge import Knowledge
 from crewai.knowledge.storage.base_knowledge_storage import BaseKnowledgeStorage
 from crewai.llms.base_llm import BaseLLM
@@ -1046,3 +1049,93 @@ def test_coworker_task_started_before_the_limit_queries_no_knowledge_after_it(
         if happened
     ]
     assert ran == [], f"after the limit the coworker made: {ran}"
+
+
+class _BlockingSaveMemory(_RecordingMemory):
+    """Recording memory whose save of a ``SUB_ONE`` result blocks until the test releases it."""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self._release = release
+        self.save_started: list[float] = []
+
+    def extract_memories(self, content: str) -> list[str]:
+        saved = super().extract_memories(content)
+        if "SUB_ONE" in content:
+            self.save_started.append(time.monotonic())
+            self._release.wait(ORPHAN_BLOCK)
+        return saved
+
+
+@pytest.mark.parametrize("entry", ["execute_task", "aexecute_task"])
+def test_coworker_task_saving_to_memory_at_the_limit_does_no_end_of_task_cleanup(
+    entry: str,
+) -> None:
+    """A coworker task whose memory save ends after the limit emits no completion event and keeps the coworker's last messages."""
+    release = threading.Event()
+    memory = _BlockingSaveMemory(release)
+
+    def coworker_script(text: str) -> str:
+        if "SUB_ONE" in text:
+            return _final("COWORKER_ORPHAN_ANSWER")
+        return _final("COWORKER_PRE_ANSWER")
+
+    coworker = _agent(
+        _ScriptedLLM(coworker_script), role="Coworker", max_execution_time=None
+    )
+    object.__setattr__(coworker, "memory", memory)
+    assert coworker.execute_task(_task(coworker, "PRE")) == "COWORKER_PRE_ANSWER"
+    last_messages = list(coworker.last_messages)
+    assert last_messages, "the coworker's earlier task left no last messages"
+    outcome: list[str] = []
+
+    @tool("ask_coworker")
+    def ask_coworker() -> str:
+        """Ask the coworker."""
+        sub_task = _task(coworker, "SUB_ONE")
+        try:
+            if entry == "execute_task":
+                coworker.execute_task(sub_task)
+            else:
+                asyncio.run(coworker.aexecute_task(sub_task))
+            outcome.append("ran")
+        except BaseException as error:
+            outcome.append(type(error).__name__)
+        return "ASKED_COWORKER"
+
+    agent = _agent(_ScriptedLLM(_asking_script), tools=[ask_coworker])
+    completed: list[AgentExecutionCompletedEvent] = []
+
+    with crewai_event_bus.scoped_handlers():
+
+        @crewai_event_bus.on(AgentExecutionCompletedEvent)
+        def _record(source: Any, event: AgentExecutionCompletedEvent) -> None:
+            completed.append(event)
+
+        before = set(threading.enumerate())
+        try:
+            with pytest.raises(TimeoutError):
+                agent.execute_task(_task(agent, "TASK_ONE"))
+            timed_out_at = time.monotonic()
+            assert not release.is_set(), "the coworker's save ended before the limit"
+        finally:
+            release.set()
+            still_alive = _join_timed_runs(before)
+        crewai_event_bus.flush(timeout=10.0)
+
+    assert still_alive == []
+    assert len(outcome) == 1, "the timed-out run's tool never called the coworker"
+    assert len(memory.save_started) == 1, "the coworker's memory save never started"
+    assert memory.save_started[0] < timed_out_at
+    ran = [
+        name
+        for name, happened in (
+            (
+                "completion event",
+                [e for e in completed if "SUB_ONE" in str(e.task.description)],
+            ),
+            ("last messages saved", coworker.last_messages != last_messages),
+        )
+        if happened
+    ]
+    assert ran == [], f"after the limit the coworker's task ended with: {ran}"
