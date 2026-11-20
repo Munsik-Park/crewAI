@@ -2,12 +2,8 @@
 
 A run that times out cannot be interrupted: the call executing at the deadline
 keeps running in its thread. Each timed run therefore carries a stop ``Event``
-in a context variable that is set only inside that run's own context. Once the
-deadline sets the event, every tool call or model request of the run that
-would begin is refused where it begins: before a call's before-hooks, when a
-call's before-hooks finish, and at every model request attempt. Nothing is
-exempt from a check, so work started with the run's context (a listener, a
-thread or a task) is refused like the run's own next step.
+in a context variable that is set only inside that run's own context, so work
+started with the run's context sees the mark too.
 
 The marks are a tuple so a run nested inside a timed run (a delegated
 co-worker, for example) also stops when any run enclosing it times out.
@@ -39,6 +35,11 @@ def enter_timed_run(stop: threading.Event) -> None:
     caller's, so that nothing outside the run sees the mark.
     """
     _stop_events.set((*_stop_events.get(), stop))
+
+
+def current_stop_marks() -> tuple[threading.Event, ...]:
+    """The marks of the runs the current context executes in."""
+    return _stop_events.get()
 
 
 def execution_stopped() -> bool:

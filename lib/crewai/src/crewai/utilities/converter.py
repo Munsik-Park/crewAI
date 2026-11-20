@@ -207,8 +207,8 @@ class Converter(OutputConverter):
     def _create_instructor(self) -> InternalInstructor[Any]:
         """Create an instructor.
 
-        The instructor talks to the provider directly, so a run stopped by
-        ``max_execution_time`` is refused here as it is at ``BaseLLM.call``.
+        Raises:
+            LLMCallBlockedError: The run was stopped by ``max_execution_time``.
         """
         if execution_stopped():
             from crewai.llms.base_llm import LLMCallBlockedError
