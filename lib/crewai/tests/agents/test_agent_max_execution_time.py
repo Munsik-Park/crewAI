@@ -1,4 +1,4 @@
-"""Regression tests for ``Agent.max_execution_time`` (issue #6).
+"""Regression tests for ``Agent.max_execution_time``.
 
 The limit must raise ``TimeoutError`` at the deadline without waiting for the
 work still running, a later call must not be affected by the timed-out run,
@@ -271,7 +271,7 @@ def _raise_time(call: Any) -> tuple[float, float]:
     return raised_at - start, raised_at
 
 
-# --- C1 ---------------------------------------------------------------------
+# --- The deadline ------------------------------------------------------------
 
 
 def test_v1_sync_timeout_raises_at_the_deadline(recorder: _Recorder) -> None:
@@ -297,7 +297,7 @@ def test_v1_sync_timeout_raises_at_the_deadline(recorder: _Recorder) -> None:
         assert done.wait(DRAIN_BOUND)
 
 
-# --- C2b --------------------------------------------------------------------
+# --- Later calls -------------------------------------------------------------
 
 
 def test_v2_sync_later_call_returns_its_own_result_and_is_not_held(
@@ -464,7 +464,7 @@ def test_v3_async_later_calls_after_timeout_are_independent(
         assert run1_tool_done.wait(DRAIN_BOUND)
 
 
-# --- I7: the timed-out run starts nothing new after the error -----------------
+# --- The timed-out run starts nothing new after the error --------------------
 
 
 def test_v6a_sync_gated_tool_after_deadline_is_not_started(
@@ -657,7 +657,7 @@ def test_v6f_async_converter_in_tool_in_flight_builds_no_client(
     assert isinstance(outcome.get("result"), ConverterError), outcome
 
 
-# --- I7: no hook runs for a call the stop refuses ------------------------------
+# --- No hook runs for a call the stop refuses --------------------------------
 
 
 @pytest.fixture
@@ -771,7 +771,7 @@ def test_v6h_async_refused_model_call_in_flight_step_runs_no_hooks(
     assert isinstance(outcome.get("co"), Exception), outcome
 
 
-# --- I7 / I8: the hook boundary around the stop, case by case -----------------
+# --- The hook boundary around the stop, case by case -------------------------
 #
 # The rule: a call checks the stop where it would begin. A call the stop refuses
 # before its before-hooks runs no hook, before or after. A call still held in
@@ -1042,7 +1042,7 @@ def test_v6i_hooks_around_the_stop_follow_the_rule(
     assert after.count("prompt") == 0, after
 
 
-# --- I7 / I8: work that starts after the error inside the work in flight -------
+# --- Work that starts after the error inside the work in flight --------------
 #
 # Each row starts one piece of late work from inside the call executing at the
 # deadline, after the caller has caught the TimeoutError, and checks that its
@@ -1333,7 +1333,7 @@ def test_v6j_work_started_after_the_error_sends_no_request(
     assert after.count("prompt") == 0, after
 
 
-# --- C2b, I3, I9: later and overlapping calls (V2-L) -------------------------
+# --- Later and overlapping calls (V2-L) --------------------------------------
 #
 # V2 and V3 above are rows L1 to L3. Each row below is a call that meets work
 # a timed-out run still holds, or a call next to a live call on one agent.

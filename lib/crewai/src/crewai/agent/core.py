@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 import concurrent.futures
+from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
 import inspect
@@ -177,9 +178,6 @@ _EXECUTOR_CLASS_MAP: dict[str, type] = {
     "AgentExecutor": AgentExecutor,
 }
 _conversation_flow_lock = Lock()
-# Choosing an agent's executor and holding it for a call is one step, so two
-# calls never run on one executor.
-_executor_choice_lock = Lock()
 
 
 @dataclass(frozen=True)
@@ -308,6 +306,12 @@ class Agent(BaseAgent):
     _mcp_resolver: MCPToolResolver | None = PrivateAttr(default=None)
     _last_messages: list[LLMMessage] = PrivateAttr(default_factory=list)
     _conversation_flow: Any = PrivateAttr(default=None)
+    # Choosing the agent's executor and holding it for a call is one step, so
+    # two calls never run on one executor.
+    _executor_choice_lock: Lock = PrivateAttr(default_factory=Lock)
+    # Executors chosen by timed-out runs, for the agent to stop naming when
+    # its choice lock is next released.
+    _executors_to_clear: list[AgentExecutor] = PrivateAttr(default_factory=list)
     conversational: bool = Field(
         default=False,
         description="Experimental: enable standalone conversations through a Flow session.",
@@ -578,7 +582,7 @@ class Agent(BaseAgent):
         task runs, after kickoff has interpolated: ``execute_task`` ->
         ``_finalize_task_prompt`` -> ``prepare_tools`` ->
         ``create_agent_executor``, which assigns ``self.llm`` to the executor
-        on every task (``_update_executor_parameters`` once it exists).
+        on every task (``_apply_executor_parameters`` once it exists).
         """
         role_before = self.role
         super().interpolate_inputs(inputs)
@@ -1193,25 +1197,71 @@ class Agent(BaseAgent):
     def _stop_timed_out_run(
         self, stop: threading.Event, call: _AgentCall | None
     ) -> None:
-        """Stop a timed-out run.
+        """Stop a timed-out run without waiting for any lock.
 
         If the agent still names the executor the run chose, it names none,
         so nothing taken from the agent before its next call (a checkpoint,
-        for example) refers to the abandoned work.
+        for example) refers to the abandoned work. When another step holds
+        the agent's choice lock, that step clears it as it ends.
         """
         stop.set()
-        with _executor_choice_lock:
-            chosen = call.executor if call is not None else None
-            if chosen is None or self.agent_executor is not chosen:
-                return
+        chosen = call.executor if call is not None else None
+        if chosen is None:
+            return
+        self._executors_to_clear.append(chosen)
+        if self._executor_choice_lock.acquire(blocking=False):
+            try:
+                self._clear_stopped_executors()
+            finally:
+                self._executor_choice_lock.release()
+
+    def _clear_stopped_executors(self) -> None:
+        while self._executors_to_clear:
+            chosen = self._executors_to_clear.pop()
+            if self.agent_executor is not chosen:
+                continue
             self.agent_executor = None
             if self.tools_handler is chosen.tools_handler:
                 self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
 
+    @contextmanager
+    def _choosing_executor(self) -> Iterator[None]:
+        """Hold the agent's choice lock."""
+        with self._executor_choice_lock:
+            try:
+                yield
+            finally:
+                self._clear_stopped_executors()
+
+    @contextmanager
+    def _usable_executor(
+        self, parameters: _ExecutorParameters
+    ) -> Iterator[AgentExecutor]:
+        """The agent's executor, replaced first if it is missing or a stopped
+        run was using it, with the choice lock held.
+
+        A replacement is built outside the lock, so building never delays
+        another step that needs it.
+        """
+        built: AgentExecutor | None = None
+        built_for: AgentExecutor | None = None
+        while True:
+            with self._choosing_executor():
+                current = self.agent_executor
+                if current is not None and not current.ran_in_stopped_run():
+                    yield current
+                    return
+                if built is not None and current is built_for:
+                    self._install_executor(built)
+                    yield built
+                    return
+            built_for = current
+            built = self._build_executor(parameters, current)
+
     def _leave_retired_tools_handler(self) -> None:
         """Give the agent a tools handler of its own if a stopped run still
         uses the one it has, before a call's preparation resets it."""
-        with _executor_choice_lock:
+        with self._choosing_executor():
             executor = self.agent_executor
             if (
                 executor is not None
@@ -1239,10 +1289,7 @@ class Agent(BaseAgent):
         call = self._own_call()
         parameters = call.parameters if call is not None else None
         build_with = parameters or self._executor_parameters(None, None)
-        with _executor_choice_lock:
-            executor = self.agent_executor
-            if executor is None or executor.ran_in_stopped_run():
-                executor = self._replace_executor(build_with)
+        with self._usable_executor(build_with) as executor:
             hold = executor.hold_for_call(current_stop_marks())
             if parameters is not None:
                 try:
@@ -1493,11 +1540,8 @@ class Agent(BaseAgent):
         call = self._own_call()
         if call is not None:
             call.parameters = parameters
-        with _executor_choice_lock:
-            executor = self.agent_executor
-            if executor is None or executor.ran_in_stopped_run():
-                self._replace_executor(parameters)
-            elif not executor._is_executing:
+        with self._usable_executor(parameters) as executor:
+            if not executor._is_executing:
                 self._apply_executor_parameters(executor, parameters)
 
     def _executor_parameters(
@@ -1517,14 +1561,16 @@ class Agent(BaseAgent):
             rpm_limit_fn=rpm_limit_fn,
         )
 
-    def _replace_executor(self, parameters: _ExecutorParameters) -> AgentExecutor:
-        """Build a new executor for the agent, with a tools handler the
-        replaced executor does not share."""
+    def _build_executor(
+        self, parameters: _ExecutorParameters, replacing: AgentExecutor | None
+    ) -> AgentExecutor:
+        """Build an executor to replace ``replacing``, with a tools handler
+        ``replacing`` does not share."""
         if not isinstance(self.llm, BaseLLM):
             raise RuntimeError("LLM must be resolved before creating agent executor.")
-        replaced = self.agent_executor
-        if replaced is not None and self.tools_handler is replaced.tools_handler:
-            self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
+        tools_handler = self.tools_handler
+        if replacing is not None and tools_handler is replacing.tools_handler:
+            tools_handler = ToolsHandler(cache=tools_handler.cache)
         task = parameters.task
         executor = self.executor_class(
             llm=self.llm,
@@ -1536,7 +1582,7 @@ class Agent(BaseAgent):
             original_tools=parameters.raw_tools,
             stop_words=parameters.stop_words,
             max_iter=self.max_iter,
-            tools_handler=self.tools_handler,
+            tools_handler=tools_handler,
             tools_names=get_tool_names(parameters.tools),
             tools_description=render_text_description_and_args(parameters.tools),
             step_callback=self.step_callback,
@@ -1552,8 +1598,15 @@ class Agent(BaseAgent):
         )
         if isinstance(executor, AgentExecutor):
             executor.use_better_compaction = self.use_better_compaction
-        self.agent_executor = executor
         return executor
+
+    def _install_executor(self, executor: AgentExecutor) -> None:
+        """Make ``executor``, built for the agent's current one, the agent's."""
+        replaced = self.agent_executor
+        if replaced is not None and self.tools_handler is replaced.tools_handler:
+            self.tools_handler = ToolsHandler(cache=self.tools_handler.cache)
+        executor.tools_handler = self.tools_handler
+        self.agent_executor = executor
 
     def _apply_executor_parameters(
         self, executor: AgentExecutor, parameters: _ExecutorParameters
@@ -2058,11 +2111,16 @@ class Agent(BaseAgent):
     def __copy__(self) -> Self:
         copied = super().__copy__()
         copied._conversation_flow = None
+        copied._executor_choice_lock = Lock()
+        copied._executors_to_clear = []
         return copied
 
     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
         # Sessions contain locks and a loader bound to their original Agent.
-        return BaseModel.__deepcopy__(self.__copy__(), memo)
+        copied = self.__copy__()
+        memo = {} if memo is None else memo
+        memo[id(copied._executor_choice_lock)] = Lock()
+        return BaseModel.__deepcopy__(copied, memo)
 
     def as_flow(self) -> Flow[Any]:
         """Return this Agent's experimental conversational Flow session.

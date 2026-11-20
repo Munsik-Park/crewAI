@@ -198,12 +198,8 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
 
 
 def refused_by_stop(context: ToolCallHookContext) -> bool:
-    """Whether the stop itself refused this tool call at its before-hooks.
-
-    Such a call runs no ``post_tool_call`` hook either. A call whose
-    before-hooks were already running at the deadline is treated as blocked
-    when they finish and keeps its after-hooks.
-    """
+    """Whether the stop itself, not a hook, refused this tool call before
+    its before-hooks ran."""
     return context._refused_by_stop
 
 

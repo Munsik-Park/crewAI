@@ -1,9 +1,8 @@
 """Stop marks for agent runs abandoned when ``max_execution_time`` is reached.
 
-A run that times out cannot be interrupted: the call executing at the deadline
-keeps running in its thread. Each timed run therefore carries a stop ``Event``
-in a context variable that is set only inside that run's own context, so work
-started with the run's context sees the mark too.
+Each timed run carries a stop ``Event`` in a context variable that is set only
+inside that run's own context, so work started with the run's context sees the
+mark too.
 
 The marks are a tuple so a run nested inside a timed run (a delegated
 co-worker, for example) also stops when any run enclosing it times out.
