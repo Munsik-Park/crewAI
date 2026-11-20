@@ -13,7 +13,7 @@ from typing_extensions import Unpack
 from crewai.agents.agent_builder.utilities.base_output_converter import OutputConverter
 from crewai.utilities.execution_stop import (
     EXECUTION_STOPPED_MESSAGE,
-    model_call_refused,
+    execution_stopped,
 )
 from crewai.utilities.i18n import I18N_DEFAULT
 from crewai.utilities.internal_instructor import InternalInstructor
@@ -210,7 +210,7 @@ class Converter(OutputConverter):
         The instructor talks to the provider directly, so a run stopped by
         ``max_execution_time`` is refused here as it is at ``BaseLLM.call``.
         """
-        if model_call_refused():
+        if execution_stopped():
             from crewai.llms.base_llm import LLMCallBlockedError
 
             raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)

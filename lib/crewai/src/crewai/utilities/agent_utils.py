@@ -62,7 +62,6 @@ from crewai.utilities.exceptions.context_window_exceeding_exception import (
 )
 from crewai.utilities.execution_stop import (
     EXECUTION_STOPPED_MESSAGE,
-    admitted_call,
     execution_stopped,
 )
 from crewai.utilities.i18n import I18N_DEFAULT
@@ -514,7 +513,7 @@ def _prepare_llm_call(
     if not _setup_before_llm_call_hooks(executor_context, printer, verbose=verbose):
         raise LLMCallBlockedError("LLM call blocked by before_llm_call hook")
 
-    with model_call_hooks_dispatched(), admitted_call():
+    with model_call_hooks_dispatched():
         yield executor_context.messages
 
 

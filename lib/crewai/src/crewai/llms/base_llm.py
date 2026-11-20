@@ -49,7 +49,7 @@ from crewai.types.streaming import StreamSession
 from crewai.types.usage_metrics import UsageMetrics
 from crewai.utilities.execution_stop import (
     EXECUTION_STOPPED_MESSAGE,
-    model_call_refused,
+    execution_stopped,
 )
 from crewai.utilities.pydantic_schema_utils import serialize_model_class
 from crewai.utilities.streaming import (
@@ -268,11 +268,13 @@ class BaseLLM(BaseModel, ABC):
 
             @wraps(method)
             def wrapped_call(instance: BaseLLM, *args: Any, **kwargs: Any) -> Any:
-                if model_call_refused():
-                    raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
-                return run_with_rate_limit_retry(
-                    lambda: method(instance, *args, **kwargs)
-                )
+                # Checked in each attempt: a rate-limit retry is a new request.
+                def attempt() -> Any:
+                    if execution_stopped():
+                        raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
+                    return method(instance, *args, **kwargs)
+
+                return run_with_rate_limit_retry(attempt)
 
             wrapped_call._crewai_rate_limit_wrapped = True  # type: ignore[attr-defined]
             setattr(cls, method_name, wrapped_call)
@@ -284,11 +286,12 @@ class BaseLLM(BaseModel, ABC):
             async def wrapped_acall(
                 instance: BaseLLM, *args: Any, **kwargs: Any
             ) -> Any:
-                if model_call_refused():
-                    raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
-                return await arun_with_rate_limit_retry(
-                    lambda: method(instance, *args, **kwargs)
-                )
+                async def attempt() -> Any:
+                    if execution_stopped():
+                        raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
+                    return await method(instance, *args, **kwargs)
+
+                return await arun_with_rate_limit_retry(attempt)
 
             wrapped_acall._crewai_rate_limit_wrapped = True  # type: ignore[attr-defined]
             setattr(cls, method_name, wrapped_acall)
@@ -1277,8 +1280,10 @@ class BaseLLM(BaseModel, ABC):
             HookAborted: If a hook raised it. The deny reaches the caller intact
                 instead of being flattened into a provider-style error.
             LLMCallBlockedError: If a legacy hook blocked the call by returning
-                ``False``. A ``ValueError``, so the fail-open handlers around
-                internal model calls keep absorbing it.
+                ``False``, or if the agent run making the call was stopped by
+                ``max_execution_time`` while the hooks ran. A ``ValueError``,
+                so the fail-open handlers around internal model calls keep
+                absorbing it.
 
         Example:
             >>> # In a native provider's call() method:
@@ -1322,6 +1327,10 @@ class BaseLLM(BaseModel, ABC):
             raise LLMCallBlockedError(
                 "LLM call blocked by before_llm_call hook"
             ) from blocked
+
+        # A hook may have held the call past the deadline; it is not sent then.
+        if execution_stopped():
+            raise LLMCallBlockedError(EXECUTION_STOPPED_MESSAGE)
 
         return True
 

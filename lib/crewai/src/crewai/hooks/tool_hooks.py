@@ -179,7 +179,8 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
         True if a hook blocked execution (returned False or raised
         :class:`HookAborted`), False otherwise. Tool input mutations on the
         context persist regardless. A run stopped by ``max_execution_time``
-        is reported as blocked without running any hook.
+        is reported as blocked without running any hook; a run stopped while
+        the hooks were running is reported as blocked when they finish.
     """
     if execution_stopped():
         context._refused_by_stop = True
@@ -191,7 +192,7 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
             reducer=before_tool_call_reducer,
             verbose=_hook_verbose(context),
         )
-        return False
+        return execution_stopped()
     except HookAborted:
         return True
 
@@ -199,9 +200,9 @@ def run_before_tool_call_hooks(context: ToolCallHookContext) -> bool:
 def refused_by_stop(context: ToolCallHookContext) -> bool:
     """Whether the stop itself refused this tool call at its before-hooks.
 
-    Such a call runs no ``post_tool_call`` hook either. A call its own
-    before-hook blocked keeps its after-hooks, even when the deadline passed
-    while that hook was running.
+    Such a call runs no ``post_tool_call`` hook either. A call whose
+    before-hooks were already running at the deadline is treated as blocked
+    when they finish and keeps its after-hooks.
     """
     return context._refused_by_stop
 
