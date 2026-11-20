@@ -5690,3 +5690,126 @@ def test_queued_review_raised_again_on_the_same_instance_keeps_its_callback_info
     assert pauses == [("x", {"ticket": "T-x"}), ("y", {"ticket": "T-y"})]
     assert not isinstance(out, HumanFeedbackPending)
     assert sorted(calls) == ["after_x", "after_y"]
+
+
+# A queued review whose reviewed output has no JSON form: a tuple key, an
+# object key, a cycle, or nesting past the recursion limit. Each entry builds
+# the output, its string form, and whether a restore can give it back equal.
+_QUEUED_OUTPUTS: dict[str, Callable[[], tuple[Any, str, bool]]] = {
+    "plain": lambda: ("O", "O", True),
+    "tuple_key": lambda: ({("a", "b"): 1}, "{('a', 'b'): 1}", True),
+    "object_key": lambda: ({_OPAQUE: 1}, "{_Opaque(): 1}", False),
+    "cyclic": lambda: (_CYCLIC_DICT, "{'k': 1, 'self': {...}}", False),
+    "deep": lambda: (*_deep_dicts(_past_the_limit()), False),
+}
+
+
+def _queued_output_beside_a_review(output: Any, at: str) -> Callable[..., type[Flow]]:
+    """``draft`` and ``other`` pause together; ``other``, which returns ``output``, is queued.
+
+    ``other`` completes after ``draft``'s review is requested. With
+    ``at="kickoff"`` both are starts; with ``at="resume"`` both listen on the
+    outcome of ``first``'s review, so they pause while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _Review(pause=True)
+        signal = _SignalledReview(review)
+
+        class AtKickoff(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                return "D"
+
+            @start()
+            @_hf(review, ("ok", "no"))
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review, ("go", "stop"))
+            def first(self):
+                return "F"
+
+            @listen("go")
+            @_hf_signalled(signal)
+            def draft(self):
+                return "D"
+
+            @listen("go")
+            @_hf(review, ("ok", "no"))
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES + [("kickoff", "same_instance")])
+@pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+def test_queued_review_with_output_without_a_json_form_still_pauses(
+    name: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row, and ``fin`` gets ``other``'s output as documented.
+
+    That is the live output, the output given back equal by a restore where it
+    has a faithful stored form, or its string form.
+    """
+    output, stored, faithful = _QUEUED_OUTPUTS[name]()
+    calls: list[Any] = []
+    flow_cls = _queued_output_beside_a_review(output, at)(calls)
+    expected = ["draft", "other"] if at == "kickoff" else ["first", "draft", "other"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        flow_id = out.context.flow_id
+        paused_for = [out.context.method_name]
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == paused_for[-1]
+            out = _failing_on_recursion(lambda: _resume(flow, how))  # noqa: B023
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            paused_for.append(out.context.method_name)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert paused_for == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish") == [
+        ("publish", ("review", "draft", "D", "approved"))
+    ]
+    fins = _calls_of(calls, "fin")
+    assert len(fins) == 1
+    _, (kind, method, got, outcome) = fins[0]
+    assert (kind, method, outcome) == ("review", "other", "ok")
+    assert (
+        got is output
+        or (isinstance(got, str) and got == stored)
+        or (faithful and type(got) is type(output) and repr(got) == repr(output))
+    ), f"fin got {type(got).__name__}"
