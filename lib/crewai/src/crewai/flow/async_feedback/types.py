@@ -47,8 +47,8 @@ class PendingFeedbackContext:
             pause (completed methods, join progress, fired ``or_`` listeners,
             and, for a reviewed listener, the event that triggered it and its
             value). Resume uses it to close joins and keep ``or_`` listeners
-            firing once across the pause. ``None`` for contexts built outside
-            the runtime or stored by earlier versions.
+            firing once across the pause. ``None`` when the context holds no
+            record.
 
     Example:
         ```python

@@ -1641,8 +1641,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         try:
             if emit and collapsed_outcome:
-                # Dispatch as the immediate path does: the reviewed method's own
-                # subscribers get the outcome, then the label's get the result.
+                # The reviewed method's own subscribers get the outcome, then
+                # the label's subscribers get the result.
                 reviewed = FlowMethodName(context.method_name)
                 has_record = context.resume_record is not None
                 record = context.resume_record or {}

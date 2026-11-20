@@ -1833,12 +1833,8 @@ class TestLearnOnResume:
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
 
 
-# Resuming a routed review dispatches the reviewed method (issue #7)
-#
-# Each case runs the same flow twice: once with the review answered at once
-# (empty reply, so ``default_outcome`` applies and no LLM is called) and once
-# paused, restored with ``from_pending`` and resumed. The resumed run must give
-# the reviewed method's own subscribers what the immediate run gives them.
+# Resuming a routed review gives the reviewed method's own subscribers what an
+# answer given at once gives them.
 
 
 class _Review:
@@ -2356,7 +2352,7 @@ def test_cycle_after_a_restore_reruns_or_listeners_completed_before_the_pause(
     assert calls == ["step", "after_step", "review"]
 
 
-# The keys a PendingFeedbackContext row had before the run record was added.
+# The keys of a PendingFeedbackContext row that holds no run record.
 _OLD_ROW_KEYS = {
     "flow_id",
     "flow_class",
