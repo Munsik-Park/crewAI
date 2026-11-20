@@ -1,4 +1,4 @@
-"""Regression tests: recall honours the configured recall_oversample_factor (#5).
+"""Regression tests: recall honours the configured recall_oversample_factor.
 
 Each test records the ``limit`` that recall passes to every storage ``search``
 call. The fake storage returns as many records as it is asked for, so every
@@ -74,7 +74,7 @@ def _assert_passes(calls: list[int], expected: int) -> None:
     assert all(c == expected for c in calls), calls
 
 
-# --- factor other than 2: fail before the fix -----------------------------
+# --- factor other than 2: recall asks storage for limit times the factor --
 
 
 def test_deep_recall_uses_memory_kwarg_factor_on_each_pass() -> None:
@@ -148,7 +148,7 @@ def test_memory_rejects_factor_below_one() -> None:
         _memory(storage, recall_oversample_factor=0)
 
 
-# --- no factor set: default 2 and the result cap (unchanged) --------------
+# --- no factor set: default factor 2 and the result cap -------------------
 
 
 def test_default_factor_and_cap_unchanged() -> None:
