@@ -440,6 +440,14 @@ def _stored_key(key: Any) -> Any:
     raise _NoStoredForm
 
 
+def _string_form(value: Any) -> str:
+    """``str(value)``, or its type's name in angle brackets when that raises."""
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
 def _stored_form(value: Any) -> Any:
     """``value`` as JSON values, with tags for what plain JSON would change.
 
@@ -477,15 +485,18 @@ def _stored_form(value: Any) -> Any:
         return value.model_dump(mode="json")
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _stored_form(dataclasses.asdict(value))
-    return str(value)
+    return _string_form(value)
 
 
 def _stored_record_value(value: Any) -> Any:
-    """The form a record value is saved in; its string form when it has none."""
+    """The form a record value is saved in; its string form when it has none.
+
+    A cycle, or nesting past the recursion limit, also has no stored form.
+    """
     try:
         return _stored_form(value)
-    except (_NoStoredForm, TypeError, ValueError):
-        return str(value)
+    except (_NoStoredForm, TypeError, ValueError, RecursionError):
+        return _string_form(value)
 
 
 def _encode_record_value(value: Any) -> LiveRecordValue:
@@ -589,10 +600,26 @@ def _is_valid_frame(frame: Any) -> bool:
     )
 
 
+def _is_rebuildable_frame(frame: _RecordFrame) -> bool:
+    """Whether a frame's values rebuild without exceeding the recursion limit."""
+    if frame["kind"] != "dispatch":
+        return True
+    try:
+        _dispatch_state(frame)
+    except RecursionError:
+        return False
+    return True
+
+
 def _valid_frames(record: Any) -> list[_RecordFrame] | None:
     """The recorded dispatch frames, or ``None`` when absent or malformed."""
     frames = record.get("frames") if isinstance(record, dict) else None
-    if isinstance(frames, list) and frames and all(map(_is_valid_frame, frames)):
+    if (
+        isinstance(frames, list)
+        and frames
+        and all(map(_is_valid_frame, frames))
+        and all(map(_is_rebuildable_frame, frames))
+    ):
         return cast(list[_RecordFrame], frames)
     return None
 
