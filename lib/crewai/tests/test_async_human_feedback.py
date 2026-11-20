@@ -12,6 +12,8 @@ This module tests the async/non-blocking human feedback flow, including:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+import enum
 import json
 import os
 import tempfile
@@ -2520,3 +2522,763 @@ def test_resume_after_a_deploy_removed_a_fired_or_listener(how: str) -> None:
     assert "draft" not in calls
     assert calls.count("audit") == 1
     assert calls.count("publish") == 1
+
+
+def _hf(review: _Review, emit: tuple[str, str] = ("approved", "rejected")) -> Any:
+    return human_feedback(
+        message="Review:",
+        emit=list(emit),
+        llm="gpt-4o-mini",
+        default_outcome=emit[0],
+        provider=review,
+    )
+
+
+ShapeFactory = Callable[[_Review, list[Any]], type[Flow]]
+
+
+def _run_at_once(make: ShapeFactory, tmpdir: str) -> list[Any]:
+    calls: list[Any] = []
+    make(_Review(pause=False), calls)(
+        persistence=SQLiteFlowPersistence(os.path.join(tmpdir, "now.db"))
+    ).kickoff()
+    return calls
+
+
+def _run_paused(
+    make: ShapeFactory, tmpdir: str, how: str, restore_each_time: bool = True
+) -> tuple[list[Any], list[Any]]:
+    """Kick off until the first pause, then restore and resume until the run ends.
+
+    Returns the calls before the first pause and the calls after it. With
+    ``restore_each_time`` false, a later pause is resumed on the same instance.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    before = list(calls)
+    calls.clear()
+    flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    for _ in range(5):
+        out = _resume(flow, how)
+        if not isinstance(out, HumanFeedbackPending):
+            return before, calls
+        if restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    raise AssertionError("the run kept pausing")
+
+
+def _named(calls: list[Any], *names: str) -> list[Any]:
+    """The calls of the given listeners, in a fixed order."""
+    picked = [c for c in calls if isinstance(c, tuple) and c[0] in names]
+    return sorted(picked, key=repr)
+
+
+def _assert_chain_resumes_as_at_once(
+    make: ShapeFactory,
+    how: str,
+    joins: dict[str, Any],
+    ran_before: tuple[str, ...],
+) -> None:
+    """Each join runs once after resume with the value it gets at once.
+
+    ``ran_before`` names the methods that completed before the pause; none of
+    them runs again after resume, and neither does ``draft``.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    expected = sorted(joins.items(), key=repr)
+    assert _named(now, *joins) == expected
+    assert _named(before, *joins) == []
+    assert _named(after, *joins) == expected
+    assert _named(after, "audit") == _named(now, "audit") == [("audit", "approved")]
+    assert _named(after, "publish") == [("publish", "HumanFeedbackResult")]
+    for name in ("draft", *ran_before):
+        assert name in before
+        assert name not in after
+
+
+def _ch1_router_outcome_leads_to_the_review(review: _Review, calls: list[Any]):
+    class Ch1(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch1
+
+
+def _ch2_earlier_router_on_the_trigger(review: _Review, calls: list[Any]):
+    class Ch2(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch2
+
+
+def _ch3_chain_of_two_routers(review: _Review, calls: list[Any]):
+    class Ch3(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "a"
+
+        @router("a")
+        def r2(self):
+            calls.append("r2")
+            return "b"
+
+        @listen("b")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("a", draft))
+        def j_a(self, value):
+            calls.append(("j_a", _payload(value)))
+
+        @listen(and_("b", draft))
+        def j_b(self, value):
+            calls.append(("j_b", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch3
+
+
+def _ch4_batch_and_chain(review: _Review, calls: list[Any]):
+    class Ch4(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @router("go")
+        def r2(self):
+            calls.append("r2")
+            return "go2"
+
+        @listen("go2")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(and_("go2", draft))
+        def j_go2(self, value):
+            calls.append(("j_go2", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch4
+
+
+def _ch5_chain_through_router_names(review: _Review, calls: list[Any]):
+    class Ch5(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "o1"
+
+        @router(r1)
+        def r2(self):
+            calls.append("r2")
+            return "o2"
+
+        @listen(r2)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_(r1, draft))
+        def j_r1(self, value):
+            calls.append(("j_r1", _payload(value)))
+
+        @listen(and_("o1", draft))
+        def j_o1(self, value):
+            calls.append(("j_o1", _payload(value)))
+
+        @listen(and_("o2", draft))
+        def j_o2(self, value):
+            calls.append(("j_o2", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch5
+
+
+def _ch6_router_start(review: _Review, calls: list[Any]):
+    class Ch6(Flow):
+        @start()
+        @router()
+        def cls_start(self):
+            calls.append("cls_start")
+            return "go"
+
+        @listen(cls_start)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(cls_start, draft))
+        def j_start(self, value):
+            calls.append(("j_start", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch6
+
+
+def _ch7_review_under_a_plain_listener(review: _Review, calls: list[Any]):
+    class Ch7(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(a)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch7
+
+
+@HOWS
+class TestResumeContinuesTheDispatchesThePauseInterrupted:
+    """Joins on steps on the way to a reviewed listener close as on an answer at once."""
+
+    def test_router_outcome_leads_to_the_review(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch1_router_outcome_leads_to_the_review,
+            how,
+            {"j_seed": "S", "j_go": "go"},
+            ran_before=("seed", "classify"),
+        )
+
+    def test_earlier_router_on_the_reviewed_listeners_trigger(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch2_earlier_router_on_the_trigger,
+            how,
+            {"j_seed": "S", "j_x": "x"},
+            ran_before=("seed", "pre"),
+        )
+
+    def test_chain_of_two_routers(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch3_chain_of_two_routers,
+            how,
+            {"j_seed": "S", "j_a": "a", "j_b": "b"},
+            ran_before=("seed", "r1", "r2"),
+        )
+
+    def test_routers_sharing_a_trigger_and_a_chain(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch4_batch_and_chain,
+            how,
+            {"j_seed": "S", "j_x": "x", "j_go": "go", "j_go2": "go2"},
+            ran_before=("seed", "pre", "classify", "r2"),
+        )
+
+    def test_chain_through_router_names(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch5_chain_through_router_names,
+            how,
+            {
+                "j_seed": "S",
+                "j_r1": "o1",
+                "j_o1": "HumanFeedbackResult",
+                "j_o2": "HumanFeedbackResult",
+            },
+            ran_before=("seed", "r1", "r2"),
+        )
+
+    def test_router_start(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch6_router_start,
+            how,
+            {"j_start": "go", "j_go": "HumanFeedbackResult"},
+            ran_before=("cls_start",),
+        )
+
+    def test_review_under_a_plain_listener(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch7_review_under_a_plain_listener,
+            how,
+            {"j_seed": "approved", "j_x": "x"},
+            ran_before=("seed", "pre", "a"),
+        )
+
+
+class _Color(enum.Enum):
+    RED = "red"
+
+
+@HOWS
+def test_restored_router_returning_an_enum_routes_its_value(how: str) -> None:
+    """``r1`` returns a plain ``Enum`` and its own subscriber is under review."""
+
+    def make(review: _Review, calls: list[Any]):
+        class EnumRouter(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def r1(self):
+                calls.append("r1")
+                return _Color.RED
+
+            @listen(r1)
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen("red")
+            def on_red(self, value):
+                calls.append(("on_red", _payload(value)))
+
+            @listen(and_("red", draft))
+            def j_red(self, value):
+                calls.append(("j_red", _payload(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return EnumRouter
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    expected = [("j_red", "HumanFeedbackResult"), ("on_red", "HumanFeedbackResult")]
+    assert _named(now, "on_red", "j_red") == expected
+    assert _named(before, "on_red", "j_red") == []
+    assert _named(after, "on_red", "j_red") == expected
+    assert _named(after, "publish") == [("publish", "HumanFeedbackResult")]
+    for name in ("seed", "r1", "draft"):
+        assert name in before
+        assert name not in after
+
+
+def _ch8_review_in_the_reviewed_methods_own_dispatch(review: _Review, calls: list[Any]):
+    class Ch8(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _payload(value)))
+
+    return Ch8
+
+
+def _ch9_two_reviews_in_a_chain(review: _Review, calls: list[Any]):
+    class Ch9(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_hf(review)
+        def draft1(self):
+            calls.append("draft1")
+            return "D1"
+
+        @listen("approved")
+        @_hf(review, ("ok", "no"))
+        def draft2(self):
+            calls.append("draft2")
+            return "D2"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen(and_(seed, draft1))
+        def j_seed1(self, value):
+            calls.append(("j_seed1", _payload(value)))
+
+        @listen(and_(seed, draft2))
+        def j_seed2(self, value):
+            calls.append(("j_seed2", _payload(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _payload(value)))
+
+    return Ch9
+
+
+@HOWS
+@pytest.mark.parametrize("second", ["restored", "same_instance"])
+class TestResumeWhenTheContinuedDispatchPausesAgain:
+    """A second review pauses while the first one's dispatch is continued."""
+
+    def test_review_in_the_reviewed_methods_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        make = _ch8_review_in_the_reviewed_methods_own_dispatch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after = _run_paused(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        expected = [
+            ("fin", "HumanFeedbackResult"),
+            ("j_seed", "S"),
+            ("publish", "HumanFeedbackResult"),
+        ]
+        assert _named(now, "j_seed", "publish", "fin") == expected
+        assert _named(before + after, "j_seed", "publish", "fin") == expected
+        for name in ("seed", "draft", "check"):
+            assert (before + after).count(name) == 1
+
+    def test_two_reviews_in_a_chain(self, how: str, second: str) -> None:
+        make = _ch9_two_reviews_in_a_chain
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after = _run_paused(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        names = ("j_seed1", "j_seed2", "publish", "fin")
+        expected = [
+            ("fin", "HumanFeedbackResult"),
+            ("j_seed1", "S"),
+            ("j_seed2", "S"),
+            ("publish", "HumanFeedbackResult"),
+        ]
+        assert _named(now, *names) == expected
+        assert _named(before + after, *names) == expected
+        for name in ("seed", "classify", "draft1", "draft2"):
+            assert (before + after).count(name) == 1
+
+
+@HOWS
+def test_restored_batch_naming_a_removed_router(how: str) -> None:
+    """``post`` follows the reviewed listener on ``seed`` and is gone on restore."""
+    calls: list[Any] = []
+    review = _Review(pause=True)
+
+    class Paused(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @router(seed)
+        def post(self):
+            calls.append("post")
+            return "y"
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    class Deployed(Flow):  # Paused without ``post``
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = Paused(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert "post" not in calls
+        calls.clear()
+
+        _resume(Deployed.from_pending(pending.context.flow_id, persistence), how)
+
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# Record entries a row keeps for joins and ``or_`` conditions; every other
+# entry describes where the paused run stopped.
+_JOIN_AND_OR_RECORD_KEYS = {"pending_events", "fired_or_listeners", "completed_methods"}
+
+
+def _of_another_type(value: Any) -> Any:
+    return 7 if isinstance(value, (str, type(None))) else "x"
+
+
+def _malformed_records(record: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Copies of ``record`` with one entry, or one field of one entry, broken."""
+    variants: list[tuple[str, dict[str, Any]]] = []
+    for key in sorted(set(record) - _JOIN_AND_OR_RECORD_KEYS):
+        variants.append((f"{key}: not a list", {**record, key: "not a list"}))
+        value = record[key]
+        entries = value if isinstance(value, list) else [value]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                variants.append((f"{key}[{index}]: another type", {**record, key: "x"}))
+                continue
+            for field in sorted(entry):
+                for change, broken in (
+                    ("missing", {k: v for k, v in entry.items() if k != field}),
+                    ("another type", {**entry, field: _of_another_type(entry[field])}),
+                ):
+                    new_entries = list(entries)
+                    new_entries[index] = broken
+                    variants.append(
+                        (
+                            f"{key}[{index}].{field}: {change}",
+                            {**record, key: new_entries},
+                        )
+                    )
+    return variants
+
+
+@HOWS
+def test_malformed_dispatch_record_resumes_as_a_row_without_it(how: str) -> None:
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    wrong: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        probe = SQLiteFlowPersistence(os.path.join(tmpdir, "probe.db"))
+        pending = flow_cls(persistence=probe).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        variants = _malformed_records(dict(pending.context.resume_record or {}))
+        assert variants
+
+        for number, (label, record) in enumerate(variants):
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, f"{number}.db"))
+            pending = flow_cls(persistence=persistence).kickoff()
+            assert isinstance(pending, HumanFeedbackPending)
+            flow_id = pending.context.flow_id
+            state, ctx = persistence.load_pending_feedback(flow_id)
+            ctx.resume_record = record
+            persistence.save_pending_feedback(
+                flow_uuid=flow_id, context=ctx, state_data=state
+            )
+            calls.clear()
+            try:
+                _resume(flow_cls.from_pending(flow_id, persistence), how)
+            except Exception as error:
+                wrong[label] = repr(error)
+                continue
+            if (
+                "draft" in calls
+                or calls.count(("audit", "approved")) != 1
+                or calls.count(("publish", "HumanFeedbackResult")) != 1
+            ):
+                wrong[label] = list(calls)
+
+    assert wrong == {}
