@@ -4108,3 +4108,309 @@ def test_queued_review_pauses_with_the_callback_info_its_provider_gave(
         "other",
         {"ticket": "T-other"},
     )
+
+
+# A second review in the continuation of the first, at every place it can sit:
+# the reviewed method's own dispatch, its outcome's dispatch, a router's or a
+# plain listener's dispatch under it, a start its outcome gates, or beside it.
+# The second review routes (``emit``) or does not; the first reviewed method is
+# a start or a listener. Each paused run resumes until it ends and gives the
+# same calls, with the same values, as the run answered at once.
+
+SECOND_REVIEW_SITES = ("own", "outcome", "router", "pass", "gated", "sibling")
+
+# A start's outcome does not run a start gated on it, even answered at once,
+# so ``gated`` has a second review only when ``draft`` is a listener.
+SECOND_REVIEW_ROWS = [
+    (site, role)
+    for site in SECOND_REVIEW_SITES
+    for role in ("start", "listener")
+    if (site, role) != ("gated", "start")
+]
+
+
+def _second_review(signal: _SignalledReview, kind: str) -> Any:
+    if kind == "emit":
+        return _hf_signalled(signal, ("ok", "no"))
+    return human_feedback(message="Check:", provider=signal)
+
+
+def _second_review_in_the_continuation(site: str, kind: str, role: str) -> ShapeFactory:
+    """``draft`` is reviewed with ``emit``; ``check`` is the second review at ``site``.
+
+    On ``sibling`` ``check`` runs beside ``draft`` and completes after
+    ``draft``'s review is asked for, so the run answered at once dispatches
+    ``draft``'s outcome first.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class SecondReview(Flow):
+            if role == "listener":
+
+                @start()
+                def seed(self):
+                    calls.append("seed")
+                    return "S"
+
+                @listen(seed)
+                @_hf_signalled(signal)
+                def draft(self):
+                    calls.append("draft")
+                    return "D"
+
+            else:
+
+                @start()
+                @_hf_signalled(signal)
+                def draft(self):
+                    calls.append("draft")
+                    return "D"
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", _value(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            if site == "own":
+
+                @listen(draft)
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "outcome":
+
+                @listen("approved")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "router":
+
+                @router(draft)
+                def route(self):
+                    calls.append("route")
+                    return "go"
+
+                @listen("go")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "pass":
+
+                @listen(draft)
+                def step(self):
+                    calls.append("step")
+                    return "T"
+
+                @listen(step)
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "gated":
+
+                @start("approved")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif role == "listener":
+
+                @listen(seed)
+                @_second_review(signal, kind)
+                def check(self):
+                    _after_the_review(signal)
+                    calls.append("check")
+                    return "C"
+
+            else:
+
+                @start()
+                @_second_review(signal, kind)
+                def check(self):
+                    _after_the_review(signal)
+                    calls.append("check")
+                    return "C"
+
+            @listen(check)
+            def after_check(self, value):
+                calls.append(("after_check", _value(value)))
+
+            if kind == "emit":
+
+                @listen("ok")
+                def fin(self, value):
+                    calls.append(("fin", _value(value)))
+
+            @listen(and_(draft, check))
+            def joined(self):
+                calls.append("joined")
+
+        return SecondReview
+
+    return make
+
+
+def _assert_resumes_as_answered_at_once(
+    make: ShapeFactory, how: str, second: str, pauses: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert sorted(before + after, key=repr) == sorted(now, key=repr)
+    assert paused_for == pauses
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize(("site", "role"), SECOND_REVIEW_ROWS)
+def test_second_review_in_the_continuation_resumes_as_answered_at_once(
+    site: str, kind: str, role: str, second: str, how: str
+) -> None:
+    _assert_resumes_as_answered_at_once(
+        _second_review_in_the_continuation(site, kind, role),
+        how,
+        second,
+        pauses=["draft", "check"],
+    )
+
+
+def _audit_reviewed_without_emit(role: str) -> ShapeFactory:
+    """review-4's N5: ``audit`` is reviewed without ``emit`` in ``draft``'s dispatch."""
+
+    def make(review: _Review, calls: list[Any]):
+        audit_review = human_feedback(message="Audit:", provider=review)
+
+        class StartReview(Flow):
+            @start()
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(draft)
+            @audit_review
+            def audit(self):
+                calls.append("audit")
+                return "A"
+
+            @listen("approved")
+            def publish(self):
+                calls.append("publish")
+
+            @listen(audit)
+            def after_audit(self):
+                calls.append("after_audit")
+
+        class ListenerReview(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @listen(seed)
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(draft)
+            @audit_review
+            def audit(self):
+                calls.append("audit")
+                return "A"
+
+            @listen("approved")
+            def publish(self):
+                calls.append("publish")
+
+            @listen(audit)
+            def after_audit(self):
+                calls.append("after_audit")
+
+        return StartReview if role == "start" else ListenerReview
+
+    return make
+
+
+@HOWS
+@SECONDS
+@ROLES
+def test_review_without_emit_in_the_reviewed_methods_dispatch_keeps_its_outcome(
+    role: str, second: str, how: str
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(_audit_reviewed_without_emit(role), tmpdir)
+        before, after, paused_for = _run_every_pause(
+            _audit_reviewed_without_emit(role),
+            tmpdir,
+            how,
+            restore_each_time=second == "restored",
+        )
+
+    assert now.count("publish") == 1
+    assert (before + after).count("publish") == 1
+    assert sorted(before + after) == sorted(now)
+    assert paused_for == ["draft", "audit"]
+
+
+# A user value shaped like the record's stored review result.
+_TAGGED_USER_VALUE = {
+    "__crewai_human_feedback_result__": {
+        "output": "x",
+        "feedback": "",
+        "outcome": "go",
+        "timestamp": "2026-01-01T00:00:00",
+        "method_name": "m",
+        "metadata": {},
+    }
+}
+
+
+@HOWS
+def test_user_dict_shaped_like_a_stored_review_result_resumes_as_that_dict(
+    how: str,
+) -> None:
+    def make(review: _Review, calls: list[Any]):
+        class Tagged(Flow):
+            @start()
+            def seed(self):
+                return json.loads(json.dumps(_TAGGED_USER_VALUE))
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @_hf(review)
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, value):
+                calls.append(("use", type(value).__name__, value))
+
+        return Tagged
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    assert now == [("use", "dict", _TAGGED_USER_VALUE)]
+    assert before + after == now
