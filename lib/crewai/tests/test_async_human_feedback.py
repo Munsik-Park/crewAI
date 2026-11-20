@@ -4725,3 +4725,57 @@ def test_queued_review_on_the_same_instance_keeps_its_live_output(
     assert paused_for == ["first", "draft", "other"]
     stored = "dict" if second == "restored" else "_Model"
     assert sorted(before + after) == [("took_draft", stored), ("took_other", stored)]
+
+
+# A step value with a dict keyed by an object with no JSON form is stored as
+# the whole value's string form; user dicts shaped like the record's tags
+# come back as those dicts.
+_UNKEYABLE_STEP_VALUES = {
+    "opaque_key": {_OPAQUE: 1},
+    "nested_opaque_key": {"rows": [{1: "v"}, {_OPAQUE: 1}]},
+}
+_TAG_SHAPED_STEP_VALUES = {
+    "dict_tag": {"__crewai_record_dict__": [[1, "v"]]},
+    "tuple_tag": {"__crewai_record_tuple__": ["a", 1]},
+    "nested_tags": {
+        5: {"__crewai_record_dict__": {"k": ["t", {(1, 2): None}]}},
+        "s": [{"__crewai_record_literal__": {2: "w"}}],
+    },
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_UNKEYABLE_STEP_VALUES))
+def test_step_value_keyed_by_an_object_resumes_as_its_string_form(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _UNKEYABLE_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    expected = str(value) if second == "restored" else value
+    assert before + after == [("use", expected)]
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_TAG_SHAPED_STEP_VALUES))
+def test_step_value_shaped_like_a_record_tag_resumes_as_that_value(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _TAG_SHAPED_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    assert repr(before + after) == repr(now)
