@@ -93,6 +93,8 @@ from crewai.flow.async_feedback.types import (
     HumanFeedbackProvider,
     LiveRecordValue,
     PendingFeedbackContext,
+    _json_safe_entries,
+    _string_form,
 )
 from crewai.flow.dsl._utils import build_flow_definition
 from crewai.flow.flow_context import (
@@ -443,14 +445,6 @@ def _stored_key(key: Any) -> Any:
     raise _NoStoredForm
 
 
-def _string_form(value: Any) -> str:
-    """``str(value)``, or its type's name in angle brackets when that raises."""
-    try:
-        return str(value)
-    except Exception:
-        return f"<{type(value).__name__}>"
-
-
 def _stored_form(value: Any) -> Any:
     """``value`` as JSON values, with tags for what plain JSON would change.
 
@@ -513,27 +507,6 @@ def _stored_record_value(value: Any) -> Any:
 def _encode_record_value(value: Any) -> LiveRecordValue:
     """Hold a value in a record as it is; the saved row gets its stored form."""
     return LiveRecordValue(value, _stored_record_value)
-
-
-def _json_safe_or_string(value: Any) -> Any:
-    """``value``'s JSON-safe form, or its string form when that has no encoding.
-
-    A cycle or nesting past the recursion limit has none. The encoding is
-    tried where the call stack already holds the record's levels.
-    """
-    try:
-        safe = PendingFeedbackContext._make_json_safe(value)
-        json.dumps(safe)
-    except (RecursionError, TypeError, ValueError):
-        return _string_form(value)
-    return safe
-
-
-def _stored_callback_info(info: Any) -> Any:
-    """A queued review's callback info as saved: each entry in its JSON form."""
-    if isinstance(info, dict):
-        return {str(key): _json_safe_or_string(value) for key, value in info.items()}
-    return _json_safe_or_string(info)
 
 
 def _restored_key(key: Any) -> Any:
@@ -744,7 +717,7 @@ def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
                 {
                     "context": other.context,
                     "callback_info": (
-                        LiveRecordValue(other.callback_info, _stored_callback_info)
+                        LiveRecordValue(other.callback_info, _json_safe_entries)
                         if other.callback_info
                         else None
                     ),

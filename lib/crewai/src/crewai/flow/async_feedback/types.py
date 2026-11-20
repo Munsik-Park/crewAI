@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 
@@ -127,6 +128,9 @@ class PendingFeedbackContext:
     def to_dict(self) -> dict[str, Any]:
         """Serialize context to a dictionary for persistence.
 
+        The reviewed output, and each entry of the metadata, take their
+        JSON-safe form, or their string form when that has no JSON encoding.
+
         Returns:
             Dictionary representation suitable for JSON serialization.
         """
@@ -134,11 +138,11 @@ class PendingFeedbackContext:
             "flow_id": self.flow_id,
             "flow_class": self.flow_class,
             "method_name": self.method_name,
-            "method_output": self._make_json_safe(self.method_output),
+            "method_output": _json_safe_or_string(self.method_output),
             "message": self.message,
             "emit": self.emit,
             "default_outcome": self.default_outcome,
-            "metadata": self._make_json_safe(self.metadata),
+            "metadata": _json_safe_entries(self.metadata),
             "llm": self.llm,
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
@@ -191,6 +195,45 @@ class PendingFeedbackContext:
             else None,
             resume_record=resume_record,
         )
+
+
+def _string_form(value: Any) -> str:
+    """``str(value)``, or its type's name in angle brackets when that raises."""
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _json_safe_or_string(value: Any) -> Any:
+    """``value``'s JSON-safe form, or its string form when that has no encoding.
+
+    A dict key other than a string, number, boolean or ``None``, a cycle and
+    nesting past the recursion limit have none. The encoding is tried where
+    the call stack already holds the levels of the row around the value.
+    """
+    try:
+        safe = PendingFeedbackContext._make_json_safe(value)
+        json.dumps(safe)
+    except (RecursionError, TypeError, ValueError):
+        return _string_form(value)
+    return safe
+
+
+def _json_safe_entries(entries: Any) -> Any:
+    """A mapping with each entry in its form from ``_json_safe_or_string``.
+
+    Keys JSON cannot hold take their string form. A value that is not a dict
+    is converted whole.
+    """
+    if not isinstance(entries, dict):
+        return _json_safe_or_string(entries)
+    return {
+        key
+        if key is None or isinstance(key, (str, int, float, bool))
+        else _string_form(key): _json_safe_or_string(value)
+        for key, value in entries.items()
+    }
 
 
 class HumanFeedbackPending(Exception):  # noqa: N818 - Not an error, a control flow signal
