@@ -130,11 +130,14 @@ class PendingFeedbackContext:
 
         The reviewed output, and each entry of the metadata, take their
         JSON-safe form, or their string form when that has no JSON encoding.
+        The record is kept only in a form with which the whole dictionary
+        encodes: as it is, else with each of its values that has no JSON
+        encoding in its string form, else not at all (``None``).
 
         Returns:
             Dictionary representation suitable for JSON serialization.
         """
-        return {
+        row: dict[str, Any] = {
             "flow_id": self.flow_id,
             "flow_class": self.flow_class,
             "method_name": self.method_name,
@@ -147,8 +150,11 @@ class PendingFeedbackContext:
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
             "trace_context": list(self.trace_context) if self.trace_context else None,
-            "resume_record": self._make_json_safe(self.resume_record),
+            "resume_record": None,
         }
+        if self.resume_record is not None:
+            row["resume_record"] = _savable_record(row, self.resume_record)
+        return row
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PendingFeedbackContext:
@@ -219,6 +225,79 @@ def _json_safe_or_string(value: Any) -> Any:
     except Exception:
         return _string_form(value)
     return safe
+
+
+def _encodes(row: dict[str, Any]) -> bool:
+    """Whether ``row`` encodes as JSON the way the SQLite persistence writes it."""
+    from crewai.flow.persistence.sqlite import _json_default
+
+    try:
+        json.dumps(row, default=_json_default)
+    except Exception:
+        return False
+    return True
+
+
+def _with_values_as_strings(record: Any) -> Any:
+    """``record``'s JSON-safe form with each value that has none in its string form.
+
+    The record's own keys are kept as they are.
+    """
+    if isinstance(record, dict):
+        return {key: _value_or_string(item, True) for key, item in record.items()}
+    return _value_or_string(record, True)
+
+
+def _value_or_string(value: Any, entry: bool = False) -> Any:
+    """A record value's JSON-safe form, or its string form when that does not encode.
+
+    Dicts and lists are converted item by item first, so only the items with
+    no JSON encoding take their string form. A record value takes its stored
+    form. A ``RecursionError`` is passed up to the record's own entry
+    (``entry``), which then takes its string form whole.
+    """
+    original = value.value if isinstance(value, LiveRecordValue) else value
+    try:
+        if isinstance(value, LiveRecordValue):
+            converted = value.stored(value.value)
+        elif isinstance(value, dict):
+            converted = {key: _value_or_string(item) for key, item in value.items()}
+        elif isinstance(value, (list, tuple)):
+            converted = [_value_or_string(item) for item in value]
+        else:
+            return _json_safe_or_string(value)
+        json.dumps(converted)
+    except RecursionError:
+        if not entry:
+            raise
+        return _string_form(original)
+    except Exception:
+        return _string_form(original)
+    return converted
+
+
+def _savable_record(row: dict[str, Any], record: Any) -> Any:
+    """``record`` in the first form with which ``row`` encodes, or ``None``.
+
+    The forms tried are its JSON-safe form, then that form with each value
+    that has no JSON encoding in its string form.
+    """
+    for convert in (PendingFeedbackContext._make_json_safe, _with_values_as_strings):
+        encodes, safe = _converted_record(row, record, convert)
+        if encodes:
+            return safe
+    return None
+
+
+def _converted_record(
+    row: dict[str, Any], record: Any, convert: Callable[[Any], Any]
+) -> tuple[bool, Any]:
+    """``convert(record)``, and whether ``row`` encodes with it as its record."""
+    try:
+        safe = convert(record)
+    except Exception:
+        return False, None
+    return _encodes({**row, "resume_record": safe}), safe
 
 
 def _json_safe_entries(entries: Any) -> Any:
