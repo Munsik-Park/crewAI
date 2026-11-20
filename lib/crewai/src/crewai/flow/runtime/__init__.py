@@ -2073,8 +2073,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             record.pop("frames", None)
         try:
             if frames is not None:
-                # The reviewed method's subscribers (and, with an outcome, the
-                # outcome's), then every interrupted dispatch, innermost first.
                 await self._continue_dispatches(
                     frames,
                     reviewed,
@@ -3369,7 +3367,6 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         # If start method is a router, use its result as an additional trigger
         if self._is_router(start_method_name) and result is not None:
-            # Listeners of the start method name first, then of its outcome
             await self._dispatch_router_completion(
                 start_method_name,
                 result,
