@@ -2090,8 +2090,8 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     result,
                 )
             elif emit and collapsed_outcome is not None:
-                # Own subscribers, then the label's; a reviewed listener
-                # re-arms fired or_ listeners for its label, a start does not.
+                # A reviewed listener re-arms fired or_ listeners for its
+                # label; a start does not.
                 await self._dispatch_router_completion(
                     reviewed,
                     collapsed_outcome,
@@ -3900,8 +3900,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             elif outcome is None:
                 await self._execute_listeners(reviewed, result)
             else:
-                # The reviewed method ran as a start: its own subscribers, then
-                # its outcome's.
+                # The reviewed method ran as a start.
                 await self._dispatch_router_completion(reviewed, outcome, outcome)
             while index < len(frames):
                 frame = frames[index]
