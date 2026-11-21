@@ -16,6 +16,7 @@ from collections.abc import Callable
 from contextlib import closing
 import dataclasses
 import enum
+import gc
 import json
 import os
 import sqlite3
@@ -4845,10 +4846,29 @@ _UNBUILDABLE_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
 }
 
 
+@pytest.fixture
+def _no_garbage_collection_during_the_test() -> Any:
+    """Keep the garbage collector off while the test runs, then collect.
+
+    The test walks values to the recursion limit. A collection there runs
+    the finalizers of unrelated objects with no stack left; they raise
+    ``RecursionError``, and pytest reports that as a failure of the test.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
 @HOWS
 @pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
 @pytest.mark.parametrize("kind", ["emit", "plain"])
 @pytest.mark.parametrize("name", list(_UNBUILDABLE_STEP_VALUES))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_step_value_with_no_buildable_stored_form_still_pauses(
     name: str, kind: str, at: str, second: str, how: str
 ) -> None:
