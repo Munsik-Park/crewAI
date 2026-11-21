@@ -6,13 +6,26 @@ non-blocking human-in-the-loop workflows.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 
 if TYPE_CHECKING:
     from crewai.flow.flow import Flow
+
+
+@dataclass(frozen=True)
+class LiveRecordValue:
+    """A value a pending context's record holds as it is while the flow runs.
+
+    ``PendingFeedbackContext.to_dict`` writes ``stored(value)`` in its place.
+    """
+
+    value: Any
+    stored: Callable[[Any], Any]
 
 
 @dataclass
@@ -43,6 +56,15 @@ class PendingFeedbackContext:
             new uuid. New pauses always store a value.
         trace_context: Previous trace and root span IDs, used to link the resumed
             execution segment. Absent when execution tracing was disabled.
+        resume_record: Run bookkeeping written by the runtime when it saves the
+            pause: completed methods, join progress, fired ``or_`` listeners,
+            where each dispatch the pause interrupted stopped, with the values
+            it passes on, and the reviews queued behind this one. Resume uses
+            it to continue those dispatches, close joins, keep ``or_``
+            listeners firing once across the pause and pause for each queued
+            review in turn. While the flow runs, the record holds the values
+            and queued contexts as they are; ``to_dict`` writes their stored
+            form. ``None`` when the context holds no record.
 
     Example:
         ```python
@@ -70,16 +92,22 @@ class PendingFeedbackContext:
     requested_at: datetime = field(default_factory=datetime.now)
     execution_uuid: str | None = None
     trace_context: tuple[int, int] | None = None
+    resume_record: dict[str, Any] | None = None
 
     @staticmethod
     def _make_json_safe(value: Any) -> Any:
         """Convert a value to a JSON-serializable form.
 
         Handles Pydantic models, dataclasses, and arbitrary objects by
-        progressively falling back to string representation.
+        progressively falling back to string representation. A record's live
+        values and queued contexts are written in their stored form.
         """
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
+        if isinstance(value, LiveRecordValue):
+            return value.stored(value.value)
+        if isinstance(value, PendingFeedbackContext):
+            return value.to_dict()
         if isinstance(value, (list, tuple)):
             return [PendingFeedbackContext._make_json_safe(v) for v in value]
         if isinstance(value, dict):
@@ -100,23 +128,33 @@ class PendingFeedbackContext:
     def to_dict(self) -> dict[str, Any]:
         """Serialize context to a dictionary for persistence.
 
+        The reviewed output, and each entry of the metadata, take their
+        JSON-safe form, or their string form when that has no JSON encoding.
+        The record is kept only in a form with which the whole dictionary
+        encodes: as it is, else with each of its values that has no JSON
+        encoding in its string form, else not at all (``None``).
+
         Returns:
             Dictionary representation suitable for JSON serialization.
         """
-        return {
+        row: dict[str, Any] = {
             "flow_id": self.flow_id,
             "flow_class": self.flow_class,
             "method_name": self.method_name,
-            "method_output": self._make_json_safe(self.method_output),
+            "method_output": _json_safe_or_string(self.method_output),
             "message": self.message,
             "emit": self.emit,
             "default_outcome": self.default_outcome,
-            "metadata": self._make_json_safe(self.metadata),
+            "metadata": _json_safe_entries(self.metadata),
             "llm": self.llm,
             "requested_at": self.requested_at.isoformat(),
             "execution_uuid": self.execution_uuid,
             "trace_context": list(self.trace_context) if self.trace_context else None,
+            "resume_record": None,
         }
+        if self.resume_record is not None:
+            row["resume_record"] = _savable_record(row, self.resume_record)
+        return row
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PendingFeedbackContext:
@@ -142,6 +180,10 @@ class PendingFeedbackContext:
         ):
             trace_context = None
 
+        resume_record = data.get("resume_record")
+        if not isinstance(resume_record, dict):
+            resume_record = None
+
         return cls(
             flow_id=data["flow_id"],
             flow_class=data["flow_class"],
@@ -157,7 +199,121 @@ class PendingFeedbackContext:
             trace_context=(trace_context[0], trace_context[1])
             if trace_context
             else None,
+            resume_record=resume_record,
         )
+
+
+def _string_form(value: Any) -> str:
+    """``str(value)``, or its type's name in angle brackets when that raises."""
+    try:
+        return str(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _json_safe_or_string(value: Any) -> Any:
+    """``value``'s JSON-safe form, or its string form when that has no encoding.
+
+    A dict key other than a string, number, boolean or ``None``, a cycle,
+    nesting past the recursion limit, and any error raised while the form is
+    built leave none. The encoding is tried where the call stack already holds
+    the levels of the row around the value.
+    """
+    try:
+        safe = PendingFeedbackContext._make_json_safe(value)
+        json.dumps(safe)
+    except Exception:
+        return _string_form(value)
+    return safe
+
+
+def _encodes(row: dict[str, Any]) -> bool:
+    """Whether ``row`` encodes as JSON the way the SQLite persistence writes it."""
+    from crewai.flow.persistence.sqlite import _json_default
+
+    try:
+        json.dumps(row, default=_json_default)
+    except Exception:
+        return False
+    return True
+
+
+def _with_values_as_strings(record: Any) -> Any:
+    """``record``'s JSON-safe form with each value that has none in its string form.
+
+    The record's own keys are kept as they are.
+    """
+    if isinstance(record, dict):
+        return {key: _value_or_string(item, True) for key, item in record.items()}
+    return _value_or_string(record, True)
+
+
+def _value_or_string(value: Any, entry: bool = False) -> Any:
+    """A record value's JSON-safe form, or its string form when that does not encode.
+
+    Dicts and lists are converted item by item first, so only the items with
+    no JSON encoding take their string form. A record value takes its stored
+    form. A ``RecursionError`` is passed up to the record's own entry
+    (``entry``), which then takes its string form whole.
+    """
+    original = value.value if isinstance(value, LiveRecordValue) else value
+    try:
+        if isinstance(value, LiveRecordValue):
+            converted = value.stored(value.value)
+        elif isinstance(value, dict):
+            converted = {key: _value_or_string(item) for key, item in value.items()}
+        elif isinstance(value, (list, tuple)):
+            converted = [_value_or_string(item) for item in value]
+        else:
+            return _json_safe_or_string(value)
+        json.dumps(converted)
+    except RecursionError:
+        if not entry:
+            raise
+        return _string_form(original)
+    except Exception:
+        return _string_form(original)
+    return converted
+
+
+def _savable_record(row: dict[str, Any], record: Any) -> Any:
+    """``record`` in the first form with which ``row`` encodes, or ``None``.
+
+    The forms tried are its JSON-safe form, then that form with each value
+    that has no JSON encoding in its string form.
+    """
+    for convert in (PendingFeedbackContext._make_json_safe, _with_values_as_strings):
+        encodes, safe = _converted_record(row, record, convert)
+        if encodes:
+            return safe
+    return None
+
+
+def _converted_record(
+    row: dict[str, Any], record: Any, convert: Callable[[Any], Any]
+) -> tuple[bool, Any]:
+    """``convert(record)``, and whether ``row`` encodes with it as its record."""
+    try:
+        safe = convert(record)
+    except Exception:
+        return False, None
+    return _encodes({**row, "resume_record": safe}), safe
+
+
+def _json_safe_entries(entries: Any) -> Any:
+    """A mapping with each entry in its form from ``_json_safe_or_string``.
+
+    Keys JSON cannot hold take their string form. A value that is not a dict
+    is converted whole.
+    """
+    if not isinstance(entries, dict):
+        return _json_safe_or_string(entries)
+    return {
+        key
+        if key is None or isinstance(key, (str, int, float, bool))
+        else _string_form(key): _json_safe_or_string(value)
+        for key, value in entries.items()
+    }
 
 
 class HumanFeedbackPending(Exception):  # noqa: N818 - Not an error, a control flow signal

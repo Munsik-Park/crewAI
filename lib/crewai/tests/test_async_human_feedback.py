@@ -11,9 +11,18 @@ This module tests the async/non-blocking human feedback flow, including:
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from contextlib import closing
+import dataclasses
+import enum
+import gc
 import json
 import os
+import sqlite3
+import sys
 import tempfile
+import threading
 from datetime import datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -21,7 +30,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from crewai.flow import Flow, HumanFeedbackResult, start, listen, human_feedback
+from crewai.flow import (
+    Flow,
+    HumanFeedbackResult,
+    and_,
+    human_feedback,
+    listen,
+    or_,
+    router,
+    start,
+)
 from crewai.flow.async_feedback import (
     ConsoleProvider,
     HumanFeedbackPending,
@@ -1820,3 +1838,4555 @@ class TestLearnOnResume:
             ["Lead with the customer outcome"], source="hitl"
         )
         assert "first draft" in llm.call.call_args.args[0][1]["content"]
+
+
+class _Review:
+    """Pause for review, or answer at once with an empty reply."""
+
+    def __init__(self, pause: bool) -> None:
+        self.pause = pause
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if self.pause:
+            raise HumanFeedbackPending(context=context)
+        return ""
+
+
+def _routed(review: _Review) -> dict[str, Any]:
+    return {
+        "message": "Review:",
+        "emit": ["approved", "rejected"],
+        "llm": "gpt-4o-mini",
+        "default_outcome": "approved",
+        "provider": review,
+    }
+
+
+def _payload(value: Any) -> Any:
+    return type(value).__name__ if isinstance(value, HumanFeedbackResult) else value
+
+
+def _review_flow(role: str, review: _Review, calls: list[Any]) -> type[Flow]:
+    """A flow with ``draft`` under review, as a start or as a listener on ``seed``.
+
+    ``draft`` returns only after ``other_start``'s completion has been
+    dispatched (``other_done`` has run), so joins and ``or_`` conditions on
+    ``other_start`` are settled before the pause is saved. Flow methods are
+    not inherited, so each role is a class of its own.
+    """
+    dispatched = threading.Event()
+
+    def body() -> str:
+        assert dispatched.wait(10), "other_start's completion was not dispatched"
+        calls.append("draft")
+        return "D"
+
+    class StartReview(Flow):
+        @start()
+        @human_feedback(**_routed(review))
+        def draft(self):
+            return body()
+
+        @start()
+        def other_start(self):
+            calls.append("other_start")
+            return "O"
+
+        @listen(other_start)
+        def other_done(self):
+            dispatched.set()
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", value))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen(and_(draft, other_start))
+        def combine(self):
+            calls.append("combine")
+
+        @router(draft)
+        def route_draft(self):
+            calls.append("route_draft")
+            return "go"
+
+        @listen("go")
+        def after_go(self):
+            calls.append("after_go")
+
+        @listen(or_(draft, "never"))
+        def or_draft(self):
+            calls.append("or_draft")
+
+        @listen(or_(other_start, draft))
+        def or_pre(self):
+            calls.append("or_pre")
+
+        @listen(or_("approved", other_start))
+        def or_label(self):
+            calls.append("or_label")
+
+        @listen(or_(draft, "approved"))
+        def or_own_label(self):
+            calls.append("or_own_label")
+
+    class ListenerReview(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @human_feedback(**_routed(review))
+        def draft(self):
+            return body()
+
+        @listen(and_(seed, draft))
+        def join_seed_draft(self, value):
+            calls.append(("join_seed_draft", value))
+
+        @start()
+        def other_start(self):
+            calls.append("other_start")
+            return "O"
+
+        @listen(other_start)
+        def other_done(self):
+            dispatched.set()
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", value))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen(and_(draft, other_start))
+        def combine(self):
+            calls.append("combine")
+
+        @router(draft)
+        def route_draft(self):
+            calls.append("route_draft")
+            return "go"
+
+        @listen("go")
+        def after_go(self):
+            calls.append("after_go")
+
+        @listen(or_(draft, "never"))
+        def or_draft(self):
+            calls.append("or_draft")
+
+        @listen(or_(other_start, draft))
+        def or_pre(self):
+            calls.append("or_pre")
+
+        @listen(or_("approved", other_start))
+        def or_label(self):
+            calls.append("or_label")
+
+        @listen(or_(draft, "approved"))
+        def or_own_label(self):
+            calls.append("or_own_label")
+
+    return StartReview if role == "start" else ListenerReview
+
+
+def _resume(flow: Flow, how: str, feedback: str = "") -> Any:
+    if how == "resume_async":
+        return asyncio.run(flow.resume_async(feedback))
+    return flow.resume(feedback)
+
+
+def _immediate(role: str, tmpdir: str) -> list[Any]:
+    calls: list[Any] = []
+    flow_cls = _review_flow(role, _Review(pause=False), calls)
+    flow_cls(persistence=SQLiteFlowPersistence(os.path.join(tmpdir, "now.db"))).kickoff()
+    return calls
+
+
+def _paused(role: str, tmpdir: str, how: str) -> tuple[list[Any], list[Any]]:
+    """Kick off until the review pauses, restore, resume; return (before, after)."""
+    calls: list[Any] = []
+    flow_cls = _review_flow(role, _Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+    pending = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(pending, HumanFeedbackPending)
+    before = list(calls)
+    calls.clear()
+    _resume(flow_cls.from_pending(pending.context.flow_id, persistence), how)
+    return before, calls
+
+
+ROLES = pytest.mark.parametrize("role", ["start", "listener"])
+HOWS = pytest.mark.parametrize("how", ["resume", "resume_async"])
+
+
+@HOWS
+class TestResumeDispatchesReviewedMethod:
+    """On resume the reviewed method's completion reaches its own subscribers."""
+
+    @ROLES
+    def test_own_listener_gets_the_outcome_before_label_listeners(
+        self, role: str, how: str
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate(role, tmpdir)
+            _, after = _paused(role, tmpdir, how)
+
+        assert now.count(("audit", "approved")) == 1
+        assert after.count(("audit", "approved")) == 1
+        assert after.count(("publish", "HumanFeedbackResult")) == 1
+        assert after.index(("audit", "approved")) < after.index(
+            ("publish", "HumanFeedbackResult")
+        )
+
+    @ROLES
+    def test_routers_and_or_on_the_reviewed_method_run(
+        self, role: str, how: str
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate(role, tmpdir)
+            _, after = _paused(role, tmpdir, how)
+
+        for name in ("route_draft", "after_go", "or_draft"):
+            assert now.count(name) == 1, name
+            assert after.count(name) == 1, name
+
+    @ROLES
+    def test_join_with_a_start_completed_before_the_pause_runs(
+        self, role: str, how: str
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate(role, tmpdir)
+            before, after = _paused(role, tmpdir, how)
+
+        assert now.count("combine") == 1
+        assert "combine" not in before
+        assert after.count("combine") == 1
+
+    @ROLES
+    def test_or_fired_before_the_pause_does_not_fire_again(
+        self, role: str, how: str
+    ) -> None:
+        # Guard: or_(other_start, draft) fired on other_start before the pause.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate(role, tmpdir)
+            before, after = _paused(role, tmpdir, how)
+
+        assert now.count("or_pre") == 1
+        assert before.count("or_pre") == 1
+        assert "or_pre" not in after
+
+    def test_label_or_fired_before_the_pause_does_not_fire_again_for_a_start(
+        self, how: str
+    ) -> None:
+        # or_("approved", other_start) fired on other_start before the pause.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate("start", tmpdir)
+            before, after = _paused("start", tmpdir, how)
+
+        assert now.count("or_label") == 1
+        assert before.count("or_label") == 1
+        assert "or_label" not in after
+
+    def test_label_or_fired_before_the_pause_fires_once_more_for_a_listener(
+        self, how: str
+    ) -> None:
+        # Guard. A reviewed listener re-arms fired or_ listeners for its label,
+        # as the immediate run does, so or_("approved", other_start) fires
+        # again on the label.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate("listener", tmpdir)
+            before, after = _paused("listener", tmpdir, how)
+
+        assert now.count("or_label") == 2
+        assert before.count("or_label") == 1
+        assert after.count("or_label") == 1
+
+    def test_or_on_the_reviewed_listener_and_its_label_fires_on_both(
+        self, how: str
+    ) -> None:
+        # or_(draft, "approved") fires on draft and, re-armed, on the label.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate("listener", tmpdir)
+            before, after = _paused("listener", tmpdir, how)
+
+        assert now.count("or_own_label") == 2
+        assert "or_own_label" not in before
+        assert after.count("or_own_label") == 2
+
+    @ROLES
+    def test_reviewed_method_is_not_run_again(self, role: str, how: str) -> None:
+        # Guard.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            before, after = _paused(role, tmpdir, how)
+
+        assert before.count("draft") == 1
+        assert "draft" not in after
+        assert ("publish", "HumanFeedbackResult") in after
+
+
+@HOWS
+class TestResumeClosesJoinsOnTheReviewedListenersTrigger:
+    """``and_(seed, draft)`` with ``draft`` a reviewed listener on ``seed``."""
+
+    def test_join_gets_the_triggers_value(self, how: str) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _immediate("listener", tmpdir)
+            before, after = _paused("listener", tmpdir, how)
+
+        assert [c for c in now if c[0] == "join_seed_draft"] == [
+            ("join_seed_draft", "S")
+        ]
+        assert not [c for c in before if c[0] == "join_seed_draft"]
+        assert [c for c in after if c[0] == "join_seed_draft"] == [
+            ("join_seed_draft", "S")
+        ]
+
+    def test_trigger_value_without_a_json_form_arrives_as_its_string(
+        self, how: str
+    ) -> None:
+        class Opaque:
+            def __str__(self) -> str:
+                return "opaque seed"
+
+        joined: list[Any] = []
+
+        class OpaqueFlow(Flow):
+            @start()
+            def seed(self):
+                return Opaque()
+
+            @listen(seed)
+            @human_feedback(**_routed(_Review(pause=True)))
+            def draft(self):
+                return "D"
+
+            @listen(and_(seed, draft))
+            def join_seed_draft(self, value):
+                joined.append(value)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+            pending = OpaqueFlow(persistence=persistence).kickoff()
+            assert isinstance(pending, HumanFeedbackPending)
+            assert joined == []
+
+            flow = OpaqueFlow.from_pending(pending.context.flow_id, persistence)
+            _resume(flow, how)
+
+        assert joined == ["opaque seed"]
+
+
+@HOWS
+@pytest.mark.parametrize("earlier_router_returns", ["x", None])
+def test_join_closes_when_an_earlier_router_shares_the_reviewed_listeners_trigger(
+    how: str, earlier_router_returns: str | None
+) -> None:
+    """``classify`` runs on ``seed`` before ``draft`` in the same router batch."""
+
+    def make(review: _Review, calls: list[Any]) -> type[Flow]:
+        class SharedTriggerFlow(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def classify(self):
+                calls.append("classify")
+                return earlier_router_returns
+
+            @listen(seed)
+            @human_feedback(**_routed(review))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(and_(seed, draft))
+            def join_seed_draft(self, value):
+                calls.append(("join_seed_draft", value))
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", value))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return SharedTriggerFlow
+
+    def joins(calls: list[Any]) -> list[Any]:
+        return [c for c in calls if isinstance(c, tuple) and c[0] == "join_seed_draft"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now: list[Any] = []
+        make(_Review(pause=False), now)(
+            persistence=SQLiteFlowPersistence(os.path.join(tmpdir, "now.db"))
+        ).kickoff()
+
+        calls: list[Any] = []
+        flow_cls = make(_Review(pause=True), calls)
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls.index("classify") < calls.index("draft")
+        assert joins(calls) == []
+        calls.clear()
+
+        _resume(flow_cls.from_pending(pending.context.flow_id, persistence), how)
+
+    assert joins(now) == [("join_seed_draft", "S")]
+    assert joins(calls) == [("join_seed_draft", "S")]
+    assert "draft" not in calls
+    assert ("audit", "approved") in calls
+    assert ("publish", "HumanFeedbackResult") in calls
+
+
+@HOWS
+@pytest.mark.parametrize("second", ["same_instance", "restored"])
+def test_review_paused_again_in_a_loop_closes_its_join_once(
+    how: str, second: str
+) -> None:
+    calls: list[str] = []
+
+    class LoopFlow(Flow):
+        @start()
+        def other_start(self):
+            calls.append("other_start")
+            return "O"
+
+        @listen(or_(other_start, "again"))
+        @human_feedback(
+            message="Review:",
+            emit=["again", "done"],
+            llm="gpt-4o-mini",
+            default_outcome="again",
+            provider=_Review(pause=True),
+        )
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def audit(self):
+            calls.append("audit")
+
+        @listen(and_(draft, other_start))
+        def combine(self):
+            calls.append("combine")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = LoopFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls.count("draft") == 1
+        calls.clear()
+
+        flow = LoopFlow.from_pending(pending.context.flow_id, persistence)
+        again = _resume(flow, how)  # empty reply -> "again" -> draft pauses again
+        assert isinstance(again, HumanFeedbackPending)
+
+        if second == "restored":
+            flow = LoopFlow.from_pending(again.context.flow_id, persistence)
+        with patch.object(flow, "_collapse_to_outcome", return_value="done"):
+            _resume(flow, how, "done")
+
+    assert calls.count("draft") == 1
+    assert calls.count("audit") == 2
+    assert calls.count("combine") == 1
+
+
+
+@HOWS
+def test_cycle_after_a_restore_reruns_or_listeners_completed_before_the_pause(
+    how: str,
+) -> None:
+    # ``after_step`` = or_(step, "never") fired before the pause. When "again"
+    # brings the flow back to ``step``, that is a new cycle, so ``after_step``
+    # and the review after it run again, as on a run answered at once.
+    calls: list[str] = []
+
+    class LoopFlow(Flow):
+        @start()
+        def begin(self):
+            calls.append("begin")
+            return "B"
+
+        @listen(or_(begin, "again"))
+        def step(self):
+            calls.append("step")
+            return "S"
+
+        @listen(or_(step, "never"))
+        def after_step(self):
+            calls.append("after_step")
+
+        @listen(after_step)
+        @human_feedback(
+            message="Review:",
+            emit=["again", "done"],
+            llm="gpt-4o-mini",
+            default_outcome="again",
+            provider=_Review(pause=True),
+        )
+        def review(self):
+            calls.append("review")
+            return "R"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = LoopFlow(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls == ["begin", "step", "after_step", "review"]
+        calls.clear()
+
+        flow = LoopFlow.from_pending(pending.context.flow_id, persistence)
+        again = _resume(flow, how)  # empty reply -> "again" -> a second cycle
+
+    assert isinstance(again, HumanFeedbackPending)
+    assert calls == ["step", "after_step", "review"]
+
+
+# The keys of a PendingFeedbackContext row that holds no run record.
+_OLD_ROW_KEYS = {
+    "flow_id",
+    "flow_class",
+    "method_name",
+    "method_output",
+    "message",
+    "emit",
+    "default_outcome",
+    "metadata",
+    "llm",
+    "requested_at",
+    "execution_uuid",
+    "trace_context",
+}
+
+
+class _OldRowContext(PendingFeedbackContext):
+    """A context serialized as a version without the run record wrote it."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in super().to_dict().items() if k in _OLD_ROW_KEYS}
+
+
+def _public_fields(ctx: PendingFeedbackContext) -> dict[str, Any]:
+    return {k: getattr(ctx, k) for k in _OLD_ROW_KEYS}
+
+
+@HOWS
+class TestResumeRowWithoutRunRecord:
+    """Rows without the run record still resume, and own and label listeners run.
+
+    Joins across the pause may stay unsatisfied for such rows, so whether
+    ``combine`` runs is not asserted.
+    """
+
+    def test_runtime_row_saved_again_without_the_record(self, how: str) -> None:
+        calls: list[Any] = []
+        flow_cls = _review_flow("start", _Review(pause=True), calls)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+            pending = flow_cls(persistence=persistence).kickoff()
+            assert isinstance(pending, HumanFeedbackPending)
+            flow_id = pending.context.flow_id
+            state, ctx = persistence.load_pending_feedback(flow_id)
+            persistence.save_pending_feedback(
+                flow_uuid=flow_id,
+                context=_OldRowContext(**_public_fields(ctx)),
+                state_data=state,
+            )
+            calls.clear()
+
+            _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+        assert "draft" not in calls
+        assert calls.count(("audit", "approved")) == 1
+        assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+    def test_row_written_outside_the_runtime(self, how: str) -> None:
+        calls: list[Any] = []
+        flow_cls = _review_flow("start", _Review(pause=True), calls)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+            persistence.save_pending_feedback(
+                flow_uuid="old-row",
+                context=_OldRowContext(
+                    flow_id="old-row",
+                    flow_class=f"test.{flow_cls.__name__}",
+                    method_name="draft",
+                    method_output="D",
+                    message="Review:",
+                    emit=["approved", "rejected"],
+                    default_outcome="approved",
+                    llm="gpt-4o-mini",
+                ),
+                state_data={"id": "old-row"},
+            )
+
+            _resume(flow_cls.from_pending("old-row", persistence), how)
+
+        assert "draft" not in calls
+        assert calls.count(("audit", "approved")) == 1
+        assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+@HOWS
+def test_resume_after_a_deploy_removed_a_fired_or_listener(how: str) -> None:
+    # ``gone`` = or_(other_start, "approved") fires on other_start before the
+    # pause; the reviewed listener re-arms fired or_ listeners for its label.
+    # The flow is then restored by a version of the class without ``gone``.
+    calls: list[str] = []
+    dispatched = threading.Event()
+    review = _Review(pause=True)
+
+    class Paused(Flow):
+        @start()
+        def other_start(self):
+            calls.append("other_start")
+            return "O"
+
+        @listen(other_start)
+        def other_done(self):
+            dispatched.set()
+
+        @start()
+        def seed(self):
+            return "S"
+
+        @listen(seed)
+        @human_feedback(**_routed(review))
+        def draft(self):
+            assert dispatched.wait(10), "other_start's completion was not dispatched"
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def audit(self):
+            calls.append("audit")
+
+        @listen("approved")
+        def publish(self):
+            calls.append("publish")
+
+        @listen(or_(other_start, "approved"))
+        def gone(self):
+            calls.append("gone")
+
+    class Deployed(Flow):  # Paused without ``gone``
+        @start()
+        def other_start(self):
+            calls.append("other_start")
+            return "O"
+
+        @listen(other_start)
+        def other_done(self):
+            dispatched.set()
+
+        @start()
+        def seed(self):
+            return "S"
+
+        @listen(seed)
+        @human_feedback(**_routed(review))
+        def draft(self):
+            assert dispatched.wait(10), "other_start's completion was not dispatched"
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def audit(self):
+            calls.append("audit")
+
+        @listen("approved")
+        def publish(self):
+            calls.append("publish")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = Paused(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert calls.count("gone") == 1
+        calls.clear()
+
+        _resume(Deployed.from_pending(pending.context.flow_id, persistence), how)
+
+    assert "draft" not in calls
+    assert calls.count("audit") == 1
+    assert calls.count("publish") == 1
+
+
+def _hf(review: _Review, emit: tuple[str, str] = ("approved", "rejected")) -> Any:
+    return human_feedback(
+        message="Review:",
+        emit=list(emit),
+        llm="gpt-4o-mini",
+        default_outcome=emit[0],
+        provider=review,
+    )
+
+
+ShapeFactory = Callable[[_Review, list[Any]], type[Flow]]
+
+
+def _run_at_once(make: ShapeFactory, tmpdir: str) -> list[Any]:
+    calls: list[Any] = []
+    make(_Review(pause=False), calls)(
+        persistence=SQLiteFlowPersistence(os.path.join(tmpdir, "now.db"))
+    ).kickoff()
+    return calls
+
+
+def _run_paused(
+    make: ShapeFactory, tmpdir: str, how: str, restore_each_time: bool = True
+) -> tuple[list[Any], list[Any]]:
+    """Kick off until the first pause, then restore and resume until the run ends.
+
+    Returns the calls before the first pause and the calls after it. With
+    ``restore_each_time`` false, a later pause is resumed on the same instance.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    before = list(calls)
+    calls.clear()
+    flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    for _ in range(5):
+        out = _resume(flow, how)
+        if not isinstance(out, HumanFeedbackPending):
+            return before, calls
+        if restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    raise AssertionError("the run kept pausing")
+
+
+def _named(calls: list[Any], *names: str) -> list[Any]:
+    """The calls of the given listeners, in a fixed order."""
+    picked = [c for c in calls if isinstance(c, tuple) and c[0] in names]
+    return sorted(picked, key=repr)
+
+
+def _assert_chain_resumes_as_at_once(
+    make: ShapeFactory,
+    how: str,
+    joins: dict[str, Any],
+    ran_before: tuple[str, ...],
+) -> None:
+    """Each join runs once after resume with the value it gets at once.
+
+    ``ran_before`` names the methods that completed before the pause; none of
+    them runs again after resume, and neither does ``draft``.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    expected = sorted(joins.items(), key=repr)
+    assert _named(now, *joins) == expected
+    assert _named(before, *joins) == []
+    assert _named(after, *joins) == expected
+    assert _named(after, "audit") == _named(now, "audit") == [("audit", "approved")]
+    assert _named(after, "publish") == [("publish", "HumanFeedbackResult")]
+    for name in ("draft", *ran_before):
+        assert name in before
+        assert name not in after
+
+
+def _ch1_router_outcome_leads_to_the_review(review: _Review, calls: list[Any]):
+    class Ch1(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch1
+
+
+def _ch2_earlier_router_on_the_trigger(review: _Review, calls: list[Any]):
+    class Ch2(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch2
+
+
+def _ch3_chain_of_two_routers(review: _Review, calls: list[Any]):
+    class Ch3(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "a"
+
+        @router("a")
+        def r2(self):
+            calls.append("r2")
+            return "b"
+
+        @listen("b")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("a", draft))
+        def j_a(self, value):
+            calls.append(("j_a", _payload(value)))
+
+        @listen(and_("b", draft))
+        def j_b(self, value):
+            calls.append(("j_b", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch3
+
+
+def _ch4_batch_and_chain(review: _Review, calls: list[Any]):
+    class Ch4(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @router("go")
+        def r2(self):
+            calls.append("r2")
+            return "go2"
+
+        @listen("go2")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(and_("go2", draft))
+        def j_go2(self, value):
+            calls.append(("j_go2", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch4
+
+
+def _ch5_chain_through_router_names(review: _Review, calls: list[Any]):
+    class Ch5(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "o1"
+
+        @router(r1)
+        def r2(self):
+            calls.append("r2")
+            return "o2"
+
+        @listen(r2)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_(r1, draft))
+        def j_r1(self, value):
+            calls.append(("j_r1", _payload(value)))
+
+        @listen(and_("o1", draft))
+        def j_o1(self, value):
+            calls.append(("j_o1", _payload(value)))
+
+        @listen(and_("o2", draft))
+        def j_o2(self, value):
+            calls.append(("j_o2", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch5
+
+
+def _ch6_router_start(review: _Review, calls: list[Any]):
+    class Ch6(Flow):
+        @start()
+        @router()
+        def cls_start(self):
+            calls.append("cls_start")
+            return "go"
+
+        @listen(cls_start)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(cls_start, draft))
+        def j_start(self, value):
+            calls.append(("j_start", _payload(value)))
+
+        @listen(and_("go", draft))
+        def j_go(self, value):
+            calls.append(("j_go", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch6
+
+
+def _ch7_review_under_a_plain_listener(review: _Review, calls: list[Any]):
+    class Ch7(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def pre(self):
+            calls.append("pre")
+            return "x"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(a)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen(and_("x", draft))
+        def j_x(self, value):
+            calls.append(("j_x", _payload(value)))
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    return Ch7
+
+
+@HOWS
+class TestResumeContinuesTheDispatchesThePauseInterrupted:
+    """Joins on steps on the way to a reviewed listener close as on an answer at once."""
+
+    def test_router_outcome_leads_to_the_review(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch1_router_outcome_leads_to_the_review,
+            how,
+            {"j_seed": "S", "j_go": "go"},
+            ran_before=("seed", "classify"),
+        )
+
+    def test_earlier_router_on_the_reviewed_listeners_trigger(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch2_earlier_router_on_the_trigger,
+            how,
+            {"j_seed": "S", "j_x": "x"},
+            ran_before=("seed", "pre"),
+        )
+
+    def test_chain_of_two_routers(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch3_chain_of_two_routers,
+            how,
+            {"j_seed": "S", "j_a": "a", "j_b": "b"},
+            ran_before=("seed", "r1", "r2"),
+        )
+
+    def test_routers_sharing_a_trigger_and_a_chain(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch4_batch_and_chain,
+            how,
+            {"j_seed": "S", "j_x": "x", "j_go": "go", "j_go2": "go2"},
+            ran_before=("seed", "pre", "classify", "r2"),
+        )
+
+    def test_chain_through_router_names(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch5_chain_through_router_names,
+            how,
+            {
+                "j_seed": "S",
+                "j_r1": "o1",
+                "j_o1": "HumanFeedbackResult",
+                "j_o2": "HumanFeedbackResult",
+            },
+            ran_before=("seed", "r1", "r2"),
+        )
+
+    def test_router_start(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch6_router_start,
+            how,
+            {"j_start": "go", "j_go": "HumanFeedbackResult"},
+            ran_before=("cls_start",),
+        )
+
+    def test_review_under_a_plain_listener(self, how: str) -> None:
+        _assert_chain_resumes_as_at_once(
+            _ch7_review_under_a_plain_listener,
+            how,
+            {"j_seed": "approved", "j_x": "x"},
+            ran_before=("seed", "pre", "a"),
+        )
+
+
+class _Color(enum.Enum):
+    RED = "red"
+
+
+@HOWS
+def test_restored_router_returning_an_enum_routes_its_value(how: str) -> None:
+    """``r1`` returns a plain ``Enum`` and its own subscriber is under review."""
+
+    def make(review: _Review, calls: list[Any]):
+        class EnumRouter(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def r1(self):
+                calls.append("r1")
+                return _Color.RED
+
+            @listen(r1)
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen("red")
+            def on_red(self, value):
+                calls.append(("on_red", _payload(value)))
+
+            @listen(and_("red", draft))
+            def j_red(self, value):
+                calls.append(("j_red", _payload(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return EnumRouter
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    expected = [("j_red", "HumanFeedbackResult"), ("on_red", "HumanFeedbackResult")]
+    assert _named(now, "on_red", "j_red") == expected
+    assert _named(before, "on_red", "j_red") == []
+    assert _named(after, "on_red", "j_red") == expected
+    assert _named(after, "publish") == [("publish", "HumanFeedbackResult")]
+    for name in ("seed", "r1", "draft"):
+        assert name in before
+        assert name not in after
+
+
+def _ch8_review_in_the_reviewed_methods_own_dispatch(review: _Review, calls: list[Any]):
+    class Ch8(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen(and_(seed, draft))
+        def j_seed(self, value):
+            calls.append(("j_seed", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _payload(value)))
+
+    return Ch8
+
+
+def _ch9_two_reviews_in_a_chain(review: _Review, calls: list[Any]):
+    class Ch9(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_hf(review)
+        def draft1(self):
+            calls.append("draft1")
+            return "D1"
+
+        @listen("approved")
+        @_hf(review, ("ok", "no"))
+        def draft2(self):
+            calls.append("draft2")
+            return "D2"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+        @listen(and_(seed, draft1))
+        def j_seed1(self, value):
+            calls.append(("j_seed1", _payload(value)))
+
+        @listen(and_(seed, draft2))
+        def j_seed2(self, value):
+            calls.append(("j_seed2", _payload(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _payload(value)))
+
+    return Ch9
+
+
+@HOWS
+@pytest.mark.parametrize("second", ["restored", "same_instance"])
+class TestResumeWhenTheContinuedDispatchPausesAgain:
+    """A second review pauses while the first one's dispatch is continued."""
+
+    def test_review_in_the_reviewed_methods_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        make = _ch8_review_in_the_reviewed_methods_own_dispatch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after = _run_paused(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        expected = [
+            ("fin", "HumanFeedbackResult"),
+            ("j_seed", "S"),
+            ("publish", "HumanFeedbackResult"),
+        ]
+        assert _named(now, "j_seed", "publish", "fin") == expected
+        assert _named(before + after, "j_seed", "publish", "fin") == expected
+        for name in ("seed", "draft", "check"):
+            assert (before + after).count(name) == 1
+
+    def test_two_reviews_in_a_chain(self, how: str, second: str) -> None:
+        make = _ch9_two_reviews_in_a_chain
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after = _run_paused(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        names = ("j_seed1", "j_seed2", "publish", "fin")
+        expected = [
+            ("fin", "HumanFeedbackResult"),
+            ("j_seed1", "S"),
+            ("j_seed2", "S"),
+            ("publish", "HumanFeedbackResult"),
+        ]
+        assert _named(now, *names) == expected
+        assert _named(before + after, *names) == expected
+        for name in ("seed", "classify", "draft1", "draft2"):
+            assert (before + after).count(name) == 1
+
+
+def test_start_gated_on_an_outcome_two_routers_return_runs_for_each() -> None:
+    """Without a review, a repeated router outcome reaches its gated start each time."""
+    calls: list[str] = []
+
+    class RepeatedOutcome(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "go"
+
+        @router(seed)
+        def r2(self):
+            calls.append("r2")
+            return "go"
+
+        @start("go")
+        def gated(self):
+            calls.append("gated")
+
+        @listen("go")
+        def on_go(self):
+            calls.append("on_go")
+
+    RepeatedOutcome().kickoff()
+
+    assert calls.count("on_go") == 2
+    assert calls.count("gated") == 2
+
+
+@HOWS
+def test_start_gated_on_a_router_outcome_under_review_does_not_rerun(
+    how: str,
+) -> None:
+    """``gated`` waits on ``classify``'s outcome and pauses for its own review."""
+
+    def make(review: _Review, calls: list[Any]):
+        class GatedReview(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @router(seed)
+            def classify(self):
+                calls.append("classify")
+                return "go"
+
+            @start("go")
+            @_hf(review)
+            def gated(self):
+                calls.append("gated")
+                return "G"
+
+            @listen("go")
+            def on_go(self):
+                calls.append("on_go")
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _payload(value)))
+
+        return GatedReview
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    assert now.count("gated") == 1
+    assert before.count("gated") == 1
+    assert "gated" not in after
+    for name in ("seed", "classify", "on_go"):
+        assert name not in after
+    assert _named(after, "publish") == _named(now, "publish")
+
+
+@HOWS
+def test_restored_batch_naming_a_removed_router(how: str) -> None:
+    """``post`` follows the reviewed listener on ``seed`` and is gone on restore."""
+    calls: list[Any] = []
+    review = _Review(pause=True)
+
+    class Paused(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @router(seed)
+        def post(self):
+            calls.append("post")
+            return "y"
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    class Deployed(Flow):  # Paused without ``post``
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = Paused(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert "post" not in calls
+        calls.clear()
+
+        _resume(Deployed.from_pending(pending.context.flow_id, persistence), how)
+
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+@HOWS
+def test_restored_batch_naming_a_router_now_a_plain_listener(how: str) -> None:
+    """``post`` is a router on ``seed`` at the pause and a plain listener on restore."""
+    calls: list[Any] = []
+    review = _Review(pause=True)
+
+    class Paused(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @router(seed)
+        def post(self):
+            calls.append("post")
+            return "y"
+
+        @listen("y")
+        def on_y(self):
+            calls.append("on_y")
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    class Deployed(Flow):  # Paused with ``post`` a plain listener
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(seed)
+        def post(self, value):
+            calls.append(("post", _payload(value)))
+            return "y"
+
+        @listen("y")
+        def on_y(self):
+            calls.append("on_y")
+
+        @listen(draft)
+        def audit(self, value):
+            calls.append(("audit", _payload(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _payload(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = Paused(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        assert "post" not in calls
+        calls.clear()
+
+        _resume(Deployed.from_pending(pending.context.flow_id, persistence), how)
+
+    assert "draft" not in calls
+    assert _named(calls, "post") == [("post", "S")]
+    assert "on_y" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# Record entries a row keeps for joins and ``or_`` conditions; every other
+# entry describes where the paused run stopped.
+_JOIN_AND_OR_RECORD_KEYS = {"pending_events", "fired_or_listeners", "completed_methods"}
+
+
+def _of_another_type(value: Any) -> Any:
+    return 7 if isinstance(value, (str, type(None))) else "x"
+
+
+def _malformed_records(record: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Copies of ``record`` with one entry, or one field of one entry, broken."""
+    variants: list[tuple[str, dict[str, Any]]] = []
+    for key in sorted(set(record) - _JOIN_AND_OR_RECORD_KEYS):
+        variants.append((f"{key}: not a list", {**record, key: "not a list"}))
+        value = record[key]
+        entries = value if isinstance(value, list) else [value]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                variants.append((f"{key}[{index}]: another type", {**record, key: "x"}))
+                continue
+            for field in sorted(entry):
+                for change, broken in (
+                    ("missing", {k: v for k, v in entry.items() if k != field}),
+                    ("another type", {**entry, field: _of_another_type(entry[field])}),
+                ):
+                    new_entries = list(entries)
+                    new_entries[index] = broken
+                    variants.append(
+                        (
+                            f"{key}[{index}].{field}: {change}",
+                            {**record, key: new_entries},
+                        )
+                    )
+    return variants
+
+
+@HOWS
+def test_malformed_dispatch_record_resumes_as_a_row_without_it(how: str) -> None:
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    wrong: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        probe = SQLiteFlowPersistence(os.path.join(tmpdir, "probe.db"))
+        pending = flow_cls(persistence=probe).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        variants = _malformed_records(dict(pending.context.resume_record or {}))
+        assert variants
+
+        for number, (label, record) in enumerate(variants):
+            persistence = SQLiteFlowPersistence(os.path.join(tmpdir, f"{number}.db"))
+            pending = flow_cls(persistence=persistence).kickoff()
+            assert isinstance(pending, HumanFeedbackPending)
+            flow_id = pending.context.flow_id
+            state, ctx = persistence.load_pending_feedback(flow_id)
+            ctx.resume_record = record
+            persistence.save_pending_feedback(
+                flow_uuid=flow_id, context=ctx, state_data=state
+            )
+            calls.clear()
+            try:
+                _resume(flow_cls.from_pending(flow_id, persistence), how)
+            except Exception as error:
+                wrong[label] = repr(error)
+                continue
+            if (
+                "draft" in calls
+                or calls.count(("audit", "approved")) != 1
+                or calls.count(("publish", "HumanFeedbackResult")) != 1
+            ):
+                wrong[label] = list(calls)
+
+    assert wrong == {}
+
+
+# Every place a review can pause: the reviewed start re-paused in its own
+# dispatch, and work running beside the review when it pauses.
+
+
+class _SignalledReview:
+    """A review that sets ``requested`` before it answers or pauses.
+
+    A method that must still be running when the review pauses waits on
+    ``requested`` and then a little longer, so it completes after the pause.
+    """
+
+    def __init__(self, review: _Review) -> None:
+        self.review = review
+        self.requested = threading.Event()
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        self.requested.set()
+        return self.review.request_feedback(context, flow)
+
+
+def _after_the_review(signal: _SignalledReview) -> None:
+    assert signal.requested.wait(10), "no review was requested"
+    threading.Event().wait(0.3)
+
+
+async def _after_the_review_async(signal: _SignalledReview) -> None:
+    for _ in range(1000):
+        if signal.requested.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert signal.requested.is_set(), "no review was requested"
+    await asyncio.sleep(0.3)
+
+
+def _value(value: Any) -> Any:
+    """A listener's argument, with a review result compared by its fields."""
+    if isinstance(value, HumanFeedbackResult):
+        return ("review", value.method_name, value.output, value.outcome)
+    return value
+
+
+def _hf_signalled(
+    signal: _SignalledReview, emit: tuple[str, str] = ("approved", "rejected")
+) -> Any:
+    return human_feedback(
+        message="Review:",
+        emit=list(emit),
+        llm="gpt-4o-mini",
+        default_outcome=emit[0],
+        provider=signal,
+    )
+
+
+def _run_every_pause(
+    make: ShapeFactory, tmpdir: str, how: str, restore_each_time: bool
+) -> tuple[list[Any], list[Any], list[str]]:
+    """Kick off, then resume until the run ends.
+
+    Returns the calls before the first pause, the calls after it, and the
+    reviewed method of each pause in the order the pauses came. Every resume
+    after the first is on a restored flow, or on the flow first restored.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "paused.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    paused_for = [out.context.method_name]
+    before = list(calls)
+    calls.clear()
+    flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    for _ in range(5):
+        out = _resume(flow, how)
+        if not isinstance(out, HumanFeedbackPending):
+            return before, calls, paused_for
+        paused_for.append(out.context.method_name)
+        if restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+    raise AssertionError("the run kept pausing")
+
+
+def _calls_of(calls: list[Any], *names: str) -> list[Any]:
+    """The calls of the given methods, in a fixed order."""
+    picked = [c for c in calls if (c[0] if isinstance(c, tuple) else c) in names]
+    return sorted(picked, key=repr)
+
+
+def _f1_reviewed_start_paused_again_in_its_own_dispatch(
+    review: _Review, calls: list[Any]
+):
+    class F1(Flow):
+        @start()
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+        @listen(and_(draft, check))
+        def joined(self, value):
+            calls.append(("joined", _value(value)))
+
+    return F1
+
+
+def _gated_start_paused_again_in_its_own_dispatch(review: _Review, calls: list[Any]):
+    class GatedAgain(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @start("go")
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_hf(review, ("ok", "no"))
+        def check(self):
+            calls.append("check")
+            return "C"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    return GatedAgain
+
+
+def _k11_start_still_running_at_the_pause(sync: bool) -> ShapeFactory:
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class TwoStarts(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            if sync:
+
+                @start()
+                def other_start(self):
+                    _after_the_review(signal)
+                    calls.append("other_start")
+                    return "O"
+
+            else:
+
+                @start()
+                async def other_start(self):
+                    await _after_the_review_async(signal)
+                    calls.append("other_start")
+                    return "O"
+
+            @listen(other_start)
+            def after_other(self, value):
+                calls.append(("after_other", _value(value)))
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", _value(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen(and_(draft, other_start))
+            def combine(self, value):
+                calls.append(("combine", _value(value)))
+
+        return TwoStarts
+
+    return make
+
+
+def _two_reviewed_starts(slower: str) -> ShapeFactory:
+    """``draft`` and ``other`` are both reviewed; ``slower`` asks after the other."""
+
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class TwoReviews(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                if slower == "draft":
+                    _after_the_review(signal)
+                calls.append("draft")
+                return "D"
+
+            @start()
+            @_hf_signalled(signal, ("ok", "no"))
+            def other(self):
+                if slower == "other":
+                    _after_the_review(signal)
+                calls.append("other")
+                return "O"
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+            @listen(and_(draft, other))
+            def combine(self, value):
+                calls.append(("combine", _value(value)))
+
+        return TwoReviews
+
+    return make
+
+
+def _plain_sibling_beside_the_paused_listener(review: _Review, calls: list[Any]):
+    signal = _SignalledReview(review)
+
+    class PassSibling(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(seed)
+        def b(self):
+            _after_the_review(signal)
+            calls.append("b")
+            return "B"
+
+        @listen(a)
+        @_hf_signalled(signal)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(b)
+        def after_b(self, value):
+            calls.append(("after_b", _value(value)))
+
+        @listen(and_(b, draft))
+        def combine(self, value):
+            calls.append(("combine", _value(value)))
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+    return PassSibling
+
+
+def _two_siblings_each_lead_to_a_review(review: _Review, calls: list[Any]):
+    signal = _SignalledReview(review)
+
+    class PassTwoReviews(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(seed)
+        def b(self):
+            _after_the_review(signal)
+            calls.append("b")
+            return "B"
+
+        @listen(a)
+        @_hf_signalled(signal)
+        def d1(self):
+            calls.append("d1")
+            return "1"
+
+        @listen(b)
+        @_hf_signalled(signal, ("ok", "no"))
+        def d2(self):
+            calls.append("d2")
+            return "2"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+        @listen(and_(d1, d2))
+        def combine(self, value):
+            calls.append(("combine", _value(value)))
+
+    return PassTwoReviews
+
+
+def _expected(listeners: dict[str, list[Any]]) -> list[Any]:
+    return sorted(
+        ((name, value) for name, values in listeners.items() for value in values),
+        key=repr,
+    )
+
+
+SECONDS = pytest.mark.parametrize("second", ["restored", "same_instance"])
+
+
+@HOWS
+@SECONDS
+class TestResumeAtEveryPauseSite:
+    """Each run resumes until it ends and gives what the run answered at once gives."""
+
+    def _check(
+        self,
+        make: ShapeFactory,
+        how: str,
+        second: str,
+        listeners: dict[str, list[Any]],
+        each_once: tuple[str, ...],
+        pauses: list[str],
+        settled: tuple[str, ...] = (),
+        paused_values: dict[str, list[Any]] | None = None,
+    ) -> None:
+        """``listeners`` gives each listener's arguments over the whole run.
+
+        ``paused_values`` replaces some of them for the paused run. Each
+        method in ``each_once`` runs once over the whole run; ``pauses`` are
+        the reviews in the order the run pauses for them; each method in
+        ``settled`` completes before the first pause and not after it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = _run_at_once(make, tmpdir)
+            before, after, paused_for = _run_every_pause(
+                make, tmpdir, how, restore_each_time=second == "restored"
+            )
+
+        names = tuple(listeners)
+        assert _calls_of(now, *names) == _expected(listeners)
+        assert _calls_of(before + after, *names) == _expected(
+            {**listeners, **(paused_values or {})}
+        )
+        assert paused_for == pauses
+        for name in each_once:
+            assert now.count(name) == 1
+            assert (before + after).count(name) == 1
+        for name in settled:
+            assert _calls_of(before, name) != []
+            assert _calls_of(after, name) == []
+
+    def test_reviewed_start_paused_again_in_its_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        # The outcome listener gets the latest review's result, as at once.
+        check = ("review", "check", "C", "ok")
+        self._check(
+            _f1_reviewed_start_paused_again_in_its_own_dispatch,
+            how,
+            second,
+            listeners={"publish": [check], "fin": [check], "joined": ["approved"]},
+            each_once=("draft", "check"),
+            pauses=["draft", "check"],
+        )
+
+    def test_gated_start_paused_again_in_its_own_dispatch(
+        self, how: str, second: str
+    ) -> None:
+        check = ("review", "check", "C", "ok")
+        self._check(
+            _gated_start_paused_again_in_its_own_dispatch,
+            how,
+            second,
+            listeners={"publish": [check], "fin": [check]},
+            each_once=("seed", "classify", "draft", "check"),
+            pauses=["draft", "check"],
+        )
+
+    # A join gets the value of the completion that fires it. At once that is
+    # the member completing last; paused, the members that settled before the
+    # pause complete first, so the review answered last fires the join.
+
+    @pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+    def test_start_still_running_at_the_pause(
+        self, how: str, second: str, sync: bool
+    ) -> None:
+        self._check(
+            _k11_start_still_running_at_the_pause(sync),
+            how,
+            second,
+            listeners={
+                "after_other": ["O"],
+                "audit": ["approved"],
+                "publish": [("review", "draft", "D", "approved")],
+                "combine": ["O"],
+            },
+            each_once=("draft", "other_start"),
+            pauses=["draft"],
+            settled=("other_start", "after_other"),
+            paused_values={"combine": ["approved"]},
+        )
+
+    @pytest.mark.parametrize("slower", ["other", "draft"])
+    def test_sibling_start_paused_for_its_own_review(
+        self, how: str, second: str, slower: str
+    ) -> None:
+        # The reviews are asked for in definition order, whichever is slower.
+        self._check(
+            _two_reviewed_starts(slower),
+            how,
+            second,
+            listeners={
+                "publish": [("review", "draft", "D", "approved")],
+                "fin": [("review", "other", "O", "ok")],
+                "combine": ["ok" if slower == "other" else "approved"],
+            },
+            each_once=("draft", "other"),
+            pauses=["draft", "other"],
+            settled=("draft", "other"),
+            paused_values={"combine": ["ok"]},
+        )
+
+    def test_plain_sibling_still_running_beside_the_paused_listener(
+        self, how: str, second: str
+    ) -> None:
+        self._check(
+            _plain_sibling_beside_the_paused_listener,
+            how,
+            second,
+            listeners={
+                "after_b": ["B"],
+                "publish": [("review", "draft", "D", "approved")],
+                "combine": ["B"],
+            },
+            each_once=("seed", "a", "b", "draft"),
+            pauses=["draft"],
+            settled=("b", "after_b"),
+            paused_values={"combine": ["approved"]},
+        )
+
+    def test_two_siblings_each_lead_to_a_review(self, how: str, second: str) -> None:
+        self._check(
+            _two_siblings_each_lead_to_a_review,
+            how,
+            second,
+            listeners={
+                "publish": [("review", "d1", "1", "approved")],
+                "fin": [("review", "d2", "2", "ok")],
+                "combine": ["ok"],
+            },
+            each_once=("seed", "a", "b", "d1", "d2"),
+            pauses=["d1", "d2"],
+            settled=("b", "d2"),
+        )
+
+
+def _review_with_another_review_later(review: _Review, calls: list[Any]):
+    class Later(Flow):
+        @start()
+        @_hf(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen("never")
+        @_hf(review, ("ok", "no"))
+        def other(self):
+            calls.append("other")
+            return "O"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    return Later
+
+
+@HOWS
+def test_queued_review_of_another_flow_is_skipped(how: str) -> None:
+    """A queued review whose ``flow_id`` is another flow's is not paused for."""
+    calls: list[Any] = []
+    flow_cls = _review_with_another_review_later(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        foreign = flow_cls(persistence=persistence).kickoff()
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(foreign, HumanFeedbackPending)
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        assert foreign.context.flow_id != flow_id
+
+        # The row as the runtime stores a review of ``other`` queued behind
+        # ``draft``'s, with another flow's review queued before it.
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        other = {
+            **ctx.to_dict(),
+            "method_name": "other",
+            "method_output": "O",
+            "emit": ["ok", "no"],
+            "default_outcome": "ok",
+            "resume_record": None,
+        }
+        stranger = {**other, "flow_id": foreign.context.flow_id}
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "queued": [
+                {"context": stranger, "callback_info": None},
+                {"context": other, "callback_info": None},
+            ],
+        }
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        assert isinstance(out, HumanFeedbackPending)
+        assert (out.context.flow_id, out.context.method_name) == (flow_id, "other")
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+    assert "draft" not in calls
+    assert "other" not in calls
+
+
+_FIELDS_OF_ANOTHER_TYPE = [
+    ("requested_at", 7),
+    ("requested_at", ["2026-01-01T00:00:00"]),
+    ("message", 7),
+    ("message", None),
+    ("emit", "ok"),
+    ("emit", 7),
+    ("emit", [1, 2]),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(
+    ("field", "value"),
+    _FIELDS_OF_ANOTHER_TYPE,
+    ids=[f"{f}={v!r}" for f, v in _FIELDS_OF_ANOTHER_TYPE],
+)
+def test_queued_review_with_a_field_of_another_type_is_skipped(
+    how: str, field: str, value: Any
+) -> None:
+    """Resume skips the broken entry and pauses for the valid one behind it."""
+    calls: list[Any] = []
+    flow_cls = _review_with_another_review_later(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        other = {
+            **ctx.to_dict(),
+            "method_name": "other",
+            "method_output": "O",
+            "emit": ["ok", "no"],
+            "default_outcome": "ok",
+            "resume_record": None,
+        }
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "queued": [
+                {"context": {**other, field: value}, "callback_info": None},
+                {"context": other, "callback_info": None},
+            ],
+        }
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "other"
+        assert persistence.load_pending_feedback(flow_id) is not None
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+
+
+class _TicketReview:
+    """Pause for review, giving the reviewed method's ticket as callback info."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": f"T-{context.method_name}"}
+        )
+
+
+@HOWS
+def test_queued_review_pauses_with_the_callback_info_its_provider_gave(
+    how: str,
+) -> None:
+    signal = _SignalledReview(_TicketReview())
+
+    class Tickets(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = Tickets(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        second = _resume(Tickets.from_pending(first.context.flow_id, persistence), how)
+
+    assert (first.context.method_name, first.callback_info) == (
+        "draft",
+        {"ticket": "T-draft"},
+    )
+    assert isinstance(second, HumanFeedbackPending)
+    assert (second.context.method_name, second.callback_info) == (
+        "other",
+        {"ticket": "T-other"},
+    )
+
+
+# A second review in the continuation of the first, at every place it can sit:
+# the reviewed method's own dispatch, its outcome's dispatch, a router's or a
+# plain listener's dispatch under it, a start its outcome gates, or beside it.
+# The second review routes (``emit``) or does not; the first reviewed method is
+# a start or a listener. Each paused run resumes until it ends and gives the
+# same calls, with the same values, as the run answered at once.
+
+SECOND_REVIEW_SITES = ("own", "outcome", "router", "pass", "gated", "sibling")
+
+# A start's outcome does not run a start gated on it, even answered at once,
+# so ``gated`` has a second review only when ``draft`` is a listener.
+SECOND_REVIEW_ROWS = [
+    (site, role)
+    for site in SECOND_REVIEW_SITES
+    for role in ("start", "listener")
+    if (site, role) != ("gated", "start")
+]
+
+
+def _second_review(signal: _SignalledReview, kind: str) -> Any:
+    if kind == "emit":
+        return _hf_signalled(signal, ("ok", "no"))
+    return human_feedback(message="Check:", provider=signal)
+
+
+def _second_review_in_the_continuation(site: str, kind: str, role: str) -> ShapeFactory:
+    """``draft`` is reviewed with ``emit``; ``check`` is the second review at ``site``.
+
+    On ``sibling`` ``check`` runs beside ``draft`` and completes after
+    ``draft``'s review is asked for, so the run answered at once dispatches
+    ``draft``'s outcome first.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        signal = _SignalledReview(review)
+
+        class SecondReview(Flow):
+            if role == "listener":
+
+                @start()
+                def seed(self):
+                    calls.append("seed")
+                    return "S"
+
+                @listen(seed)
+                @_hf_signalled(signal)
+                def draft(self):
+                    calls.append("draft")
+                    return "D"
+
+            else:
+
+                @start()
+                @_hf_signalled(signal)
+                def draft(self):
+                    calls.append("draft")
+                    return "D"
+
+            @listen(draft)
+            def audit(self, value):
+                calls.append(("audit", _value(value)))
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            if site == "own":
+
+                @listen(draft)
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "outcome":
+
+                @listen("approved")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "router":
+
+                @router(draft)
+                def route(self):
+                    calls.append("route")
+                    return "go"
+
+                @listen("go")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "pass":
+
+                @listen(draft)
+                def step(self):
+                    calls.append("step")
+                    return "T"
+
+                @listen(step)
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif site == "gated":
+
+                @start("approved")
+                @_second_review(signal, kind)
+                def check(self):
+                    calls.append("check")
+                    return "C"
+
+            elif role == "listener":
+
+                @listen(seed)
+                @_second_review(signal, kind)
+                def check(self):
+                    _after_the_review(signal)
+                    calls.append("check")
+                    return "C"
+
+            else:
+
+                @start()
+                @_second_review(signal, kind)
+                def check(self):
+                    _after_the_review(signal)
+                    calls.append("check")
+                    return "C"
+
+            @listen(check)
+            def after_check(self, value):
+                calls.append(("after_check", _value(value)))
+
+            if kind == "emit":
+
+                @listen("ok")
+                def fin(self, value):
+                    calls.append(("fin", _value(value)))
+
+            @listen(and_(draft, check))
+            def joined(self):
+                calls.append("joined")
+
+        return SecondReview
+
+    return make
+
+
+def _assert_resumes_as_answered_at_once(
+    make: ShapeFactory, how: str, second: str, pauses: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert sorted(before + after, key=repr) == sorted(now, key=repr)
+    assert paused_for == pauses
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize(("site", "role"), SECOND_REVIEW_ROWS)
+def test_second_review_in_the_continuation_resumes_as_answered_at_once(
+    site: str, kind: str, role: str, second: str, how: str
+) -> None:
+    _assert_resumes_as_answered_at_once(
+        _second_review_in_the_continuation(site, kind, role),
+        how,
+        second,
+        pauses=["draft", "check"],
+    )
+
+
+def _audit_reviewed_without_emit(role: str) -> ShapeFactory:
+    """review-4's N5: ``audit`` is reviewed without ``emit`` in ``draft``'s dispatch."""
+
+    def make(review: _Review, calls: list[Any]):
+        audit_review = human_feedback(message="Audit:", provider=review)
+
+        class StartReview(Flow):
+            @start()
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(draft)
+            @audit_review
+            def audit(self):
+                calls.append("audit")
+                return "A"
+
+            @listen("approved")
+            def publish(self):
+                calls.append("publish")
+
+            @listen(audit)
+            def after_audit(self):
+                calls.append("after_audit")
+
+        class ListenerReview(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return "S"
+
+            @listen(seed)
+            @_hf(review)
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @listen(draft)
+            @audit_review
+            def audit(self):
+                calls.append("audit")
+                return "A"
+
+            @listen("approved")
+            def publish(self):
+                calls.append("publish")
+
+            @listen(audit)
+            def after_audit(self):
+                calls.append("after_audit")
+
+        return StartReview if role == "start" else ListenerReview
+
+    return make
+
+
+@HOWS
+@SECONDS
+@ROLES
+def test_review_without_emit_in_the_reviewed_methods_dispatch_keeps_its_outcome(
+    role: str, second: str, how: str
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(_audit_reviewed_without_emit(role), tmpdir)
+        before, after, paused_for = _run_every_pause(
+            _audit_reviewed_without_emit(role),
+            tmpdir,
+            how,
+            restore_each_time=second == "restored",
+        )
+
+    assert now.count("publish") == 1
+    assert (before + after).count("publish") == 1
+    assert sorted(before + after) == sorted(now)
+    assert paused_for == ["draft", "audit"]
+
+
+# User values shaped like the record's tagged forms: a stored review result,
+# and a value stored under the record's literal tag.
+_TAGGED_USER_VALUE = {
+    "__crewai_human_feedback_result__": {
+        "output": "x",
+        "feedback": "",
+        "outcome": "go",
+        "timestamp": "2026-01-01T00:00:00",
+        "method_name": "m",
+        "metadata": {},
+    }
+}
+_LITERAL_TAGGED_USER_VALUE = {"__crewai_record_literal__": {"k": 1}}
+
+
+@HOWS
+@pytest.mark.parametrize(
+    "user_value",
+    [_TAGGED_USER_VALUE, _LITERAL_TAGGED_USER_VALUE],
+    ids=["review_result_tag", "literal_tag"],
+)
+def test_user_dict_shaped_like_a_stored_review_result_resumes_as_that_dict(
+    user_value: dict[str, Any], how: str
+) -> None:
+    def make(review: _Review, calls: list[Any]):
+        class Tagged(Flow):
+            @start()
+            def seed(self):
+                return json.loads(json.dumps(user_value))
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @_hf(review)
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, value):
+                calls.append(("use", type(value).__name__, value))
+
+        return Tagged
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after = _run_paused(make, tmpdir, how)
+
+    assert now == [("use", "dict", user_value)]
+    assert before + after == now
+
+
+# Flows whose reviews have no ``emit``: resume continues the work the pause
+# interrupted, as the run answered at once does.
+
+
+def _plain_review(review: _Review) -> Any:
+    return human_feedback(message="Review:", provider=review)
+
+
+def _plain_review_beside_a_gated_start(review: _Review, calls: list[Any]):
+    class Gated(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @router(seed)
+        def classify(self):
+            calls.append("classify")
+            return "go"
+
+        @listen("go")
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @start("go")
+        def gated(self):
+            calls.append("gated")
+
+        @listen(draft)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+        @listen(and_(seed, draft))
+        def joined(self):
+            calls.append("joined")
+
+    return Gated
+
+
+def _two_plain_reviews_in_a_chain(review: _Review, calls: list[Any]):
+    class Chain(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+            return "S"
+
+        @listen(seed)
+        def a(self):
+            calls.append("a")
+            return "A"
+
+        @listen(a)
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        @_plain_review(review)
+        def again(self):
+            calls.append("again")
+            return "G"
+
+        @listen(again)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+        @listen(and_(a, again))
+        def joined(self):
+            calls.append("joined")
+
+    return Chain
+
+
+def _plain_reviewed_start(review: _Review, calls: list[Any]):
+    class StartReview(Flow):
+        @start()
+        @_plain_review(review)
+        def draft(self):
+            calls.append("draft")
+            return "D"
+
+        @listen(draft)
+        def after(self, value):
+            calls.append(("after", _value(value)))
+
+    return StartReview
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize(
+    ("make", "pauses"),
+    [
+        (_plain_review_beside_a_gated_start, ["draft"]),
+        (_two_plain_reviews_in_a_chain, ["draft", "again"]),
+        (_plain_reviewed_start, ["draft"]),
+    ],
+    ids=["gated_start", "chain", "start"],
+)
+def test_reviews_without_emit_resume_as_answered_at_once(
+    make: ShapeFactory, pauses: list[str], second: str, how: str
+) -> None:
+    _assert_resumes_as_answered_at_once(make, how, second, pauses)
+
+
+# Step values the record stores that JSON does not keep as they are: dicts with
+# keys other than strings, and values with no JSON form.
+
+
+class _Opaque:
+    """A value with no JSON form; its string form is ``opaque``."""
+
+    def __repr__(self) -> str:
+        return "_Opaque()"
+
+    def __str__(self) -> str:
+        return "opaque"
+
+
+_OPAQUE = _Opaque()
+_STEP_VALUES = {
+    "tuple_keys": {("a", "b"): 1, ("c", 2): "x"},
+    "int_keys": {1: "v", 2: "w"},
+    "nested": {
+        "rows": [
+            {1: "int", 2.5: "float", None: "none"},
+            {False: {("a", 2): "tuple", ("b", None, 3.5): [1, "x"]}},
+        ],
+        7: {"inner": [1, "x", {True: "bool"}]},
+    },
+    "opaque": _OPAQUE,
+    "opaque_key": {_OPAQUE: 1},
+}
+# The pause the value is stored with: the first one (from kickoff), or one
+# reached while resuming, which is then resumed restored or on the same instance.
+_STEP_VALUE_PAUSES = [
+    ("kickoff", "restored"),
+    ("resume", "restored"),
+    ("resume", "same_instance"),
+]
+
+
+def _step_value_beside_a_review(value: Any, kind: str, at: str) -> ShapeFactory:
+    """``seed`` returns ``value``; its router leads to ``draft``, reviewed by ``kind``.
+
+    ``use`` listens on ``seed``. With ``emit``, ``draft`` pauses in ``seed``'s
+    router loop, so ``use`` gets the value from the record after resume; without
+    ``emit``, ``use`` runs beside ``draft`` before the pause is saved. With
+    ``at="resume"``, ``seed`` runs after a first review is resumed.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        draft_review = (
+            _hf(review, emit=("ok", "no")) if kind == "emit" else _plain_review(review)
+        )
+
+        class AtKickoff(Flow):
+            @start()
+            def seed(self):
+                return value
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @draft_review
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, got):
+                calls.append(("use", got))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review)
+            def first(self):
+                return "F"
+
+            @listen("approved")
+            def seed(self):
+                return value
+
+            @router(seed)
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @draft_review
+            def draft(self):
+                return "D"
+
+            @listen(seed)
+            def use(self, got):
+                calls.append(("use", got))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_STEP_VALUES))
+def test_step_value_without_a_faithful_json_form_resumes_as_documented(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """The pause saves, and ``use`` gets the value it gets when answered at once.
+
+    Dicts keyed by JSON scalars or tuples of them come back equal, with the same
+    key types. A value with no JSON form comes back as its string form when it
+    crossed a restore, and as the live value on the same instance.
+    """
+    value = _STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert now == [("use", value)]
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    restored = kind == "emit" and second == "restored"
+    if name == "opaque" and restored:
+        assert got == [("use", "opaque")]
+    elif name == "opaque_key" and restored:
+        assert isinstance(got[0][1], (str, dict))
+    else:
+        assert repr(got) == repr(now)
+
+
+class _Model(BaseModel):
+    field: str
+
+
+def _two_queued_reviews_of_models(review: _Review, calls: list[Any]):
+    """``draft`` and ``other`` are reviewed beside each other after ``first``'s resume.
+
+    ``other`` completes after ``draft``'s review is requested, so it is queued
+    behind ``draft``. Their listeners record the type of the reviewed output.
+    """
+    signal = _SignalledReview(review)
+    plain = human_feedback(message="Review:", provider=signal)
+
+    class Queued(Flow):
+        @start()
+        @_hf(review)
+        def first(self):
+            return "F"
+
+        @listen("approved")
+        @plain
+        def draft(self):
+            return _Model(field="d")
+
+        @listen("approved")
+        @plain
+        def other(self):
+            _after_the_review(signal)
+            return _Model(field="o")
+
+        @listen(draft)
+        def took_draft(self, result):
+            calls.append(("took_draft", type(result.output).__name__))
+
+        @listen(other)
+        def took_other(self, result):
+            calls.append(("took_other", type(result.output).__name__))
+
+    return Queued
+
+
+@HOWS
+@SECONDS
+def test_queued_review_on_the_same_instance_keeps_its_live_output(
+    second: str, how: str
+) -> None:
+    """On the same instance, a queued review's listener gets the live model.
+
+    A restored flow gets the stored form, a dict, for both reviews.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(_two_queued_reviews_of_models, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            _two_queued_reviews_of_models,
+            tmpdir,
+            how,
+            restore_each_time=second == "restored",
+        )
+
+    assert sorted(now) == [("took_draft", "_Model"), ("took_other", "_Model")]
+    assert paused_for == ["first", "draft", "other"]
+    stored = "dict" if second == "restored" else "_Model"
+    assert sorted(before + after) == [("took_draft", stored), ("took_other", stored)]
+
+
+# A step value with a dict keyed by an object with no JSON form is stored as
+# the whole value's string form; user dicts shaped like the record's tags
+# come back as those dicts.
+_UNKEYABLE_STEP_VALUES = {
+    "opaque_key": {_OPAQUE: 1},
+    "nested_opaque_key": {"rows": [{1: "v"}, {_OPAQUE: 1}]},
+}
+_TAG_SHAPED_STEP_VALUES = {
+    "dict_tag": {"__crewai_record_dict__": [[1, "v"]]},
+    "tuple_tag": {"__crewai_record_tuple__": ["a", 1]},
+    "nested_tags": {
+        5: {"__crewai_record_dict__": {"k": ["t", {(1, 2): None}]}},
+        "s": [{"__crewai_record_literal__": {2: "w"}}],
+    },
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_UNKEYABLE_STEP_VALUES))
+def test_step_value_keyed_by_an_object_resumes_as_its_string_form(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _UNKEYABLE_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    expected = str(value) if second == "restored" else value
+    assert before + after == [("use", expected)]
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_TAG_SHAPED_STEP_VALUES))
+def test_step_value_shaped_like_a_record_tag_resumes_as_that_value(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _TAG_SHAPED_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    assert repr(before + after) == repr(now)
+
+
+# Step values whose stored form cannot be built: cycles and nesting past the
+# recursion limit. The pause still saves, and the value is stored as its
+# string form, or as its type's name in angle brackets when that cannot be
+# taken either.
+
+
+class _DeepRepr:
+    """A chain of objects whose string form recurses once per link."""
+
+    def __init__(self, child: Any = None) -> None:
+        self.child = child
+
+    def __repr__(self) -> str:
+        return f"_DeepRepr({self.child!r})"
+
+
+def _nested(depth: int, leaf: Any, wrap: Callable[[Any], Any]) -> Any:
+    value = leaf
+    for _ in range(depth):
+        value = wrap(value)
+    return value
+
+
+def _past_the_limit() -> int:
+    """A depth that no recursive walk reaches within the current recursion limit."""
+    return 5 * sys.getrecursionlimit()
+
+
+def _deep_dicts(depth: int) -> tuple[Any, str]:
+    """``{"k": {"k": ... 1}}`` ``depth`` deep, and the string form stored for it.
+
+    The string form is built without recursion. Python 3.10 and 3.11 cannot
+    take ``str()`` of a dict nested past the recursion limit; there the value
+    is stored as its type's name in angle brackets.
+    """
+    value = _nested(depth, 1, lambda v: {"k": v})
+    try:
+        str(value)
+    except RecursionError:
+        return value, "<dict>"
+    return value, "{'k': " * depth + "1" + "}" * depth
+
+
+_CYCLIC_DICT: dict[str, Any] = {"k": 1}
+_CYCLIC_DICT["self"] = _CYCLIC_DICT
+_CYCLIC_LIST: list[Any] = [1]
+_CYCLIC_LIST.append(_CYCLIC_LIST)
+# Each entry builds the value and the string form stored for it when the
+# test runs, so the depths follow the recursion limit in force.
+_UNBUILDABLE_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "cyclic_dict": lambda: (_CYCLIC_DICT, "{'k': 1, 'self': {...}}"),
+    "cyclic_list": lambda: (_CYCLIC_LIST, "[1, [...]]"),
+    "deep_dicts": lambda: _deep_dicts(_past_the_limit()),
+    "deep_repr": lambda: (
+        _nested(_past_the_limit(), None, _DeepRepr),
+        "<_DeepRepr>",
+    ),
+}
+
+
+@pytest.fixture
+def _no_garbage_collection_during_the_test() -> Any:
+    """Keep the garbage collector off while the test runs, then collect.
+
+    For tests that walk values to or near the recursion limit. A collection
+    there runs the finalizers of unrelated objects with little or no stack
+    left; they raise ``RecursionError``, and pytest reports that as a
+    failure of the test.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_UNBUILDABLE_STEP_VALUES))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_step_value_with_no_buildable_stored_form_still_pauses(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """``use`` gets the live value, or after a restore its stored string form."""
+    value, stored = _UNBUILDABLE_STEP_VALUES[name]()
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if kind == "emit" and second == "restored":
+        assert got[0][1] == stored
+    else:
+        assert got[0][1] is value
+
+
+@HOWS
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_its_frames(
+    how: str,
+) -> None:
+    """A frame whose value cannot be rebuilt is malformed; resume ignores the frames."""
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    # A dict keyed by a tuple nested in tuples, past the limit. Its JSON is
+    # built as text, since encoding it would nest past the limit too.
+    depth = sys.getrecursionlimit() * 9 // 10
+    forged = (
+        '{"__crewai_record_dict__": [['
+        + '{"__crewai_record_tuple__": [' * depth
+        + '"k"'
+        + "]}" * depth
+        + ', "x"]]}'
+    )
+    placeholder = "forged frame result"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        # The row is written straight into SQLite: saving it through the
+        # persistence would build its stored form, which nests past the limit.
+        with closing(sqlite3.connect(persistence.db_path)) as conn, conn:
+            (text,) = conn.execute(
+                "SELECT context_json FROM pending_feedback WHERE flow_uuid = ?",
+                (flow_id,),
+            ).fetchone()
+            row = json.loads(text)
+            frames = row["resume_record"]["frames"]
+            assert any(frame["kind"] == "dispatch" for frame in frames)
+            row["resume_record"]["frames"] = [
+                {**frame, "result": placeholder}
+                if frame["kind"] == "dispatch"
+                else frame
+                for frame in frames
+            ]
+            text = json.dumps(row).replace(json.dumps(placeholder), forged)
+            conn.execute(
+                "UPDATE pending_feedback SET context_json = ? WHERE flow_uuid = ?",
+                (text, flow_id),
+            )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# User dicts shaped like the record's dict tag, at other depths and beside a
+# tuple-tag-shaped key: each comes back as that dict, not as a keyed dict.
+_DICT_TAG_SHAPED_STEP_VALUES = {
+    "in_a_list": [{"__crewai_record_dict__": [[1, "v"]]}],
+    "under_an_int_key": {1: {"__crewai_record_dict__": [["k", 2]]}},
+    "with_a_tuple_tag_key": {
+        "__crewai_record_dict__": [[{"__crewai_record_tuple__": ["a", 1]}, "x"]]
+    },
+    "in_a_review_output": {"out": {"__crewai_record_dict__": []}},
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("name", list(_DICT_TAG_SHAPED_STEP_VALUES))
+def test_step_value_shaped_like_the_dict_tag_resumes_as_that_value(
+    name: str, at: str, second: str, how: str
+) -> None:
+    value = _DICT_TAG_SHAPED_STEP_VALUES[name]
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, _ = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [("use", value)]
+    assert repr(before + after) == repr(now)
+
+
+# An earlier review's result passed on across a later review's pause: its
+# output keeps its dict keys after a restore.
+_EARLIER_REVIEW_OUTPUTS = {
+    "tuple_keys": {("a", 1): "v", ("b", None): [1, 2]},
+    "int_keys": {1: "v", 2: {3: "w"}},
+}
+
+
+class _AnsweredAtOnce:
+    """A review answered at once with an empty reply, even in a paused run."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        return ""
+
+
+def _earlier_review_result_beside_a_review(output: Any) -> ShapeFactory:
+    """``first``'s outcome reaches ``use`` with its result after ``draft`` pauses.
+
+    ``zero`` pauses first, so ``draft``'s pause is reached while resuming.
+    ``first`` is answered at once and returns ``output``. ``classify`` routes
+    its outcome to ``draft``, which pauses in that outcome's router loop, so
+    ``use`` gets ``first``'s result from the record.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        class EarlierReview(Flow):
+            @start()
+            @_hf(review, emit=("begin", "stop"))
+            def zero(self):
+                return "Z"
+
+            @listen("begin")
+            @_hf(_AnsweredAtOnce())  # type: ignore[arg-type]
+            def first(self):
+                return output
+
+            @router("approved")
+            def classify(self):
+                return "go"
+
+            @listen("go")
+            @_hf(review, emit=("ok", "no"))
+            def draft(self):
+                return "D"
+
+            @listen("approved")
+            def use(self, result):
+                calls.append(("use", _value(result)))
+
+        return EarlierReview
+
+    return make
+
+
+@HOWS
+@SECONDS
+@pytest.mark.parametrize("name", list(_EARLIER_REVIEW_OUTPUTS))
+def test_earlier_review_result_keeps_its_output_across_a_later_pause(
+    name: str, second: str, how: str
+) -> None:
+    make = _earlier_review_result_beside_a_review(_EARLIER_REVIEW_OUTPUTS[name])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert now == [
+        ("use", ("review", "first", _EARLIER_REVIEW_OUTPUTS[name], "approved"))
+    ]
+    assert paused_for == ["zero", "draft"]
+    assert before == []
+    assert repr(after) == repr(now)
+
+
+# A method that is both a start gated on ``and_("x", "y")`` and a listener on
+# ``"x"``: it runs on ``x`` as a listener and again as a start when ``y`` comes.
+
+
+def test_start_gated_on_and_that_also_listens_runs_for_each_without_a_pause() -> None:
+    calls: list[Any] = []
+
+    class GatedAndListening(Flow):
+        @start()
+        def seed(self):
+            calls.append("seed")
+
+        @router(seed)
+        def r1(self):
+            calls.append("r1")
+            return "x"
+
+        @router("x")
+        def r2(self):
+            calls.append("r2")
+            return "y"
+
+        @start(and_("x", "y"))
+        @listen("x")
+        def m(self):
+            calls.append("m")
+
+    GatedAndListening().kickoff()
+
+    assert calls == ["seed", "r1", "r2", "m", "m"]
+
+
+def _gated_start_that_listens_beside_a_review(at: str) -> ShapeFactory:
+    """``m`` starts on ``and_("x", "y")`` and listens on ``"x"``; ``y`` is ``draft``'s outcome.
+
+    ``draft`` is reviewed on ``x``, so ``m`` runs on ``x`` before the pause and
+    as a start when the review gives ``y``. With ``at="resume"``, ``seed`` runs
+    after a first review is resumed.
+    """
+
+    def make(review: _Review, calls: list[Any]):
+        class AtKickoff(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @router(seed)
+            def r1(self):
+                return "x"
+
+            @listen("x")
+            @_hf(review, emit=("y", "n"))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @start(and_("x", "y"))
+            @listen("x")
+            def m(self):
+                calls.append("m")
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review)
+            def first(self):
+                return "F"
+
+            @listen("approved")
+            def seed(self):
+                calls.append("seed")
+
+            @router(seed)
+            def r1(self):
+                return "x"
+
+            @listen("x")
+            @_hf(review, emit=("y", "n"))
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @start(and_("x", "y"))
+            @listen("x")
+            def m(self):
+                calls.append("m")
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+def test_start_gated_on_and_that_also_listens_resumes_as_answered_at_once(
+    at: str, second: str, how: str
+) -> None:
+    make = _gated_start_that_listens_beside_a_review(at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert sorted(now) == ["draft", "m", "m", "seed"]
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert sorted(before + after) == sorted(now)
+
+
+# An empty outcome label: ``emit=[""]`` with ``default_outcome=""``.
+
+
+def _reviewed_with_an_empty_outcome(role: str) -> ShapeFactory:
+    """``draft`` is reviewed with the single outcome ``""``; ``use`` listens on it."""
+
+    def make(review: _Review, calls: list[Any]):
+        empty_review = human_feedback(
+            message="Review:",
+            emit=[""],
+            llm="gpt-4o-mini",
+            default_outcome="",
+            provider=review,
+        )
+
+        class ReviewedStart(Flow):
+            @start()
+            @empty_review
+            def draft(self):
+                return "D"
+
+            @listen(draft)
+            def use(self, got):
+                calls.append(("use", _value(got)))
+
+        class ReviewedListener(Flow):
+            @start()
+            def seed(self):
+                return "S"
+
+            @listen(seed)
+            @empty_review
+            def draft(self):
+                return "D"
+
+            @listen(draft)
+            def use(self, got):
+                calls.append(("use", _value(got)))
+
+        return ReviewedStart if role == "start" else ReviewedListener
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize("role", ["start", "listener"])
+def test_empty_outcome_reaches_the_reviewed_methods_listeners_after_resume(
+    role: str, how: str
+) -> None:
+    make = _reviewed_with_an_empty_outcome(role)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=True
+        )
+
+    assert now == [("use", "")]
+    assert paused_for == ["draft"]
+    assert before + after == now
+
+
+# Python 3.10 and 3.11 raise RecursionError from json.dumps and str() of deeply
+# nested values, where 3.12+ does not. The pure-Python JSON encoder recurses
+# with the interpreter's limit, as the C encoder does on 3.10 and 3.11; with it
+# and the default limit of 1000, saving a pause meets the same RecursionError.
+
+
+@pytest.fixture
+def _json_encoding_as_on_python_3_10(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import json.encoder
+
+    monkeypatch.setattr(json.encoder, "c_make_encoder", None)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def _int_keys(depth: int) -> tuple[Any, str]:
+    """``{1: {1: ... 1}}`` ``depth`` deep, and its ``str()`` built without recursion."""
+    return _nested(depth, 1, lambda v: {1: v}), "{1: " * depth + "1" + "}" * depth
+
+
+# ``int_keys_350`` (350 deep at the limit of 1000) builds a stored form within
+# the limit (about one frame per level), and that form's JSON (three levels
+# per level) nests past it.
+_DEEP_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "int_keys_350": lambda: _int_keys(sys.getrecursionlimit() * 35 // 100),
+    "deep_dicts": _UNBUILDABLE_STEP_VALUES["deep_dicts"],
+    "deep_repr": _UNBUILDABLE_STEP_VALUES["deep_repr"],
+}
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("kind", ["emit", "plain"])
+@pytest.mark.parametrize("name", list(_DEEP_STEP_VALUES))
+@pytest.mark.usefixtures("_json_encoding_as_on_python_3_10")
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_deep_step_value_pauses_when_its_json_nests_past_the_limit(
+    name: str, kind: str, at: str, second: str, how: str
+) -> None:
+    """The pause saves; after a restore ``use`` gets the value's stored string form."""
+    value, stored = _DEEP_STEP_VALUES[name]()
+    make = _step_value_beside_a_review(value, kind, at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if kind == "emit" and second == "restored":
+        assert got[0][1] == stored
+    else:
+        assert got[0][1] is value
+
+
+# ``and_`` and ``or_`` routers on a reviewed method, its trigger or the method
+# upstream of it. ``draft`` is reviewed twice: answered ``rejected``, which
+# runs it again, then ``approved``. Each paused run gives the same calls as
+# the run answered at once, so each router runs as often.
+
+_LOOP_ANSWERS = ("rejected", "approved")
+
+
+class _ScriptedReview:
+    """Answers the reviews in turn from ``_LOOP_ANSWERS``; pauses for those in ``pause_at``."""
+
+    def __init__(self, pause_at: tuple[int, ...]) -> None:
+        self.pause_at = set(pause_at)
+        self.asked = 0
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        index = self.asked
+        self.asked += 1
+        if index in self.pause_at:
+            raise HumanFeedbackPending(context=context)
+        return _LOOP_ANSWERS[index]
+
+
+def _feedback_as_outcome(
+    self: Flow, feedback: str, outcomes: Any, llm: Any
+) -> str:
+    """The feedback text is the outcome, so no LLM is called."""
+    return feedback.strip()
+
+
+_ROUTER_CONDITIONS: dict[str, Callable[[], Any]] = {
+    "and_upstream": lambda: and_("seed", "draft"),
+    "or_upstream": lambda: or_("seed", "draft"),
+    "and_trigger": lambda: and_("prep", "draft"),
+    "or_trigger": lambda: or_("prep", "draft"),
+    "and_outcome": lambda: and_("draft", "rejected"),
+    "or_outcome": lambda: or_("draft", "rejected"),
+}
+
+
+def _router_on_a_looping_review(role: str, condition: str) -> Callable[..., type[Flow]]:
+    """``gate`` routes on ``condition``; ``draft`` runs again on ``rejected``.
+
+    As a listener ``draft`` listens on ``prep``, which listens on ``seed``; as
+    a start it listens on ``rejected`` only.
+    """
+
+    def make(review: _ScriptedReview, calls: list[Any]) -> type[Flow]:
+        reviewed = human_feedback(
+            message="Review:",
+            emit=list(_LOOP_ANSWERS),
+            llm="gpt-4o-mini",
+            default_outcome="approved",
+            provider=review,
+        )
+
+        class ReviewedListener(Flow):
+            _collapse_to_outcome = _feedback_as_outcome
+
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @listen("seed")
+            def prep(self):
+                calls.append("prep")
+
+            @listen(or_("prep", "rejected"))
+            @reviewed
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @router(_ROUTER_CONDITIONS[condition]())
+            def gate(self):
+                calls.append("gate")
+                return "gated"
+
+            @listen("gated")
+            def after_gate(self):
+                calls.append("after_gate")
+
+            @listen("approved")
+            def done(self):
+                calls.append("done")
+
+        class ReviewedStart(Flow):
+            _collapse_to_outcome = _feedback_as_outcome
+
+            @start()
+            def seed(self):
+                calls.append("seed")
+
+            @listen("seed")
+            def prep(self):
+                calls.append("prep")
+
+            @start()
+            @listen("rejected")
+            @reviewed
+            def draft(self):
+                calls.append("draft")
+                return "D"
+
+            @router(_ROUTER_CONDITIONS[condition]())
+            def gate(self):
+                calls.append("gate")
+                return "gated"
+
+            @listen("gated")
+            def after_gate(self):
+                calls.append("after_gate")
+
+            @listen("approved")
+            def done(self):
+                calls.append("done")
+
+        return ReviewedListener if role == "listener" else ReviewedStart
+
+    return make
+
+
+def _run_scripted(
+    make: Callable[..., type[Flow]],
+    tmpdir: str,
+    how: str,
+    pause_at: tuple[int, ...],
+    restore_each_time: bool,
+) -> tuple[list[Any], list[int]]:
+    """Kick off, then resume each pause with its scripted answer until the run ends.
+
+    Returns the calls and the index of each review paused for. The first
+    resume is on a restored flow; a later one is on a restored flow, or on the
+    flow first restored.
+    """
+    calls: list[Any] = []
+    review = _ScriptedReview(pause_at)
+    flow_cls = make(review, calls)
+    persistence = SQLiteFlowPersistence(
+        os.path.join(tmpdir, f"scripted-{'-'.join(map(str, pause_at))}.db")
+    )
+    out = flow_cls(persistence=persistence).kickoff()
+    paused_for: list[int] = []
+    flow: Flow | None = None
+    for _ in range(5):
+        if not isinstance(out, HumanFeedbackPending):
+            return calls, paused_for
+        paused_for.append(review.asked - 1)
+        if flow is None or restore_each_time:
+            flow = flow_cls.from_pending(out.context.flow_id, persistence)
+        out = _resume(flow, how, _LOOP_ANSWERS[review.asked - 1])
+    raise AssertionError("the run kept pausing")
+
+
+# The reviews paused for, and how a second pause is resumed.
+_LOOP_PAUSES = [
+    ((0,), "restored"),
+    ((1,), "restored"),
+    ((0, 1), "restored"),
+    ((0, 1), "same_instance"),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(
+    ("pause_at", "second"),
+    _LOOP_PAUSES,
+    ids=["first", "second", "both-restored", "both-same_instance"],
+)
+@pytest.mark.parametrize("condition", list(_ROUTER_CONDITIONS))
+@pytest.mark.parametrize("role", ["listener", "start"])
+def test_and_or_router_on_a_looping_review_runs_as_answered_at_once(
+    role: str, condition: str, pause_at: tuple[int, ...], second: str, how: str
+) -> None:
+    make = _router_on_a_looping_review(role, condition)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now, _ = _run_scripted(make, tmpdir, how, (), restore_each_time=True)
+        calls, paused_for = _run_scripted(
+            make, tmpdir, how, pause_at, restore_each_time=second == "restored"
+        )
+
+    # Where the run answered at once reviews ``draft`` once, the second
+    # review is never reached.
+    assert paused_for == [index for index in pause_at if index < now.count("draft")]
+    assert calls.count("gate") == now.count("gate")
+    assert sorted(calls) == sorted(now)
+
+
+# A review queued behind another whose provider gave ``callback_info`` with
+# no faithful JSON form: the pause still saves, and the queued review pauses
+# with the entries that have one and the string form of the others.
+
+
+def _callback_info(kind: str) -> dict[str, Any]:
+    if kind == "cyclic":
+        cycle: dict[str, Any] = {}
+        cycle["self"] = cycle
+        return {"ticket": "T", "extra": cycle}
+    if kind == "deep":
+        return {"ticket": "T", "extra": _nested(_past_the_limit(), 1, lambda v: {"k": v})}
+    return {"ticket": "T", "extra": _OPAQUE}
+
+
+class _InfoReview:
+    """Pause for review; ``other``'s pause gives ``info`` as its callback info."""
+
+    def __init__(self, info: dict[str, Any]) -> None:
+        self.info = info
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        info = self.info if context.method_name == "other" else {"ticket": "T-draft"}
+        raise HumanFeedbackPending(context=context, callback_info=info)
+
+
+def _failing_on_recursion(run: Callable[[], Any]) -> Any:
+    """``run()``; a ``RecursionError`` fails the test with its message only.
+
+    Its traceback is too deep for pytest to report within the test timeout,
+    so the failure is raised outside the handler, with no exception context.
+    """
+    try:
+        return run()
+    except RecursionError as error:
+        message = f"raised {error!r}"
+    pytest.fail(message, pytrace=False)
+
+
+@HOWS
+@pytest.mark.parametrize("kind", ["cyclic", "deep", "opaque"])
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_queued_review_with_callback_info_without_a_json_form_still_pauses(
+    kind: str, how: str
+) -> None:
+    calls: list[Any] = []
+    signal = _SignalledReview(_InfoReview(_callback_info(kind)))  # type: ignore[arg-type]
+
+    class Queued(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+        @listen("approved")
+        def publish(self, value):
+            calls.append(("publish", _value(value)))
+
+        @listen("ok")
+        def fin(self, value):
+            calls.append(("fin", _value(value)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = _failing_on_recursion(Queued(persistence=persistence).kickoff)
+        assert isinstance(first, HumanFeedbackPending)
+        flow_id = first.context.flow_id
+        assert first.context.method_name == "draft"
+        assert persistence.load_pending_feedback(flow_id) is not None
+        second = _failing_on_recursion(
+            lambda: _resume(Queued.from_pending(flow_id, persistence), how)
+        )
+        assert isinstance(second, HumanFeedbackPending)
+        assert second.context.method_name == "other"
+        out = _failing_on_recursion(
+            lambda: _resume(Queued.from_pending(flow_id, persistence), how)
+        )
+
+    info = second.callback_info
+    assert isinstance(info, dict)
+    assert info["ticket"] == "T"
+    assert isinstance(info["extra"], str)
+    if kind == "opaque":
+        assert info["extra"] == "opaque"
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish", "fin") == [
+        ("fin", ("review", "other", "O", "ok")),
+        ("publish", ("review", "draft", "D", "approved")),
+    ]
+
+
+# A saved record whose join and ``or_`` bookkeeping lists hold values that
+# cannot be set members is malformed: resume goes on as for a row without it.
+_UNHASHABLE_BOOKKEEPING: dict[str, tuple[str, Any]] = {
+    "pending_events_dict_member": ("pending_events", {"draft": [{}]}),
+    "pending_events_list_member": ("pending_events", {"draft": [["seed"]]}),
+    "fired_or_listeners_dict_member": ("fired_or_listeners", [{}]),
+    "fired_or_listeners_list_member": ("fired_or_listeners", [["audit"]]),
+    "completed_methods_dict_member": ("completed_methods", [{}]),
+    "completed_methods_list_member": ("completed_methods", [["seed"]]),
+}
+
+
+@HOWS
+@pytest.mark.parametrize("name", list(_UNHASHABLE_BOOKKEEPING))
+def test_record_with_unhashable_bookkeeping_resumes_as_a_row_without_it(
+    name: str, how: str
+) -> None:
+    key, broken = _UNHASHABLE_BOOKKEEPING[name]
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        assert isinstance(ctx.resume_record, dict)
+        assert key in ctx.resume_record
+        ctx.resume_record = {**ctx.resume_record, key: broken}
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+        calls.clear()
+
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# Queued reviews' callback info with keys JSON has no form for, and a queued
+# review raised again from the live queue on the same instance.
+_KEYED_CALLBACK_INFO: dict[str, tuple[dict[Any, Any], dict[str, Any]]] = {
+    "tuple_keyed_entry": (
+        {"ticket": "T", "extra": {(1,): "x"}},
+        {"ticket": "T", "extra": "{(1,): 'x'}"},
+    ),
+    "tuple_key": ({"ticket": "T", ("k",): "v"}, {"ticket": "T", "('k',)": "v"}),
+}
+
+
+@HOWS
+@pytest.mark.parametrize("kind", list(_KEYED_CALLBACK_INFO))
+def test_queued_review_with_callback_info_keys_without_a_json_form_still_pauses(
+    kind: str, how: str
+) -> None:
+    """The pause saves; the queued review pauses with those keys' string forms."""
+    given, stored = _KEYED_CALLBACK_INFO[kind]
+    signal = _SignalledReview(_InfoReview(given))  # type: ignore[arg-type]
+
+    class Queued(Flow):
+        @start()
+        @_hf_signalled(signal)
+        def draft(self):
+            return "D"
+
+        @start()
+        @_hf_signalled(signal, ("ok", "no"))
+        def other(self):
+            _after_the_review(signal)
+            return "O"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = Queued(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        assert first.context.method_name == "draft"
+        second = _resume(Queued.from_pending(first.context.flow_id, persistence), how)
+
+    assert isinstance(second, HumanFeedbackPending)
+    assert second.context.method_name == "other"
+    assert second.callback_info == stored
+
+
+class _TicketsReview:
+    """Pause for review, giving ``T-<method>`` as the callback info's ticket."""
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": f"T-{context.method_name}"}
+        )
+
+
+@HOWS
+def test_queued_review_raised_again_on_the_same_instance_keeps_its_callback_info(
+    how: str,
+) -> None:
+    """``x`` and ``y`` pause together during a resume; the one queued keeps its ticket."""
+    calls: list[Any] = []
+    review = _TicketsReview()
+
+    class TwoLater(Flow):
+        @start()
+        @human_feedback(message="Review:", provider=review)
+        def draft(self):
+            return "D"
+
+        @listen("draft")
+        @human_feedback(message="Review:", provider=review)
+        def x(self):
+            return "X"
+
+        @listen("draft")
+        @human_feedback(message="Review:", provider=review)
+        def y(self):
+            return "Y"
+
+        @listen("x")
+        def after_x(self):
+            calls.append("after_x")
+
+        @listen("y")
+        def after_y(self):
+            calls.append("after_y")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        first = TwoLater(persistence=persistence).kickoff()
+        assert isinstance(first, HumanFeedbackPending)
+        assert first.context.method_name == "draft"
+        flow = TwoLater.from_pending(first.context.flow_id, persistence)
+        second = _resume(flow, how)
+        assert isinstance(second, HumanFeedbackPending)
+        third = _resume(flow, how)
+        assert isinstance(third, HumanFeedbackPending)
+        out = _resume(flow, how)
+
+    pauses = sorted(
+        (pause.context.method_name, pause.callback_info) for pause in (second, third)
+    )
+    assert pauses == [("x", {"ticket": "T-x"}), ("y", {"ticket": "T-y"})]
+    assert not isinstance(out, HumanFeedbackPending)
+    assert sorted(calls) == ["after_x", "after_y"]
+
+
+# A queued review whose reviewed output has no JSON form: a tuple key, an
+# object key, a cycle, or nesting past the recursion limit. Each entry builds
+# the output, its string form, and whether a restore can give it back equal.
+_QUEUED_OUTPUTS: dict[str, Callable[[], tuple[Any, str, bool]]] = {
+    "plain": lambda: ("O", "O", True),
+    "tuple_key": lambda: ({("a", "b"): 1}, "{('a', 'b'): 1}", True),
+    "object_key": lambda: ({_OPAQUE: 1}, "{_Opaque(): 1}", False),
+    "cyclic": lambda: (_CYCLIC_DICT, "{'k': 1, 'self': {...}}", False),
+    "deep": lambda: (*_deep_dicts(_past_the_limit()), False),
+}
+
+
+def _queued_output_beside_a_review(output: Any, at: str) -> Callable[..., type[Flow]]:
+    """``draft`` and ``other`` pause together; ``other``, which returns ``output``, is queued.
+
+    ``other`` completes after ``draft``'s review is requested. With
+    ``at="kickoff"`` both are starts; with ``at="resume"`` both listen on the
+    outcome of ``first``'s review, so they pause while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _Review(pause=True)
+        signal = _SignalledReview(review)
+
+        class AtKickoff(Flow):
+            @start()
+            @_hf_signalled(signal)
+            def draft(self):
+                return "D"
+
+            @start()
+            @_hf(review, ("ok", "no"))
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review, ("go", "stop"))
+            def first(self):
+                return "F"
+
+            @listen("go")
+            @_hf_signalled(signal)
+            def draft(self):
+                return "D"
+
+            @listen("go")
+            @_hf(review, ("ok", "no"))
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("approved")
+            def publish(self, value):
+                calls.append(("publish", _value(value)))
+
+            @listen("ok")
+            def fin(self, value):
+                calls.append(("fin", _value(value)))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES + [("kickoff", "same_instance")])
+@pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_queued_review_with_output_without_a_json_form_still_pauses(
+    name: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row, and ``fin`` gets ``other``'s output as documented.
+
+    That is the live output, the output given back equal by a restore where it
+    has a faithful stored form, or its string form.
+    """
+    output, stored, faithful = _QUEUED_OUTPUTS[name]()
+    calls: list[Any] = []
+    flow_cls = _queued_output_beside_a_review(output, at)(calls)
+    expected = ["draft", "other"] if at == "kickoff" else ["first", "draft", "other"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        flow_id = out.context.flow_id
+        paused_for = [out.context.method_name]
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == paused_for[-1]
+            out = _failing_on_recursion(lambda: _resume(flow, how))  # noqa: B023
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            paused_for.append(out.context.method_name)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert paused_for == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert _calls_of(calls, "publish") == [
+        ("publish", ("review", "draft", "D", "approved"))
+    ]
+    fins = _calls_of(calls, "fin")
+    assert len(fins) == 1
+    _, (kind, method, got, outcome) = fins[0]
+    assert (kind, method, outcome) == ("review", "other", "ok")
+    assert (
+        got is output
+        or (isinstance(got, str) and got == stored)
+        or (faithful and type(got) is type(output) and repr(got) == repr(output))
+    ), f"fin got {type(got).__name__}"
+
+
+class _MetadataReview:
+    """Pause for review, putting ``extra`` in the context's metadata when given."""
+
+    def __init__(self, extra: Any) -> None:
+        self.extra = extra
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if self.extra is not None:
+            context.metadata = {**context.metadata, "extra": self.extra}
+        raise HumanFeedbackPending(context=context)
+
+
+def _pending_value_under_review(value: Any, field: str, at: str) -> Callable[..., type[Flow]]:
+    """``draft`` is reviewed alone; ``value`` is its output or its metadata's ``extra``.
+
+    The decorator's metadata is stored in its JSON form when the flow is
+    defined, so the provider puts ``value`` in the context's metadata. With
+    ``at="kickoff"`` ``draft`` is a start; with ``at="resume"`` it listens on
+    the outcome of ``first``'s review, so it pauses while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _Review(pause=True)
+        reviewed = human_feedback(
+            message="Review:",
+            emit=["ok", "no"],
+            llm="gpt-4o-mini",
+            default_outcome="ok",
+            provider=_MetadataReview(value if field == "metadata" else None),
+        )
+        output = value if field == "output" else "D"
+
+        class AtKickoff(Flow):
+            @start()
+            @reviewed
+            def draft(self):
+                return output
+
+            @listen("ok")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        class AtResume(Flow):
+            @start()
+            @_hf(review, ("go", "stop"))
+            def first(self):
+                return "F"
+
+            @listen("go")
+            @reviewed
+            def draft(self):
+                return output
+
+            @listen("ok")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+@pytest.mark.parametrize("field", ["output", "metadata"])
+@pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_pending_review_with_a_value_without_a_json_form_still_pauses(
+    name: str, field: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row, and ``fin`` gets ``draft``'s value as documented.
+
+    That is the live value, the value given back equal by a restore where it
+    has a faithful stored form, or its string form.
+    """
+    value, stored, faithful = _QUEUED_OUTPUTS[name]()
+    calls: list[Any] = []
+    flow_cls = _pending_value_under_review(value, field, at)(calls)
+    expected = ["draft"] if at == "kickoff" else ["first", "draft"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        flow_id = out.context.flow_id
+        paused_for = [out.context.method_name]
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == paused_for[-1]
+            out = _failing_on_recursion(lambda: _resume(flow, how))  # noqa: B023
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            paused_for.append(out.context.method_name)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert paused_for == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert len(calls) == 1
+    result = calls[0][1]
+    assert isinstance(result, HumanFeedbackResult)
+    assert (result.method_name, result.outcome) == ("draft", "ok")
+    if field == "output":
+        got = result.output
+    else:
+        assert isinstance(result.metadata, dict)
+        assert list(result.metadata) == ["extra"]
+        got = result.metadata["extra"]
+    assert (
+        got is value
+        or (isinstance(got, str) and got == stored)
+        or (faithful and type(got) is type(value) and repr(got) == repr(value))
+    ), f"fin got {type(got).__name__}"
+
+
+# Values whose conversion raises an exception other than a type, value or
+# recursion error: a string form that raises, and a dataclass whose copy
+# raises. The pause still saves, with the string form, or the type's name in
+# angle brackets when that raises too.
+class _RaisingStr:
+    def __str__(self) -> str:
+        raise RuntimeError("no string form")
+
+    __repr__ = __str__
+
+
+class _NoCopy:
+    def __deepcopy__(self, memo: Any) -> Any:
+        raise RuntimeError("no copy")
+
+
+@dataclasses.dataclass
+class _HoldsNoCopy:
+    item: Any
+
+
+_RAISING_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "plain": lambda: ("P", "P"),
+    "raising_str": lambda: (_RaisingStr(), "<_RaisingStr>"),
+    "dataclass_no_copy": lambda: (
+        (held := _HoldsNoCopy(_NoCopy())),
+        str(held),
+    ),
+}
+
+
+class _QueuedValuesReview:
+    """Pause for review; ``other``'s pause carries ``extra`` in its metadata and info."""
+
+    def __init__(self, extra: Any, field: str) -> None:
+        self.extra = extra
+        self.field = field
+
+    def request_feedback(self, context: PendingFeedbackContext, flow: Flow) -> str:
+        if context.method_name != "other" or self.field == "output":
+            raise HumanFeedbackPending(context=context)
+        if self.field == "metadata":
+            context.metadata = {**context.metadata, "extra": self.extra}
+            raise HumanFeedbackPending(context=context)
+        raise HumanFeedbackPending(
+            context=context, callback_info={"ticket": "T", "extra": self.extra}
+        )
+
+
+def _queued_value_beside_a_review(
+    value: Any, field: str, at: str
+) -> Callable[..., type[Flow]]:
+    """``draft`` and ``other`` pause together; ``other`` is queued with ``value``.
+
+    ``value`` is ``other``'s output, an entry of its metadata or of its
+    callback info. Both are reviewed without ``emit``: a review with ``emit``
+    runs as a router, one at a time. With ``at="kickoff"`` both are starts;
+    with ``at="resume"`` both listen on ``first``, so they pause together
+    while a resumed run goes on.
+    """
+
+    def make(calls: list[Any]) -> type[Flow]:
+        review = _QueuedValuesReview(value, field)
+        signal = _SignalledReview(review)  # type: ignore[arg-type]
+        signalled = human_feedback(message="Review:", provider=signal)
+        plain = human_feedback(message="Review:", provider=review)
+        output = value if field == "output" else "O"
+
+        class AtKickoff(Flow):
+            @start()
+            @signalled
+            def draft(self):
+                return "D"
+
+            @start()
+            @plain
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("other")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        class AtResume(Flow):
+            @start()
+            @plain
+            def first(self):
+                return "F"
+
+            @listen("first")
+            @signalled
+            def draft(self):
+                return "D"
+
+            @listen("first")
+            @plain
+            def other(self):
+                _after_the_review(signal)
+                return output
+
+            @listen("other")
+            def fin(self, result):
+                calls.append(("fin", result))
+
+        return AtKickoff if at == "kickoff" else AtResume
+
+    return make
+
+
+_QUEUED_RAISING = [
+    ("plain", "output"),
+    ("plain", "metadata"),
+    ("plain", "callback_info"),
+    ("raising_str", "output"),
+    ("raising_str", "metadata"),
+    ("raising_str", "callback_info"),
+    ("dataclass_no_copy", "output"),
+]
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES + [("kickoff", "same_instance")])
+@pytest.mark.parametrize(("name", "field"), _QUEUED_RAISING)
+def test_queued_review_with_a_value_whose_conversion_raises_still_pauses(
+    name: str, field: str, at: str, second: str, how: str
+) -> None:
+    """Each pause saves its row; ``other``'s value comes back live or as its string form."""
+    value, stored = _RAISING_VALUES[name]()
+    calls: list[Any] = []
+    flow_cls = _queued_value_beside_a_review(value, field, at)(calls)
+    expected = ["draft", "other"] if at == "kickoff" else ["first", "draft", "other"]
+    pauses: list[HumanFeedbackPending] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(out, HumanFeedbackPending)
+        pauses.append(out)
+        flow_id = out.context.flow_id
+        flow = flow_cls.from_pending(flow_id, persistence)
+        for _ in range(len(expected)):
+            row = persistence.load_pending_feedback(flow_id)
+            assert row is not None
+            assert row[1].method_name == pauses[-1].context.method_name
+            out = _resume(flow, how)
+            if not isinstance(out, HumanFeedbackPending):
+                break
+            pauses.append(out)
+            if second == "restored":
+                flow = flow_cls.from_pending(flow_id, persistence)
+
+    assert [p.context.method_name for p in pauses] == expected
+    assert not isinstance(out, HumanFeedbackPending)
+    assert len(calls) == 1
+    result = calls[0][1]
+    assert isinstance(result, HumanFeedbackResult)
+    assert result.method_name == "other"
+    if field == "output":
+        got = result.output
+    elif field == "metadata":
+        got = result.metadata.get("extra")
+    else:
+        info = pauses[-1].callback_info
+        assert isinstance(info, dict)
+        assert info.get("ticket") == "T"
+        got = info.get("extra")
+    assert got is value or (isinstance(got, str) and got == stored), (
+        f"got {type(got).__name__}"
+    )
+
+
+@HOWS
+@pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
+def test_step_value_whose_copy_raises_still_pauses(at: str, second: str, how: str) -> None:
+    """``use`` gets the live dataclass, or after a restore its string form."""
+    value, stored = _RAISING_VALUES["dataclass_no_copy"]()
+    make = _step_value_beside_a_review(value, "emit", at)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        before, after, paused_for = _run_every_pause(
+            make, tmpdir, how, restore_each_time=second == "restored"
+        )
+
+    assert paused_for == (["draft"] if at == "kickoff" else ["first", "draft"])
+    assert len(now) == 1
+    assert now[0][1] is value
+    got = [c for c in before + after if c[0] == "use"]
+    assert len(got) == 1
+    if second == "restored":
+        assert got[0][1] == stored
+    else:
+        assert got[0][1] is value
+
+
+# A restored run paused again while a frame carried over from the first pause
+# still holds a deep step value in its stored form. The re-pause saves that
+# form as it is; with the native JSON encoder and the default limit of 1000,
+# ``int_keys_350`` is built and encoded at kickoff, and the second save must
+# hold it too. ``shallow`` is a guard.
+
+
+@pytest.fixture
+def _recursion_limit_of_1000() -> Any:
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+_WAITING_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
+    "shallow": lambda: _int_keys(10),
+    "int_keys_350": _DEEP_STEP_VALUES["int_keys_350"],
+}
+
+
+def _deep_value_waiting_while_a_second_review_pauses(value: Any) -> ShapeFactory:
+    """``draft`` and ``beside`` listen on ``seed``; ``second`` reviews after ``draft``."""
+
+    def make(review: _Review, calls: list[Any]):
+        class DeepValueWaiting(Flow):
+            @start()
+            def seed(self):
+                calls.append("seed")
+                return value
+
+            @listen(seed)
+            @_hf(review)
+            def draft(self, _):
+                calls.append("draft")
+                return "D"
+
+            @listen(seed)
+            def beside(self, _):
+                calls.append("beside")
+
+            @listen(draft)
+            @_hf(review)
+            def second(self, _):
+                calls.append("second")
+                return "S"
+
+            @listen("approved")
+            def publish(self, result):
+                calls.append(("publish", _value(result)))
+
+        return DeepValueWaiting
+
+    return make
+
+
+@HOWS
+@pytest.mark.parametrize("name", list(_WAITING_STEP_VALUES))
+@pytest.mark.usefixtures("_recursion_limit_of_1000")
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_restored_run_paused_again_with_a_deep_value_waiting_saves_the_pause(
+    name: str, how: str
+) -> None:
+    """The second pause saves its row; the run makes the calls it makes at once."""
+    value, _ = _WAITING_STEP_VALUES[name]()
+    make = _deep_value_waiting_while_a_second_review_pauses(value)
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        now = _run_at_once(make, tmpdir)
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        out = _failing_on_recursion(flow_cls(persistence=persistence).kickoff)
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "draft"
+        flow_id = out.context.flow_id
+
+        restored = flow_cls.from_pending(flow_id, persistence)
+        out = _failing_on_recursion(lambda: _resume(restored, how))
+        assert isinstance(out, HumanFeedbackPending)
+        assert out.context.method_name == "second"
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].method_name == "second"
+
+        restored = flow_cls.from_pending(flow_id, persistence)
+        out = _failing_on_recursion(lambda: _resume(restored, how))
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert sorted(calls, key=repr) == sorted(now, key=repr)
+    assert calls.count("second") == 1
+
+
+@HOWS
+def test_pending_row_whose_record_has_no_json_form_saves_without_the_record(
+    how: str,
+) -> None:
+    """The row is saved and resumes as a row without a record.
+
+    The record's own key has no JSON form, so no value's string form makes
+    it encode.
+    """
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        saved = ctx.to_dict()
+        ctx.resume_record = {**(ctx.resume_record or {}), _OPAQUE: 1}
+
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].resume_record is None
+        assert {k: v for k, v in row[1].to_dict().items() if k != "resume_record"} == {
+            k: v for k, v in saved.items() if k != "resume_record"
+        }
+        calls.clear()
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+@HOWS
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_pending_row_whose_record_has_a_cyclic_and_a_deep_entry_keeps_the_record(
+    how: str,
+) -> None:
+    """The record is kept with each of those entries as its one string form.
+
+    Its other entries are saved as they were, and the run resumes from it.
+    """
+    cyclic, cyclic_stored = _UNBUILDABLE_STEP_VALUES["cyclic_dict"]()
+    deep, deep_stored = _UNBUILDABLE_STEP_VALUES["deep_dicts"]()
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        saved = ctx.to_dict()
+        assert isinstance(saved["resume_record"], dict)
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "cyclic": cyclic,
+            "deep": deep,
+        }
+
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].resume_record == {
+            **saved["resume_record"],
+            "cyclic": cyclic_stored,
+            "deep": deep_stored,
+        }
+        assert {k: v for k, v in row[1].to_dict().items() if k != "resume_record"} == {
+            k: v for k, v in saved.items() if k != "resume_record"
+        }
+        calls.clear()
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
+# A record whose frames are malformed counts as absent, bookkeeping and queued
+# reviews with it. ``plain_listener`` restores join progress from its
+# bookkeeping; ``two_starts`` holds ``other``'s review queued behind ``draft``.
+_SHAPES_WITH_A_RECORD: dict[str, ShapeFactory] = {
+    "plain_listener": _ch7_review_under_a_plain_listener,
+    "two_starts": _two_reviewed_starts("other"),
+}
+_MALFORMED_FRAMES: dict[str, Any] = {
+    "not_a_list": "x",
+    "an_entry_of_another_type": [7],
+    "a_dispatch_frame_with_only_its_kind": [{"kind": "dispatch"}],
+}
+
+
+def _resume_with_record(
+    make: ShapeFactory, tmpdir: str, how: str, frames: Any
+) -> tuple[list[str], list[str]]:
+    """Kick off, set the row's frames (``None``: drop the record), resume to the end.
+
+    Returns the reviewed method of each later pause and the calls after the
+    first, each by its ``repr``, sorted.
+    """
+    calls: list[Any] = []
+    flow_cls = make(_Review(pause=True), calls)
+    persistence = SQLiteFlowPersistence(os.path.join(tmpdir, f"{len(os.listdir(tmpdir))}.db"))
+    out = flow_cls(persistence=persistence).kickoff()
+    assert isinstance(out, HumanFeedbackPending)
+    flow_id = out.context.flow_id
+    state, ctx = persistence.load_pending_feedback(flow_id)
+    assert isinstance(ctx.resume_record, dict)
+    ctx.resume_record = (
+        None if frames is None else {**ctx.resume_record, "frames": frames}
+    )
+    persistence.save_pending_feedback(flow_uuid=flow_id, context=ctx, state_data=state)
+    calls.clear()
+    paused_for: list[str] = []
+    for _ in range(5):
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+        if not isinstance(out, HumanFeedbackPending):
+            return paused_for, sorted(map(repr, calls))
+        paused_for.append(out.context.method_name)
+    raise AssertionError("the run kept pausing")
+
+
+@HOWS
+@pytest.mark.parametrize("frames", list(_MALFORMED_FRAMES))
+@pytest.mark.parametrize("shape", list(_SHAPES_WITH_A_RECORD))
+def test_record_with_malformed_frames_resumes_as_a_row_without_the_record(
+    shape: str, frames: str, how: str
+) -> None:
+    make = _SHAPES_WITH_A_RECORD[shape]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        without = _resume_with_record(make, tmpdir, how, None)
+        got = _resume_with_record(make, tmpdir, how, _MALFORMED_FRAMES[frames])
+
+    assert got == without

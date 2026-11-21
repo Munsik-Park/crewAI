@@ -13,9 +13,11 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
 import copy
+import dataclasses
 from datetime import datetime, timezone
 import enum
 import inspect
+import json
 import logging
 from pathlib import Path
 import threading
@@ -28,6 +30,7 @@ from typing import (
     Literal,
     ParamSpec,
     TypeVar,
+    TypedDict,
     cast,
 )
 from uuid import uuid4
@@ -47,6 +50,7 @@ from pydantic import (
 from pydantic._internal._model_construction import ModelMetaclass
 from rich.console import Console
 from rich.panel import Panel
+from typing_extensions import NotRequired
 
 from crewai.events.base_events import reset_emission_counter
 from crewai.events.event_bus import crewai_event_bus
@@ -87,7 +91,10 @@ from crewai.execution import (
 from crewai.flow.async_feedback.types import (
     HumanFeedbackPending,
     HumanFeedbackProvider,
+    LiveRecordValue,
     PendingFeedbackContext,
+    _json_safe_entries,
+    _string_form,
 )
 from crewai.flow.dsl._utils import build_flow_definition
 from crewai.flow.flow_context import (
@@ -340,6 +347,433 @@ def _serialize_input_provider(value: Any) -> str | None:
     from crewai.types.callback import _instance_to_dotted_path
 
     return _instance_to_dotted_path(value)
+
+
+_FEEDBACK_RESULT_TAG = "__crewai_human_feedback_result__"
+_RECORD_LITERAL_TAG = "__crewai_record_literal__"
+_RECORD_DICT_TAG = "__crewai_record_dict__"
+_RECORD_TUPLE_TAG = "__crewai_record_tuple__"
+_RECORD_TAGS = frozenset(
+    {_FEEDBACK_RESULT_TAG, _RECORD_LITERAL_TAG, _RECORD_DICT_TAG, _RECORD_TUPLE_TAG}
+)
+
+
+class _DispatchPosition(TypedDict):
+    """The part of a dispatch position kept the same in its saved form."""
+
+    trigger_method: str
+    result: Any
+    current_trigger: str
+    router_results: list[str]
+    payloads: dict[str, Any]
+    feedback: dict[str, Any]
+    batch: list[str] | None
+    trigger_index: int
+    stage: Literal["listeners", "starts"]
+    started: list[str]
+    rearm_first: bool
+
+
+class _DispatchStateKeys(_DispatchPosition):
+    ran: dict[str, set[str]]
+    rearmable: set[FlowMethodName] | None
+
+
+class _DispatchState(_DispatchStateKeys, total=False):
+    """A running dispatch's position.
+
+    ``batch`` holds the routers of the current trigger not yet finished,
+    ``trigger_index`` the trigger whose listeners run next, and ``stage``
+    whether that trigger's listeners or only its gated starts remain.
+    ``started`` holds the starts whose condition was already checked for that
+    trigger. ``rearmable`` is ``None`` until the router phase has ended.
+    ``ran`` holds the methods already run per trigger, so a
+    conditional start that also listens to the same event is not run a second
+    time. ``inflight_result`` is the result of the first router in ``batch``
+    when it has already returned.
+    """
+
+    inflight_result: str | None
+
+
+class _DispatchFrameKeys(_DispatchPosition):
+    kind: Literal["dispatch"]
+    ran: dict[str, list[str]]
+    rearmable: list[str] | None
+
+
+class _DispatchFrame(_DispatchFrameKeys, total=False):
+    """A dispatch position as saved in a pending context's record."""
+
+    inflight_result: str | None
+
+
+class _StartOutcomeFrame(TypedDict):
+    """A router start's outcome still to be dispatched, as saved in a record."""
+
+    kind: Literal["start_outcome"]
+    result: str | None
+    rearm_first: NotRequired[bool]
+
+
+_RecordFrame = _DispatchFrame | _StartOutcomeFrame
+
+_DISPATCH_FRAME_KEYS = _DispatchFrame.__required_keys__
+
+
+def _router_outcome(value: Any) -> str | None:
+    """The event a router's return value triggers: its ``Enum`` value or string."""
+    if value is None:
+        return None
+    return str(value.value if isinstance(value, enum.Enum) else value)
+
+
+def _is_tagged(value: Any, tag: str) -> bool:
+    return isinstance(value, dict) and set(value) == {tag}
+
+
+class _NoStoredForm(Exception):  # noqa: N818 - control flow inside the encoder
+    """A dict key that neither JSON nor the record's tagged forms can hold."""
+
+
+def _stored_key(key: Any) -> Any:
+    """A dict key as a JSON value: a scalar as is, a tuple under its tag."""
+    if key is None or isinstance(key, (str, int, float, bool)):
+        return key
+    if isinstance(key, tuple):
+        return {_RECORD_TUPLE_TAG: [_stored_key(item) for item in key]}
+    raise _NoStoredForm
+
+
+def _stored_form(value: Any) -> Any:
+    """``value`` as JSON values, with tags for what plain JSON would change.
+
+    A ``HumanFeedbackResult``, a dict with keys other than strings and a dict
+    whose only key is one of the tags each go under a tag. Lists and tuples
+    become lists; other values take their JSON-safe form.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, HumanFeedbackResult):
+        return {
+            _FEEDBACK_RESULT_TAG: {
+                "output": _stored_form(value.output),
+                "feedback": value.feedback,
+                "outcome": value.outcome,
+                "timestamp": value.timestamp.isoformat(),
+                "method_name": value.method_name,
+                "metadata": _stored_form(value.metadata),
+            }
+        }
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            items = {key: _stored_form(item) for key, item in value.items()}
+            if len(items) == 1 and next(iter(items)) in _RECORD_TAGS:
+                return {_RECORD_LITERAL_TAG: items}
+            return items
+        return {
+            _RECORD_DICT_TAG: [
+                [_stored_key(key), _stored_form(item)] for key, item in value.items()
+            ]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stored_form(item) for item in value]
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _stored_form(dataclasses.asdict(value))
+    return _string_form(value)
+
+
+def _stored_record_value(value: Any) -> Any:
+    """The form a record value is saved in; its string form when it has none.
+
+    A cycle, nesting past the recursion limit, a stored form whose JSON
+    encoding nests past that limit, or any error raised while the form is
+    built or encoded also leaves no stored form. The JSON encoding is tried
+    here, where the call stack already holds the levels of the record around
+    the value.
+    """
+    try:
+        stored = _stored_form(value)
+        json.dumps(stored, default=str)
+    except Exception:
+        return _string_form(value)
+    return stored
+
+
+def _encode_record_value(value: Any) -> LiveRecordValue:
+    """Hold a value in a record as it is; the saved row gets its stored form."""
+    return LiveRecordValue(value, _stored_record_value)
+
+
+def _restored_key(key: Any) -> Any:
+    if _is_tagged(key, _RECORD_TUPLE_TAG) and isinstance(key[_RECORD_TUPLE_TAG], list):
+        return tuple(_restored_key(item) for item in key[_RECORD_TUPLE_TAG])
+    return key
+
+
+def _restored_feedback_result(fields: Any) -> HumanFeedbackResult | None:
+    if not isinstance(fields, dict):
+        return None
+    try:
+        return HumanFeedbackResult(
+            output=_decode_record_value(fields.get("output")),
+            feedback=str(fields.get("feedback", "")),
+            outcome=fields.get("outcome"),
+            timestamp=datetime.fromisoformat(str(fields.get("timestamp"))),
+            method_name=str(fields.get("method_name", "")),
+            metadata=dict(_decode_record_value(fields.get("metadata")) or {}),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_record_value(value: Any) -> Any:
+    """A record value as it was: held as is, or rebuilt from its stored form.
+
+    A tagged form that is malformed is returned as stored.
+    """
+    if isinstance(value, LiveRecordValue):
+        return value.value
+    if isinstance(value, list):
+        return [_decode_record_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if _is_tagged(value, _RECORD_LITERAL_TAG) and isinstance(
+        value[_RECORD_LITERAL_TAG], dict
+    ):
+        return {
+            key: _decode_record_value(item)
+            for key, item in value[_RECORD_LITERAL_TAG].items()
+        }
+    if _is_tagged(value, _FEEDBACK_RESULT_TAG):
+        result = _restored_feedback_result(value[_FEEDBACK_RESULT_TAG])
+        return value if result is None else result
+    if _is_tagged(value, _RECORD_DICT_TAG):
+        pairs = value[_RECORD_DICT_TAG]
+        if not (
+            isinstance(pairs, list)
+            and all(isinstance(pair, list) and len(pair) == 2 for pair in pairs)
+        ):
+            return value
+        try:
+            return {
+                _restored_key(key): _decode_record_value(item) for key, item in pairs
+            }
+        except TypeError:
+            return value
+    return {key: _decode_record_value(item) for key, item in value.items()}
+
+
+def _is_str_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_valid_bookkeeping(record: dict[str, Any]) -> bool:
+    """Whether the join and ``or_`` bookkeeping a record saved lists method names."""
+    pending = record.get("pending_events", {})
+    return (
+        isinstance(pending, dict)
+        and all(_is_str_list(seen) for seen in pending.values())
+        and _is_str_list(record.get("fired_or_listeners", []))
+        and _is_str_list(record.get("completed_methods", []))
+    )
+
+
+def _is_valid_frame(frame: Any) -> bool:
+    """Whether a recorded dispatch frame has every field, each of its type."""
+    if not isinstance(frame, dict):
+        return False
+    if frame.get("kind") == "start_outcome":
+        return isinstance(frame.get("result"), str) and isinstance(
+            frame.get("rearm_first", False), bool
+        )
+    if frame.get("kind") != "dispatch" or not _DISPATCH_FRAME_KEYS <= frame.keys():
+        return False
+    ran = frame["ran"]
+    trigger_index = frame["trigger_index"]
+    inflight = frame.get("inflight_result")
+    return (
+        isinstance(frame["trigger_method"], str)
+        and isinstance(frame["current_trigger"], str)
+        and _is_str_list(frame["router_results"])
+        and isinstance(frame["payloads"], dict)
+        and isinstance(frame["feedback"], dict)
+        and isinstance(ran, dict)
+        and all(_is_str_list(names) for names in ran.values())
+        and (frame["batch"] is None or _is_str_list(frame["batch"]))
+        and (frame["rearmable"] is None or _is_str_list(frame["rearmable"]))
+        and isinstance(trigger_index, int)
+        and not isinstance(trigger_index, bool)
+        and 0 <= trigger_index <= len(frame["router_results"]) + 1
+        and frame["stage"] in ("listeners", "starts")
+        and _is_str_list(frame["started"])
+        and isinstance(frame["rearm_first"], bool)
+        and (inflight is None or isinstance(inflight, str))
+    )
+
+
+def _is_rebuildable_frame(frame: _RecordFrame) -> bool:
+    """Whether a frame's values rebuild without exceeding the recursion limit."""
+    if frame["kind"] != "dispatch":
+        return True
+    try:
+        _dispatch_state(frame)
+    except RecursionError:
+        return False
+    return True
+
+
+def _valid_frames(record: Any) -> list[_RecordFrame] | None:
+    """The recorded dispatch frames, or ``None`` when absent or malformed."""
+    frames = record.get("frames") if isinstance(record, dict) else None
+    if (
+        isinstance(frames, list)
+        and frames
+        and all(map(_is_valid_frame, frames))
+        and all(map(_is_rebuildable_frame, frames))
+    ):
+        return cast(list[_RecordFrame], frames)
+    return None
+
+
+def _restored_frames(frames: Any) -> list[_RecordFrame] | None:
+    """Saved dispatch frames with their values rebuilt and held as they are.
+
+    ``None`` when a frame is malformed or a value cannot be rebuilt within
+    the recursion limit.
+    """
+    if not (isinstance(frames, list) and frames and all(map(_is_valid_frame, frames))):
+        return None
+    restored: list[_RecordFrame] = []
+    try:
+        for frame in cast(list[_RecordFrame], frames):
+            if frame["kind"] == "dispatch":
+                st = _dispatch_state(frame)
+                frame = {
+                    **frame,
+                    "result": _encode_record_value(st["result"]),
+                    "payloads": {
+                        k: _encode_record_value(v) for k, v in st["payloads"].items()
+                    },
+                    "feedback": {
+                        k: _encode_record_value(v) for k, v in st["feedback"].items()
+                    },
+                }
+            restored.append(frame)
+    except RecursionError:
+        return None
+    return restored
+
+
+def _dispatch_frame(st: _DispatchState) -> _DispatchFrame:
+    """A dispatch position as a record frame of plain values."""
+    frame: _DispatchFrame = {
+        "kind": "dispatch",
+        "trigger_method": st["trigger_method"],
+        "result": _encode_record_value(st["result"]),
+        "current_trigger": st["current_trigger"],
+        "router_results": list(st["router_results"]),
+        "payloads": {k: _encode_record_value(v) for k, v in st["payloads"].items()},
+        "feedback": {k: _encode_record_value(v) for k, v in st["feedback"].items()},
+        "ran": {k: sorted(v) for k, v in st["ran"].items()},
+        "batch": list(st["batch"]) if st["batch"] is not None else None,
+        "rearmable": sorted(st["rearmable"]) if st["rearmable"] is not None else None,
+        "trigger_index": st["trigger_index"],
+        "stage": st["stage"],
+        "started": list(st["started"]),
+        "rearm_first": st["rearm_first"],
+    }
+    if "inflight_result" in st:
+        frame["inflight_result"] = st["inflight_result"]
+    return frame
+
+
+def _dispatch_state(frame: _DispatchFrame) -> _DispatchState:
+    """The dispatch position a record frame holds, with its values rebuilt."""
+    rearmable = frame["rearmable"]
+    st: _DispatchState = {
+        "trigger_method": frame["trigger_method"],
+        "result": _decode_record_value(frame["result"]),
+        "current_trigger": frame["current_trigger"],
+        "router_results": list(frame["router_results"]),
+        "payloads": {k: _decode_record_value(v) for k, v in frame["payloads"].items()},
+        "feedback": {k: _decode_record_value(v) for k, v in frame["feedback"].items()},
+        "ran": {k: set(v) for k, v in frame["ran"].items()},
+        "batch": list(frame["batch"]) if frame["batch"] is not None else None,
+        "rearmable": (
+            {FlowMethodName(name) for name in rearmable}
+            if rearmable is not None
+            else None
+        ),
+        "trigger_index": frame["trigger_index"],
+        "stage": frame["stage"],
+        "started": list(frame["started"]),
+        "rearm_first": frame["rearm_first"],
+    }
+    if "inflight_result" in frame:
+        st["inflight_result"] = frame["inflight_result"]
+    return st
+
+
+def _is_savable_pause_context(ctx: PendingFeedbackContext) -> bool:
+    """Whether ``FlowPausedEvent`` and ``to_dict`` accept the context's fields."""
+    emit = ctx.emit
+    return (
+        isinstance(ctx.requested_at, datetime)
+        and isinstance(ctx.message, str)
+        and (
+            emit is None
+            or (isinstance(emit, list) and all(isinstance(e, str) for e in emit))
+        )
+    )
+
+
+def _queue_pauses(first: HumanFeedbackPending, others: list[Any]) -> None:
+    """Queue reviews behind ``first`` so resume pauses for each in turn."""
+    if not others:
+        return
+    record = first.context.resume_record
+    if record is None:
+        record = first.context.resume_record = {}
+    queue = record.setdefault("queued", [])
+    for other in others:
+        if isinstance(other, HumanFeedbackPending):
+            queue.append(
+                {
+                    "context": other.context,
+                    "callback_info": (
+                        LiveRecordValue(other.callback_info, _json_safe_entries)
+                        if other.callback_info
+                        else None
+                    ),
+                }
+            )
+        else:
+            queue.append(other)
+    others.clear()
+
+
+async def _gather_settling(coros: list[Any]) -> list[Any]:
+    """``asyncio.gather`` that lets the others settle when one pauses for review.
+
+    Other errors propagate as with ``gather``. When any pauses, the first in
+    order is raised once all have finished; the later ones are queued on it.
+    """
+
+    async def guard(coro: Any) -> Any:
+        try:
+            return await coro
+        except HumanFeedbackPending as pending:
+            return pending
+
+    results = await asyncio.gather(*(guard(c) for c in coros))
+    pauses = [r for r in results if isinstance(r, HumanFeedbackPending)]
+    if pauses:
+        _queue_pauses(pauses[0], pauses[1:])
+        raise pauses[0]
+    return results
 
 
 _INITIAL_STATE_CLASS_MARKER = "__crewai_pydantic_class_schema__"
@@ -1081,6 +1515,54 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         result: list[str] = self.memory.extract_memories(content)
         return result
 
+    def _attach_resume_record(self, context: PendingFeedbackContext) -> None:
+        """Store the run bookkeeping on a pending context before it is saved."""
+        record = dict(context.resume_record or {})
+        record["pending_events"] = {
+            str(key): sorted(seen) for key, seen in self._pending_events.items()
+        }
+        with self._or_listeners_lock:
+            record["fired_or_listeners"] = sorted(self._fired_or_listeners)
+        record["completed_methods"] = sorted(self._completed_methods)
+        record.pop("returned", None)
+        context.resume_record = record
+
+    def _restore_resume_record(self, context: PendingFeedbackContext) -> None:
+        """Restore the run bookkeeping saved with a pending context, if any.
+
+        A record whose bookkeeping, frames or queue is malformed is dropped
+        whole, so the context resumes as one saved without a record.
+        """
+        record = context.resume_record
+        if not isinstance(record, dict):
+            return
+        frames = _restored_frames(record["frames"]) if "frames" in record else []
+        if (
+            not _is_valid_bookkeeping(record)
+            or frames is None
+            or not isinstance(record.get("queued", []), list)
+        ):
+            context.resume_record = None
+            return
+        if frames:
+            record["frames"] = frames
+        pending = record.get("pending_events")
+        if isinstance(pending, dict):
+            self._pending_events = {
+                PendingListenerKey(key): set(seen) for key, seen in pending.items()
+            }
+        fired = record.get("fired_or_listeners")
+        if isinstance(fired, list):
+            # Only fired names are looked up in the definition (re-arm), so drop
+            # listeners the flow no longer defines.
+            listeners = {name for name, _, _ in self._listener_methods()}
+            self._fired_or_listeners = {
+                FlowMethodName(name) for name in fired if name in listeners
+            }
+        completed = record.get("completed_methods")
+        if isinstance(completed, list):
+            self._completed_methods = {FlowMethodName(name) for name in completed}
+
     def _clear_or_listeners(self) -> None:
         """Clear fired OR listeners for cyclic flows."""
         with self._or_listeners_lock:
@@ -1318,6 +1800,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         )
         instance._initialize_state(state_data)
         instance._pending_feedback_context = pending_context
+        instance._restore_resume_record(pending_context)
         instance._is_execution_resuming = True
         # Seed the match id so the resume-phase listener filters its own
         # LLM events (which run with `current_flow_id == instance.flow_id`)
@@ -1586,20 +2069,43 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
             method_output_entry["human_feedback"] = result
         self._method_outputs.append(method_output_entry)
 
+        resumed_record = context.resume_record
+        queued = (
+            resumed_record.pop("queued", None)
+            if isinstance(resumed_record, dict)
+            else None
+        )
+        queued = queued if isinstance(queued, list) else []
+        reviewed = FlowMethodName(context.method_name)
+        record = context.resume_record
+        frames = _valid_frames(record)
+        if isinstance(record, dict):
+            record.pop("frames", None)
         try:
-            if emit and collapsed_outcome:
-                await self._execute_listeners(
-                    FlowMethodName(collapsed_outcome),
+            if frames is not None:
+                await self._continue_dispatches(
+                    frames,
+                    reviewed,
+                    collapsed_outcome if emit else None,
                     result,
+                )
+            elif emit and collapsed_outcome is not None:
+                # A reviewed listener re-arms fired or_ listeners for its
+                # label; a start does not.
+                await self._dispatch_router_completion(
+                    reviewed,
+                    collapsed_outcome,
+                    collapsed_outcome,
+                    rearm=not self._definition.methods[str(reviewed)].is_start,
                 )
             else:
-                await self._execute_listeners(
-                    FlowMethodName(context.method_name),
-                    result,
-                )
+                await self._execute_listeners(reviewed, result)
+            self._raise_queued_pause(queued)
         except Exception as e:
             # Check if flow was paused again for human feedback (loop case)
             if isinstance(e, HumanFeedbackPending):
+                # A new review pauses ahead of the reviews still queued.
+                _queue_pauses(e, queued)
                 self._pending_feedback_context = e.context
 
                 if self.persistence is None:
@@ -1628,6 +2134,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     await asyncio.wrap_future(future)
                 if session := get_trace_session():
                     e.context.trace_context = session.context.otel_resume_context
+                self._attach_resume_record(e.context)
                 self.persistence.save_pending_feedback(
                     flow_uuid=e.context.flow_id,
                     context=e.context,
@@ -2442,11 +2949,12 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                     for start_method in starts_to_execute:
                         await self._execute_start_method(start_method)
                 else:
-                    tasks = [
-                        self._execute_start_method(start_method)
-                        for start_method in starts_to_execute
-                    ]
-                    await asyncio.gather(*tasks)
+                    await _gather_settling(
+                        [
+                            self._execute_start_method(start_method)
+                            for start_method in starts_to_execute
+                        ]
+                    )
             except Exception as e:
                 # Check if flow was paused for human feedback
                 if isinstance(e, HumanFeedbackPending):
@@ -2492,6 +3000,7 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
                     if session := get_trace_session():
                         e.context.trace_context = session.context.otel_resume_context
+                    self._attach_resume_record(e.context)
                     self.persistence.save_pending_feedback(
                         flow_uuid=e.context.flow_id,
                         context=e.context,
@@ -2868,18 +3377,11 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
 
         # If start method is a router, use its result as an additional trigger
         if self._is_router(start_method_name) and result is not None:
-            # Execute listeners for the start method name first
-            await self._execute_listeners(start_method_name, result, finished_event_id)
-            # Then execute listeners for the router result (e.g., "approved")
-            router_result = result.value if isinstance(result, enum.Enum) else result
-            router_result_trigger = FlowMethodName(str(router_result))
-            listener_result = (
-                self.last_human_feedback
-                if self.last_human_feedback is not None
-                else result
-            )
-            await self._execute_listeners(
-                router_result_trigger, listener_result, finished_event_id
+            await self._dispatch_router_completion(
+                start_method_name,
+                result,
+                cast(str, _router_outcome(result)),
+                finished_event_id,
             )
         else:
             await self._execute_listeners(start_method_name, result, finished_event_id)
@@ -3170,102 +3672,152 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         trigger_method: FlowMethodName,
         result: Any,
         triggering_event_id: str | None = None,
+        rearm_trigger: bool = False,
     ) -> None:
         """Executes all listeners and routers triggered by a method completion.
 
-        This internal method manages the execution flow by:
-        1. First executing all triggered routers sequentially
-        2. Then executing all triggered listeners in parallel
+        Routers run first, one batch per trigger, each outcome becoming the next
+        trigger; then the plain listeners of every trigger seen run in parallel,
+        and starts gated on a router outcome are checked. A review pause raised
+        under this dispatch records where it stopped, so resume can continue it.
 
         Args:
             trigger_method: The name of the method that triggered these listeners.
             result: The result from the triggering method, passed to listeners that accept parameters.
             triggering_event_id: The event_id of the MethodExecutionFinishedEvent that
                 triggered these listeners, used for causal chain tracking.
-
-        Note:
-            - Routers are executed sequentially to maintain flow control
-            - Each router's result becomes a new trigger_method
-            - Normal listeners are executed in parallel for efficiency
-            - Listeners can receive the trigger method's result as a parameter
+            rearm_trigger: Re-arm fired or_ listeners on ``trigger_method`` too, as
+                is done for router outcomes.
         """
-        # First, handle routers repeatedly until no router triggers anymore
-        router_results = []
-        router_result_payloads: dict[str, Any] = {}
-        router_result_to_feedback: dict[
-            str, Any
-        ] = {}  # Map outcome -> HumanFeedbackResult
-        current_trigger = trigger_method
-        current_result = result  # Track the result to pass to each router
+        state: _DispatchState = {
+            "trigger_method": str(trigger_method),
+            "result": result,
+            "current_trigger": str(trigger_method),
+            "router_results": [],
+            "payloads": {},
+            "feedback": {},
+            "ran": {},
+            "batch": None,
+            "rearmable": None,
+            "trigger_index": 0,
+            "stage": "listeners",
+            "started": [],
+            "rearm_first": rearm_trigger,
+        }
+        await self._run_dispatch(state, triggering_event_id)
+
+    async def _run_dispatch(
+        self, st: _DispatchState, triggering_event_id: str | None = None
+    ) -> None:
+        """Run a dispatch from the position held in ``st``.
+
+        When a review pause unwinds through it, the position is appended to
+        the pending context's record as a dispatch frame.
+        """
+        try:
+            await self._run_dispatch_steps(st, triggering_event_id)
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            returned = record.pop("returned", None)
+            if (
+                st["batch"]
+                and isinstance(returned, dict)
+                and returned.get("name") == st["batch"][0]
+            ):
+                st["inflight_result"] = returned.get("result")
+            record.setdefault("frames", []).append(_dispatch_frame(st))
+            raise
+
+    async def _run_dispatch_steps(
+        self, st: _DispatchState, triggering_event_id: str | None
+    ) -> None:
+        """Advance a dispatch, keeping its position in ``st`` up to date."""
         current_triggering_event_id = triggering_event_id
-        # Methods already run per trigger, so a conditional start that also
-        # listens to the same event is not run a second time below.
-        ran_for_trigger: dict[str, set[FlowMethodName]] = {}
-
-        while True:
-            routers_triggered = self._find_triggered_methods(
-                current_trigger, router_only=True
-            )
-            if not routers_triggered:
-                break
-            ran_for_trigger.setdefault(str(current_trigger), set()).update(
-                routers_triggered
-            )
-
-            for router_name in routers_triggered:
-                # For routers triggered by a router outcome, pass the HumanFeedbackResult
-                router_input = router_result_to_feedback.get(
-                    str(current_trigger), current_result
+        ran = st["ran"]
+        # ``rearmable`` is taken when the router phase ends, so a dispatch
+        # continued after that phase does not search for routers again.
+        while st["rearmable"] is None:
+            if st["batch"] is None:
+                current = FlowMethodName(st["current_trigger"])
+                routers_triggered = self._find_triggered_methods(
+                    current, router_only=True
                 )
-                (
-                    router_result,
-                    current_triggering_event_id,
-                ) = await self._execute_single_listener(
-                    router_name, router_input, current_triggering_event_id
-                )
-                if router_result is None:
-                    current_trigger = FlowMethodName("")
+                if not routers_triggered:
+                    break
+                ran.setdefault(str(current), set()).update(routers_triggered)
+                st["batch"] = [str(name) for name in routers_triggered]
+            while st["batch"]:
+                router_name = FlowMethodName(st["batch"][0])
+                if "inflight_result" in st:
+                    router_result = st.pop("inflight_result")
+                elif not (
+                    router_name in self._methods
+                    and str(router_name) in self._definition.methods
+                    and self._is_router(router_name)
+                ):
+                    # A restored batch can name a method the flow no longer
+                    # defines as a router; it is not run from the batch.
+                    st["batch"].pop(0)
                     continue
-
+                else:
+                    # For routers triggered by a router outcome, pass the HumanFeedbackResult
+                    router_input = st["feedback"].get(
+                        st["current_trigger"], st["result"]
+                    )
+                    (
+                        router_result,
+                        current_triggering_event_id,
+                    ) = await self._execute_single_listener(
+                        router_name, router_input, current_triggering_event_id
+                    )
+                st["batch"].pop(0)
+                if router_result is None:
+                    st["current_trigger"] = ""
+                    continue
                 router_result = (
                     router_result.value
                     if isinstance(router_result, enum.Enum)
                     else router_result
                 )
                 router_result_str = str(router_result)
-                router_result_event = FlowMethodName(router_result_str)
-                router_results.append(router_result_event)
-                router_result_payloads[router_result_str] = (
+                st["router_results"].append(router_result_str)
+                st["payloads"][router_result_str] = (
                     self.last_human_feedback
                     if self.last_human_feedback is not None
                     else router_result
                 )
-
                 if self.last_human_feedback is not None:
-                    router_result_to_feedback[router_result_str] = (
-                        self.last_human_feedback
-                    )
-                current_trigger = router_result_event
+                    st["feedback"][router_result_str] = self.last_human_feedback
+                st["current_trigger"] = router_result_str
+            st["batch"] = None
+            if not st["current_trigger"]:
+                break
 
-        all_triggers = [trigger_method, *router_results]
+        rearmable = st["rearmable"]
+        if rearmable is None:
+            with self._or_listeners_lock:
+                rearmable = st["rearmable"] = set(self._fired_or_listeners)
+        all_triggers = [st["trigger_method"], *st["router_results"]]
+        router_results = set(st["router_results"])
 
-        with self._or_listeners_lock:
-            rearmable: set[FlowMethodName] = set(self._fired_or_listeners)
-
-        for idx, current_trigger in enumerate(all_triggers):
-            if current_trigger:
-                if idx > 0 and rearmable:
+        while st["trigger_index"] < len(all_triggers):
+            idx = st["trigger_index"]
+            trigger = all_triggers[idx]
+            current_trigger = FlowMethodName(trigger)
+            if trigger and st["stage"] == "listeners":
+                if (idx > 0 or st["rearm_first"]) and rearmable:
                     self._rearm_or_listeners_for_trigger(current_trigger, rearmable)
                 listeners_triggered = self._find_triggered_methods(
                     current_trigger, router_only=False
                 )
-                ran_for_trigger.setdefault(str(current_trigger), set()).update(
-                    listeners_triggered
-                )
+                ran.setdefault(trigger, set()).update(listeners_triggered)
+                # From here the trigger's listeners are running: a pause under
+                # them leaves only the start check of this trigger to do.
+                st["stage"] = "starts"
                 if listeners_triggered:
-                    listener_result = router_result_payloads.get(
-                        str(current_trigger), result
-                    )
+                    listener_result = st["payloads"].get(trigger, st["result"])
                     racing_group = self._get_racing_group_for_listeners(
                         listeners_triggered
                     )
@@ -3283,31 +3835,166 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                             current_triggering_event_id,
                         )
                     else:
-                        tasks = [
-                            self._execute_single_listener(
-                                listener_name,
-                                listener_result,
-                                current_triggering_event_id,
-                            )
-                            for listener_name in listeners_triggered
-                        ]
-                        await asyncio.gather(*tasks)
+                        await _gather_settling(
+                            [
+                                self._execute_single_listener(
+                                    name, listener_result, current_triggering_event_id
+                                )
+                                for name in listeners_triggered
+                            ]
+                        )
+            if trigger and trigger in router_results:
+                for method_name in self._start_method_names():
+                    if method_name in st["started"]:
+                        continue
+                    st["started"].append(str(method_name))
+                    # The condition records the trigger even for a start that
+                    # already ran as one of the trigger's listeners.
+                    if not self._start_condition_triggered_by(
+                        method_name, current_trigger
+                    ) or method_name in ran.get(trigger, set()):
+                        continue
+                    if method_name in self._completed_methods:
+                        # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
+                        was_resuming = self._is_execution_resuming
+                        self._is_execution_resuming = False
+                        await self._execute_start_method(method_name)
+                        self._is_execution_resuming = was_resuming
+                    else:
+                        await self._execute_start_method(method_name)
+            st["trigger_index"] = idx + 1
+            st["stage"] = "listeners"
+            st["started"] = []
 
-                if current_trigger in router_results:
-                    for method_name in self._start_method_names():
-                        if self._start_condition_triggered_by(
-                            method_name, current_trigger
-                        ) and method_name not in ran_for_trigger.get(
-                            str(current_trigger), set()
-                        ):
-                            if method_name in self._completed_methods:
-                                # Cyclic re-execution: temporarily clear resumption flag so the method actually re-runs
-                                was_resuming = self._is_execution_resuming
-                                self._is_execution_resuming = False
-                                await self._execute_start_method(method_name)
-                                self._is_execution_resuming = was_resuming
-                            else:
-                                await self._execute_start_method(method_name)
+    async def _continue_dispatches(
+        self,
+        frames: list[_RecordFrame],
+        reviewed: FlowMethodName,
+        outcome: str | None,
+        result: Any,
+    ) -> None:
+        """Continue the dispatches a review pause interrupted, innermost first.
+
+        With ``outcome`` ``None`` (a review without ``emit``) the reviewed
+        method's own subscribers get ``result`` and no outcome is dispatched.
+        If a review pauses again, the frames not yet continued are appended
+        after the ones recorded by that pause.
+        """
+        index = 0
+        try:
+            first = frames[0] if frames else None
+            if (
+                first is not None
+                and first["kind"] == "dispatch"
+                and first["batch"]
+                and first["batch"][0] == str(reviewed)
+                and "inflight_result" not in first
+            ):
+                # The reviewed method ran as a router listener: its own
+                # subscribers get the outcome, then its dispatch continues with
+                # the outcome as the router's result.
+                first["inflight_result"] = outcome
+                await self._execute_listeners(
+                    reviewed, result if outcome is None else outcome
+                )
+            elif outcome is None:
+                await self._execute_listeners(reviewed, result)
+            else:
+                # The reviewed method ran as a start.
+                await self._dispatch_router_completion(reviewed, outcome, outcome)
+            while index < len(frames):
+                frame = frames[index]
+                index += 1
+                if frame["kind"] == "dispatch":
+                    await self._run_dispatch(_dispatch_state(frame))
+                else:
+                    await self._dispatch_router_outcome(
+                        str(frame["result"]),
+                        frame["result"],
+                        rearm=frame.get("rearm_first", False),
+                    )
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            record.setdefault("frames", []).extend(frames[index:])
+            raise
+
+    async def _dispatch_router_completion(
+        self,
+        name: FlowMethodName,
+        result: Any,
+        outcome: str,
+        triggering_event_id: str | None = None,
+        rearm: bool = False,
+    ) -> None:
+        """Dispatch a router start's (or reviewed method's) completion.
+
+        Its own subscribers run first with ``result``, then its outcome's. A
+        review pause under the first dispatch records the outcome dispatch as
+        still to do, so resume continues it.
+        """
+        try:
+            await self._execute_listeners(name, result, triggering_event_id)
+        except HumanFeedbackPending as pending:
+            record = pending.context.resume_record
+            if record is None:
+                record = pending.context.resume_record = {}
+            frame: _StartOutcomeFrame = {"kind": "start_outcome", "result": outcome}
+            if rearm:
+                frame["rearm_first"] = True
+            record.setdefault("frames", []).append(frame)
+            raise
+        await self._dispatch_router_outcome(outcome, result, triggering_event_id, rearm)
+
+    async def _dispatch_router_outcome(
+        self,
+        outcome: str,
+        fallback: Any,
+        triggering_event_id: str | None = None,
+        rearm: bool = False,
+    ) -> None:
+        """Dispatch a router outcome with the payload the immediate path gives."""
+        payload = (
+            self.last_human_feedback
+            if self.last_human_feedback is not None
+            else fallback
+        )
+        await self._execute_listeners(
+            FlowMethodName(outcome), payload, triggering_event_id, rearm_trigger=rearm
+        )
+
+    def _raise_queued_pause(self, queued: list[Any]) -> None:
+        """Pause again for the first review queued behind the resumed one."""
+        while queued:
+            entry = queued.pop(0)
+            if not isinstance(entry, dict):
+                continue
+            stored = entry.get("context")
+            if isinstance(stored, PendingFeedbackContext):
+                ctx = stored
+            elif isinstance(stored, dict):
+                try:
+                    ctx = PendingFeedbackContext.from_dict(stored)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            else:
+                continue
+            if (
+                ctx.flow_id != self.flow_id
+                or not isinstance(ctx.method_name, str)
+                or ctx.method_name not in self._definition.methods
+                or not _is_savable_pause_context(ctx)
+            ):
+                continue
+            info = entry.get("callback_info")
+            if isinstance(info, LiveRecordValue):
+                info = info.value
+            pause = HumanFeedbackPending(
+                context=ctx, callback_info=info if isinstance(info, dict) else None
+            )
+            _queue_pauses(pause, queued)
+            raise pause
 
     def _condition_met(
         self,
@@ -3323,7 +4010,9 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
         return True
 
     def _find_triggered_methods(
-        self, trigger_method: FlowMethodName, router_only: bool
+        self,
+        trigger_method: FlowMethodName,
+        router_only: bool,
     ) -> list[FlowMethodName]:
         triggered: list[FlowMethodName] = []
 
@@ -3437,9 +4126,20 @@ class Flow(BaseModel, Generic[T], metaclass=FlowMeta):
                         listener_name, method
                     )
 
-            await self._execute_listeners(
-                listener_name, listener_result, finished_event_id
-            )
+            try:
+                await self._execute_listeners(
+                    listener_name, listener_result, finished_event_id
+                )
+            except HumanFeedbackPending as pending:
+                if self._is_router(listener_name):
+                    record = pending.context.resume_record
+                    if record is None:
+                        record = pending.context.resume_record = {}
+                    record["returned"] = {
+                        "name": str(listener_name),
+                        "result": _router_outcome(listener_result),
+                    }
+                raise
 
             return (listener_result, finished_event_id)
 
