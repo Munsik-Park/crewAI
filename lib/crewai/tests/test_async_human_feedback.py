@@ -4850,9 +4850,10 @@ _UNBUILDABLE_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
 def _no_garbage_collection_during_the_test() -> Any:
     """Keep the garbage collector off while the test runs, then collect.
 
-    The test walks values to the recursion limit. A collection there runs
-    the finalizers of unrelated objects with no stack left; they raise
-    ``RecursionError``, and pytest reports that as a failure of the test.
+    For tests that walk values to or near the recursion limit. A collection
+    there runs the finalizers of unrelated objects with little or no stack
+    left; they raise ``RecursionError``, and pytest reports that as a
+    failure of the test.
     """
     enabled = gc.isenabled()
     gc.disable()
@@ -4893,6 +4894,7 @@ def test_step_value_with_no_buildable_stored_form_still_pauses(
 
 
 @HOWS
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_row_with_a_stored_key_nested_past_the_recursion_limit_resumes_without_its_frames(
     how: str,
 ) -> None:
@@ -5259,6 +5261,7 @@ _DEEP_STEP_VALUES: dict[str, Callable[[], tuple[Any, str]]] = {
 @pytest.mark.parametrize("kind", ["emit", "plain"])
 @pytest.mark.parametrize("name", list(_DEEP_STEP_VALUES))
 @pytest.mark.usefixtures("_json_encoding_as_on_python_3_10")
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_deep_step_value_pauses_when_its_json_nests_past_the_limit(
     name: str, kind: str, at: str, second: str, how: str
 ) -> None:
@@ -5511,6 +5514,7 @@ def _failing_on_recursion(run: Callable[[], Any]) -> Any:
 
 @HOWS
 @pytest.mark.parametrize("kind", ["cyclic", "deep", "opaque"])
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_queued_review_with_callback_info_without_a_json_form_still_pauses(
     kind: str, how: str
 ) -> None:
@@ -5790,6 +5794,7 @@ def _queued_output_beside_a_review(output: Any, at: str) -> Callable[..., type[F
 @HOWS
 @pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES + [("kickoff", "same_instance")])
 @pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_queued_review_with_output_without_a_json_form_still_pauses(
     name: str, at: str, second: str, how: str
 ) -> None:
@@ -5902,6 +5907,7 @@ def _pending_value_under_review(value: Any, field: str, at: str) -> Callable[...
 @pytest.mark.parametrize(("at", "second"), _STEP_VALUE_PAUSES)
 @pytest.mark.parametrize("field", ["output", "metadata"])
 @pytest.mark.parametrize("name", list(_QUEUED_OUTPUTS))
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_pending_review_with_a_value_without_a_json_form_still_pauses(
     name: str, field: str, at: str, second: str, how: str
 ) -> None:
@@ -6206,6 +6212,7 @@ def _deep_value_waiting_while_a_second_review_pauses(value: Any) -> ShapeFactory
 @HOWS
 @pytest.mark.parametrize("name", list(_WAITING_STEP_VALUES))
 @pytest.mark.usefixtures("_recursion_limit_of_1000")
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
 def test_restored_run_paused_again_with_a_deep_value_waiting_saves_the_pause(
     name: str, how: str
 ) -> None:
