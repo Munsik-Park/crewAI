@@ -6284,6 +6284,56 @@ def test_pending_row_whose_record_has_no_json_form_saves_without_the_record(
     assert calls.count(("publish", "HumanFeedbackResult")) == 1
 
 
+@HOWS
+@pytest.mark.usefixtures("_no_garbage_collection_during_the_test")
+def test_pending_row_whose_record_has_a_cyclic_and_a_deep_entry_keeps_the_record(
+    how: str,
+) -> None:
+    """The record is kept with each of those entries as its one string form.
+
+    Its other entries are saved as they were, and the run resumes from it.
+    """
+    cyclic, cyclic_stored = _UNBUILDABLE_STEP_VALUES["cyclic_dict"]()
+    deep, deep_stored = _UNBUILDABLE_STEP_VALUES["deep_dicts"]()
+    calls: list[Any] = []
+    flow_cls = _ch1_router_outcome_leads_to_the_review(_Review(pause=True), calls)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        persistence = SQLiteFlowPersistence(os.path.join(tmpdir, "flows.db"))
+        pending = flow_cls(persistence=persistence).kickoff()
+        assert isinstance(pending, HumanFeedbackPending)
+        flow_id = pending.context.flow_id
+        state, ctx = persistence.load_pending_feedback(flow_id)
+        saved = ctx.to_dict()
+        assert isinstance(saved["resume_record"], dict)
+        ctx.resume_record = {
+            **(ctx.resume_record or {}),
+            "cyclic": cyclic,
+            "deep": deep,
+        }
+
+        persistence.save_pending_feedback(
+            flow_uuid=flow_id, context=ctx, state_data=state
+        )
+
+        row = persistence.load_pending_feedback(flow_id)
+        assert row is not None
+        assert row[1].resume_record == {
+            **saved["resume_record"],
+            "cyclic": cyclic_stored,
+            "deep": deep_stored,
+        }
+        assert {k: v for k, v in row[1].to_dict().items() if k != "resume_record"} == {
+            k: v for k, v in saved.items() if k != "resume_record"
+        }
+        calls.clear()
+        out = _resume(flow_cls.from_pending(flow_id, persistence), how)
+
+    assert not isinstance(out, HumanFeedbackPending)
+    assert "draft" not in calls
+    assert calls.count(("audit", "approved")) == 1
+    assert calls.count(("publish", "HumanFeedbackResult")) == 1
+
+
 # A record whose frames are malformed counts as absent, bookkeeping and queued
 # reviews with it. ``plain_listener`` restores join progress from its
 # bookkeeping; ``two_starts`` holds ``other``'s review queued behind ``draft``.
